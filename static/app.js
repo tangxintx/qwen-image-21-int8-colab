@@ -1293,6 +1293,8 @@
       const statusMode = eng.demo_mode ? "演示模式" : eng.loaded ? "模型已驻留" : "待加载(按需)";
       let quantTag = "INT8";
       if (eng.quant_mode === "none") quantTag = `${eng.effective_dtype.toUpperCase()} 满血`;
+      else if (eng.quant_mode === "gguf-q8-full" || eng.gguf_variant === "q8") quantTag = "GGUF Q8 满血";
+      else if (eng.quant_mode === "gguf-q4" || eng.gguf_variant === "q4") quantTag = "GGUF Q4";
       else if (eng.quant_mode === "fp8-int8") quantTag = "FP8+INT8";
       else if (eng.quant_mode === "fp8-all") quantTag = "FP8";
       $("headerQuantBadge").textContent = quantTag;
@@ -1629,8 +1631,13 @@
         $("stepsSlider").value = String(recommendedSteps);
         $("stepsVal").textContent = String(recommendedSteps);
       }
-      const isFull = $("quantSelect").value === "none";
-      showToast(isFull ? "已切换至满血原生精度配置（下次生成生效）" : "模型与系统配置已保存");
+      const qVal = $("quantSelect").value;
+      if ($("comfyGgufSelect") && !$("comfyGgufSelect").disabled) {
+        if (qVal === "gguf-q8-full") $("comfyGgufSelect").value = "q8";
+        else if (qVal === "gguf-q4") $("comfyGgufSelect").value = "q4";
+      }
+      const isFull = qVal === "none" || qVal === "gguf-q8-full";
+      showToast(isFull ? "已切换至满血高精度配置（下次生成生效）" : "模型与系统配置已保存");
       refreshStats();
     } catch (err) {
       showToast(`保存失败: ${err.message}`);
@@ -2236,6 +2243,24 @@
       $("comfyProgressPct").textContent = st.status === "error" ? "失败" : `${pct}%`;
       $("comfyProgressFill").style.width = `${pct}%`;
     }
+    if ($("comfyGgufSelect")) {
+      $("comfyGgufSelect").disabled = busy || running;
+      if ((busy || running) && st.gguf_variant && Array.from($("comfyGgufSelect").options).some((o) => o.value === st.gguf_variant)) {
+        $("comfyGgufSelect").value = st.gguf_variant;
+      }
+    }
+    if ($("comfyGgufMeta")) {
+      const pluginOk = st.gguf_plugin_installed ? "已安装 city96/ComfyUI-GGUF" : "将自动安装 city96/ComfyUI-GGUF";
+      const stagedCount = Array.isArray(st.staged_files) ? st.staged_files.length : 0;
+      const wfCount = Array.isArray(st.workflows) ? st.workflows.length : 0;
+      if (running || stagedCount > 0 || wfCount > 0) {
+        $("comfyGgufMeta").innerHTML = `${escapeHtml(pluginOk)} · 档位 ${(escapeHtml((st.gguf_variant || "q4").toUpperCase()))}` +
+          (stagedCount ? ` · 已挂载 ${stagedCount} 个模型文件` : "") +
+          (wfCount ? ` · 已生成 ${wfCount} 份工作流` : "");
+      } else {
+        $("comfyGgufMeta").innerHTML = '启动时自动安装 <a href="https://github.com/city96/ComfyUI-GGUF" target="_blank" style="color:var(--cyan)">city96/ComfyUI-GGUF</a> 扩展插件并生成 Qwen-Image-2.1 工作流';
+      }
+    }
     $("comfyLaunchBtn").disabled = busy || running;
     $("comfyLaunchBtn").classList.toggle("hidden", running);
     $("comfyStopBtn").classList.toggle("hidden", !running);
@@ -2264,7 +2289,12 @@
   $("comfyLaunchBtn").addEventListener("click", async () => {
     try {
       state.comfyOpenedOnce = false;
-      const st = await apiFetch("/api/comfyui/launch", { method: "POST" });
+      const ggufVariant = $("comfyGgufSelect") ? $("comfyGgufSelect").value : "q4";
+      const st = await apiFetch("/api/comfyui/launch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ gguf_variant: ggufVariant }),
+      });
       renderComfyState(st);
       clearInterval(state.comfyPollTimer);
       state.comfyPollTimer = setInterval(pollComfyStatus, 900);
@@ -2292,8 +2322,20 @@
     try {
       const stats = await apiFetch("/api/stats");
       const eng = stats.engine || {};
-      if (eng.model_id) $("modelSelect").value = eng.model_id;
+      if (eng.model_id) {
+        const msel = $("modelSelect");
+        if (!Array.from(msel.options).some((o) => o.value === eng.model_id)) {
+          const opt = document.createElement("option");
+          opt.value = eng.model_id;
+          opt.textContent = eng.model_id;
+          msel.appendChild(opt);
+        }
+        msel.value = eng.model_id;
+      }
       if (eng.quant_mode) $("quantSelect").value = eng.quant_mode;
+      if (eng.gguf_variant && $("comfyGgufSelect") && (eng.gguf_variant === "q8" || eng.gguf_variant === "q4")) {
+        $("comfyGgufSelect").value = eng.gguf_variant;
+      }
       if (eng.gpu_profile_override) $("gpuProfileSelect").value = eng.gpu_profile_override;
       if (eng.dtype_mode) $("dtypeSelect").value = eng.dtype_mode;
       if (eng.offload_mode) $("offloadSelect").value = eng.offload_mode;

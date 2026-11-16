@@ -888,10 +888,12 @@
           </div>
 
           <div class="form-group">
-            <label>一键版本切换（L4 FP8 黄金方案 / INT8 / 满血无损）</label>
+            <label>一键版本切换（L4 FP8 黄金方案 / Uncensored GGUF Q8·Q4 / 满血无损）</label>
             <div class="quick-tags" id="editionQuickBtns">
               <button class="tag-chip" data-model="Qwen/Qwen-Image-2.1-Turbo" data-quant="fp8-int8" data-offload="smart_stage_offload" data-steps="8">L4 黄金方案 (FP8 DiT + INT8编码 + BF16 VAE)</button>
               <button class="tag-chip" data-model="Qwen/Qwen-Image-2.1" data-quant="fp8-int8" data-offload="smart_stage_offload" data-steps="40">L4 精绘 (Qwen-2.1 FP8+INT8 · 40步)</button>
+              <button class="tag-chip" data-model="abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8" data-quant="gguf-q8-full" data-offload="auto" data-steps="8">Uncensored GGUF Q8 满血版 (BF16 编码 + BF16 VAE)</button>
+              <button class="tag-chip" data-model="abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4" data-quant="gguf-q4" data-offload="auto" data-steps="8">Uncensored GGUF Q4 轻量版 (Qwen3-VL Q4_K_M + BF16 VAE)</button>
               <button class="tag-chip" data-model="Qwen/Qwen-Image-2.1-Turbo" data-quant="int8-torchao" data-offload="auto" data-steps="8">Turbo INT8 全8bit (8步)</button>
               <button class="tag-chip" data-model="Qwen/Qwen-Image-2.1-Turbo" data-quant="none" data-offload="auto" data-steps="8">Turbo 满血原生不量化 (8步)</button>
               <button class="tag-chip" data-model="Qwen/Qwen-Image-2.1" data-quant="none" data-offload="auto" data-steps="40">Qwen-2.1 满血旗舰版 (BF16 · 40步)</button>
@@ -904,6 +906,8 @@
             <select id="modelSelect">
               <option value="Qwen/Qwen-Image-2.1-Turbo">Qwen/Qwen-Image-2.1-Turbo (8步极速)</option>
               <option value="Qwen/Qwen-Image-2.1">Qwen/Qwen-Image-2.1 (满血基础版 · 40步精绘)</option>
+              <option value="abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8">abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8 (Q8 满血 · BF16 编码)</option>
+              <option value="abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4">abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4 (Q4 轻量 · Qwen3-VL Q4_K_M)</option>
               <option value="addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit">addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit (预量化)</option>
             </select>
           </div>
@@ -927,6 +931,8 @@
               <option value="fp8-all">全 FP8 (FP8 DiT + FP8 文本编码器 + BF16 VAE)</option>
               <option value="int8-torchao">TorchAO 全 INT8 (INT8 DiT + INT8 文本编码器 + BF16 VAE)</option>
               <option value="int8-bnb">BitsAndBytes 8-bit</option>
+              <option value="gguf-q8-full">GGUF Q8 满血 (Q8_0 DiT + 全精度BF16编码器 + BF16 VAE)</option>
+              <option value="gguf-q4">GGUF Q4 轻量 (Q4_K_M DiT + Qwen3-VL-8B Q4_K_M + BF16 VAE)</option>
               <option value="none">满血原生精度 (BF16/FP16 不量化 · 适合 80G/96G 显卡)</option>
             </select>
           </div>
@@ -1012,8 +1018,20 @@
         <!-- On-demand ComfyUI Launcher Card -->
         <div class="card" id="comfyLauncherCard">
           <div class="card-header">
-            <span class="card-title">ComfyUI 启动器</span>
+            <span class="card-title">ComfyUI 启动器 (内置 GGUF 加载器)</span>
             <span class="badge-int8" id="comfyStatusBadge">未启动</span>
+          </div>
+          <div class="form-group">
+            <label for="comfyGgufSelect">预装模型与 GGUF 档位（自动部署 city96/ComfyUI-GGUF）</label>
+            <select id="comfyGgufSelect">
+              <option value="q4">Q4 轻量版 (Q4_K_M DiT + Qwen3-VL-8B Q4_K_M.gguf + BF16 VAE)</option>
+              <option value="q8">Q8 满血版 (Q8_0 DiT + qwen3vl_8b_bf16 + qwen_image_2.1_vae_bf16)</option>
+              <option value="both">同时部署 Q8 + Q4 全套文件与工作流</option>
+              <option value="none">仅安装 ComfyUI 与 ComfyUI-GGUF 插件（暂不下载模型）</option>
+            </select>
+          </div>
+          <div class="card-sub" id="comfyGgufMeta" style="margin-bottom:10px">
+            启动时自动安装 <a href="https://github.com/city96/ComfyUI-GGUF" target="_blank" style="color:var(--cyan)">city96/ComfyUI-GGUF</a> 扩展插件并生成 Qwen-Image-2.1 工作流
           </div>
           <div class="progress-wrap compact hidden" id="comfyProgressWrap">
             <div class="progress-info">
@@ -1027,7 +1045,7 @@
           <div class="action-row">
             <button class="btn-primary" id="comfyLaunchBtn">
               <svg class="icon"><use href="#ic-play" /></svg>
-              <span>下载并启动 ComfyUI</span>
+              <span>下载并启动 ComfyUI (含 GGUF 插件)</span>
             </button>
             <a class="btn-chip primary hidden" id="comfyOpenLink" href="#" target="_blank">打开 ComfyUI</a>
             <button class="btn-stop hidden" id="comfyStopBtn">

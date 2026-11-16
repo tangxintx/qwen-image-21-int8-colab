@@ -153,10 +153,37 @@ def preload_model_with_progress() -> None:
         return
 
     model_id = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen-Image-2.1-Turbo")
+    quant_mode = os.environ.get("QWEN_QUANT_MODE", "int8-torchao")
     hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    print(f"正在通过 Hugging Face API 极速预下载模型: {model_id}", flush=True)
-    from hf_downloader import download_model_fast
+    from hf_downloader import (
+        GGUF_BASE_REPO,
+        GGUF_REDIRECTED_REPO,
+        download_gguf_bundle_fast,
+        download_model_fast,
+        strip_model_variant_suffix,
+    )
 
+    base_repo, suffix = strip_model_variant_suffix(model_id)
+    qm_low = quant_mode.strip().lower()
+    is_gguf = (
+        base_repo.lower() in {GGUF_BASE_REPO.lower(), GGUF_REDIRECTED_REPO.lower()}
+        or "gguf" in base_repo.lower()
+        or qm_low in {"gguf-q8-full", "gguf-q4"}
+    )
+    if is_gguf:
+        variant = suffix if suffix in {"q8", "q4"} else ("q4" if "q4" in qm_low else "q8")
+        print(f"正在通过 Hugging Face API 极速按需预下载 GGUF {variant.upper()} 模型组件: {base_repo}", flush=True)
+        bundle = download_gguf_bundle_fast(
+            variant=variant,
+            token=hf_token,
+            use_tqdm=True,
+            include_diffusers_configs=True,
+            include_mmproj=True,
+        )
+        print(f"GGUF {variant.upper()} 模型组件已高速缓存至: {bundle.get('dit_path')}", flush=True)
+        return
+
+    print(f"正在通过 Hugging Face API 极速预下载模型: {model_id}", flush=True)
     local_dir = download_model_fast(repo_id=model_id, token=hf_token, use_tqdm=True)
     print(f"模型已高速缓存至: {local_dir}", flush=True)
 

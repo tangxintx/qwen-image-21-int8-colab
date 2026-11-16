@@ -7,7 +7,7 @@
 ## 核心功能
 
 1. **四大创作模式 & 非标准比例自适应**
-   - **文生图 (T2I)**：支持 `Qwen/Qwen-Image-2.1-Turbo`（8 步极速）、`Qwen/Qwen-Image-2.1`（40 步精绘）及预量化 8bit 权重。
+   - **文生图 (T2I)**：支持 `Qwen/Qwen-Image-2.1-Turbo`（8 步极速）、`Qwen/Qwen-Image-2.1`（40 步精绘）、预量化 8bit 权重，以及 [`abenzerps/Qwen-Image-2.1-Uncensored-GGUF`](https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-GGUF) 的 **Q8 满血版**（`Q8_0` DiT + 全精度 BF16 文本编码器 + `qwen_image_2.1_vae_bf16.safetensors`）与 **Q4 轻量版**（`Q4_K_M` DiT + `Qwen3-VL-8B` `Q4_K_M.gguf` + `qwen_image_2.1_vae_bf16.safetensors`）。
    - **图生图 (I2I)**：支持主图 `@0` + 最多 9 张次图 `@1..@9` 多图引用，结合 `Denoise` 控制重绘幅度。
    - **高清修复 (Hires Fix)**：支持 `1.0x ~ 2.5x` 倍率放大与二次精绘去噪，自动启用 VAE Tiling/Slicing 防爆显存。
    - **局部重绘 (Inpaint)**：内置手机触控涂抹遮罩画布（画笔、橡皮、笔刷粗细、撤销、防误触锁屏、羽化融合）。
@@ -28,7 +28,10 @@
    - **L4 · Ada Lovelace (24GB, `sm_89`)**：FP8 DiT + INT8 编码器 + BF16 VAE + 智能分阶段显存调度。
    - **T4 · Turing (16GB, `sm_75`)**：FP16 + Model CPU Offload + VAE/注意力切片。
 
-5. **监控、Web 终端、作品库与一键关闭**
+5. **按需 ComfyUI + GGUF 加载器插件 (`city96/ComfyUI-GGUF`)**
+   - 在「设置 -> ComfyUI 启动器」中可一键按需安装 ComfyUI 与 [`city96/ComfyUI-GGUF`](https://github.com/city96/ComfyUI-GGUF) 扩展插件，自动按所选档位（Q4 / Q8 / 全部）高速拉取并挂载 DiT `.gguf`、文本编码器与 `qwen_image_2.1_vae_bf16.safetensors`，同步生成即开即用的 ComfyUI 工作流（`Qwen_Image_2.1_Uncensored_GGUF_Q8.json` / `Qwen_Image_2.1_Uncensored_GGUF_Q4.json`）。
+
+6. **监控、Web 终端、作品库与一键关闭**
    - **资源与模型监控**：实时监控 VRAM、RAM、Swap、磁盘占用，并展示当前已加载模型/LoRA、本地 HF 缓存模型与 LoRA 列表。
    - **Web 终端 & 作品库**：持久 `cd` 工作目录、服务日志流、作品 ZIP 打包、Lightbox 大图与参数一键复用。
    - **一键关闭**：支持在手机端一键卸载模型、关闭隧道与服务，并可选调用 `google.colab.runtime.unassign()` 释放 Colab 计算单元。
@@ -62,10 +65,10 @@ python colab_launch.py
 - `server.py` — FastAPI 后端、`QwenImage21Pipeline` 推理引擎、透明扩图裁剪与 AI 接口代理
 - `lora_manager.py` — Civitai / HF LoRA 解析下载、header 校验与前缀重映射
 - `gpu_profiles.py` — 五档 Colab GPU 自动检测与显存/精度优化配置
-- `hf_downloader.py` — Hugging Face API 极速下载器（`hf_transfer`）
+- `hf_downloader.py` — Hugging Face API 极速下载器（`hf_transfer` + GGUF Q8/Q4 定向组件下载）
 - `terminal_manager.py` — 持久化工作目录 Web 终端与实时服务日志缓冲
 - `swap_manager.py` — Linux Swap 虚拟内存配置工具
-- `comfy_launcher.py` — 按需手动启动 ComfyUI 辅助启动器
+- `comfy_launcher.py` — 按需手动启动 ComfyUI 辅助启动器（内置 `city96/ComfyUI-GGUF` 与工作流生成）
 - `static/` — 移动优先暗色毛玻璃 Web 前端（`index.html`, `styles.css`, `app.js`）
 - `test_server.py` — 自动化接口与引擎冒烟测试脚本
 

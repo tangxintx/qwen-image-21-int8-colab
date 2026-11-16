@@ -40,7 +40,16 @@ from pydantic import BaseModel, Field
 
 from comfy_launcher import ComfyUILauncher
 from gpu_profiles import GPU_PROFILES, GPUProfile, match_gpu_profile
-from hf_downloader import download_model_fast
+from hf_downloader import (
+    GGUF_BASE_REPO,
+    GGUF_REDIRECTED_REPO,
+    GGUF_VARIANTS,
+    download_gguf_bundle_fast,
+    download_hf_file_fast,
+    download_model_fast,
+    resolve_repo_file,
+    strip_model_variant_suffix,
+)
 from lora_manager import (
     LoraDownloadManager,
     delete_lora,
@@ -190,7 +199,45 @@ MODEL_PRESETS = {
         "default_cfg": 1.0,
         "description": "预量化 TorchAO 8bit 权重，加载更快、显存更低",
     },
+    "abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8": {
+        "label": "Qwen-Image-2.1 Uncensored GGUF Q8 满血版 (BF16 编码器 + BF16 VAE)",
+        "default_steps": 8,
+        "default_cfg": 1.0,
+        "quant_mode": "gguf-q8-full",
+        "description": "Q8_0 扩散权重直接拉满，搭配全精度 BF16 文本编码器与 qwen_image_2.1_vae_bf16",
+    },
+    "abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4": {
+        "label": "Qwen-Image-2.1 Uncensored GGUF Q4 轻量版 (Qwen3-VL-8B Q4_K_M + BF16 VAE)",
+        "default_steps": 8,
+        "default_cfg": 1.0,
+        "quant_mode": "gguf-q4",
+        "description": "Q4_K_M 扩散权重 + Qwen3-VL-8B Q4_K_M.gguf 文本编码器 + qwen_image_2.1_vae_bf16",
+    },
 }
+
+
+def resolve_gguf_variant(model_id: str, quant_mode: str) -> Optional[str]:
+    """Return `'q8'` or `'q4'` if the configured model/quant targets a GGUF variant, else `None`."""
+    base_id, suffix = strip_model_variant_suffix(model_id)
+    base_low = base_id.lower()
+    qm = (quant_mode or "").strip().lower()
+    is_gguf_repo = base_low in {
+        GGUF_BASE_REPO.lower(),
+        GGUF_REDIRECTED_REPO.lower(),
+        "m9ter1a/qwen-image-2.1-turbo-gguf",
+    } or "gguf" in base_low
+    is_gguf_quant = qm in {"gguf-q8-full", "gguf-q4", "q8", "q4"}
+
+    if not is_gguf_repo and not is_gguf_quant:
+        return None
+    if suffix in {"q8", "q4"}:
+        return suffix
+    if qm in {"gguf-q4", "q4"}:
+        return "q4"
+    if qm in {"gguf-q8-full", "q8", "none"}:
+        return "q8"
+    return "q8"
+
 
 
 def align_dim(value: int, multiple: int = 16, min_val: int = 256, max_val: int = 3072) -> int:
@@ -675,10 +722,17 @@ class QwenImage21Engine:
     def effective_settings(self) -> dict[str, Any]:
         profile = self.resolve_gpu_profile()
         eff_dtype = profile.dtype if self.dtype_mode == "auto" else self.dtype_mode
+        gguf_var = resolve_gguf_variant(self.model_id, self.quant_mode)
         if self.offload_mode == "auto":
             # Unquantized (full-precision) weights exceed 16-24GB VRAM, so auto-upgrade T4/L4 to sequential offload
             if self.quant_mode == "none" and profile.vram_gb <= 24:
                 eff_offload = "sequential_cpu_offload"
+            elif gguf_var == "q8" and profile.vram_gb <= 16:
+                eff_offload = "sequential_cpu_offload"
+            elif gguf_var == "q8" and profile.vram_gb <= 24:
+                eff_offload = "smart_stage_offload"
+            elif gguf_var == "q4" and profile.vram_gb <= 16:
+                eff_offload = "model_cpu_offload"
             else:
                 eff_offload = profile.offload_mode
         else:
@@ -695,7 +749,241 @@ class QwenImage21Engine:
             "vae_slicing": eff_vae_tiling or profile.vae_slicing,
             "attention_slicing": profile.attention_slicing,
             "allow_tf32": profile.allow_tf32,
+            "gguf_variant": gguf_var,
         }
+
+    def _load_gguf_pipeline(
+        self,
+        gguf_variant: str,
+        eff: dict[str, Any],
+        dtype: Any,
+        job: Optional[JobState],
+        dl_progress: Any,
+    ) -> Any:
+        import torch
+        from diffusers import AutoencoderKLQwenImage21, QwenImage21Pipeline, QwenImage21Transformer2DModel
+        from transformers import AutoConfig, Qwen3VLForConditionalGeneration
+
+        profile: GPUProfile = eff["profile"]
+        token = self.hf_token or None
+        cfg_variant = GGUF_VARIANTS[gguf_variant]
+        base_repo = cfg_variant["base_config_repo"]
+
+        bundle = download_gguf_bundle_fast(
+            variant=gguf_variant,
+            token=token,
+            progress_cb=dl_progress,
+            use_tqdm=False,
+            include_diffusers_configs=True,
+            include_mmproj=False,
+        )
+        if job and job.cancel_event.is_set():
+            raise InterruptedError("用户已取消生成")
+
+        base_cfg_dir = bundle["base_config_dir"]
+        if job:
+            job.status = "loading_model"
+            job.progress = max(job.progress, 0.32)
+            job.message = f"[{profile.display_name}] 正在加载 GGUF {gguf_variant.upper()} 扩散权重..."
+
+        # 1) Load GGUF Diffusion Transformer (try user-specified abenzerps GGUF first, fallback to Diffusers-layout GGUF)
+        transformer = None
+        try:
+            from diffusers import GGUFQuantizationConfig
+
+            def _load_dit_single(file_path: str) -> Any:
+                try:
+                    return QwenImage21Transformer2DModel.from_single_file(
+                        file_path,
+                        quantization_config=GGUFQuantizationConfig(compute_dtype=dtype),
+                        torch_dtype=dtype,
+                        config=base_cfg_dir,
+                        subfolder="transformer",
+                        local_files_only=True,
+                    )
+                except TypeError:
+                    return QwenImage21Transformer2DModel.from_single_file(
+                        file_path,
+                        quantization_config=GGUFQuantizationConfig(compute_dtype=dtype),
+                        dtype=dtype,
+                        config=base_cfg_dir,
+                        subfolder="transformer",
+                        local_files_only=True,
+                    )
+
+            try:
+                transformer = _load_dit_single(bundle["dit_path"])
+                logger.info("Loaded DiT directly from %s", bundle["dit_filename"])
+            except Exception as primary_dit_exc:
+                logger.warning(
+                    "Direct Diffusers loading of %s failed (%s); falling back to Diffusers-formatted GGUF %s...",
+                    bundle["dit_filename"],
+                    primary_dit_exc,
+                    cfg_variant["dit_diffusers_fallback_repo"],
+                )
+                fb_repo, fb_file, fb_size = resolve_repo_file(
+                    cfg_variant["dit_diffusers_fallback_repo"],
+                    cfg_variant["dit_diffusers_fallback_patterns"],
+                    token=token,
+                )
+                fb_path = download_hf_file_fast(
+                    fb_repo,
+                    fb_file,
+                    token=token,
+                    expected_bytes=fb_size,
+                    progress_cb=dl_progress,
+                    use_tqdm=False,
+                )
+                transformer = _load_dit_single(fb_path)
+                logger.info("Loaded Diffusers-compatible GGUF DiT from %s/%s", fb_repo, fb_file)
+        except Exception as gguf_dit_exc:
+            logger.warning("GGUF DiT loading failed (%s); falling back to %s transformer.", gguf_dit_exc, base_repo)
+            transformer = QwenImage21Transformer2DModel.from_pretrained(
+                base_repo,
+                subfolder="transformer",
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+                token=token,
+            )
+
+        # 2) Load Text Encoder: Q8 -> Full BF16 Qwen3-VL-8B ("直接拉满"); Q4 -> Qwen3-VL-8B Q4_K_M.gguf (w/ 4-bit fallback)
+        if job:
+            job.progress = max(job.progress, 0.55)
+            job.message = (
+                f"[{profile.display_name}] 正在加载全精度 BF16 Qwen3-VL 文本编码器..."
+                if gguf_variant == "q8"
+                else f"[{profile.display_name}] 正在加载 Qwen3-VL-8B Q4_K_M 文本编码器..."
+            )
+
+        text_encoder = None
+        te_cfg = AutoConfig.from_pretrained(str(Path(base_cfg_dir) / "text_encoder"), local_files_only=True)
+        if gguf_variant == "q8":
+            try:
+                from safetensors.torch import load_file as load_safetensors_file
+
+                raw_sd = load_safetensors_file(bundle["te_path"], device="cpu")
+                remapped_sd: dict[str, Any] = {}
+                for k, v in raw_sd.items():
+                    nk = k
+                    if k.startswith(("model.embed_tokens.", "model.layers.", "model.norm.")):
+                        nk = "model.language_model." + k[len("model.") :]
+                    elif k.startswith("visual."):
+                        nk = "model." + k
+                    remapped_sd[nk] = v
+                del raw_sd
+                if any(k.startswith("model.language_model.") for k in remapped_sd):
+                    te_cand, load_info = Qwen3VLForConditionalGeneration.from_pretrained(
+                        None,
+                        config=te_cfg,
+                        state_dict=remapped_sd,
+                        torch_dtype=torch.bfloat16 if dtype == torch.bfloat16 else dtype,
+                        low_cpu_mem_usage=True,
+                        output_loading_info=True,
+                    )
+                    missing = [m for m in load_info.get("missing_keys", []) if "lm_head" not in m]
+                    if not missing:
+                        text_encoder = te_cand
+                        logger.info("Loaded BF16 Qwen3-VL text encoder directly from %s", bundle["te_filename"])
+                    else:
+                        del te_cand
+                del remapped_sd
+            except Exception as te_bf16_exc:
+                logger.info("Single-file BF16 TE load skipped (%s); loading HF BF16 shards from %s.", te_bf16_exc, base_repo)
+
+            if text_encoder is None:
+                text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+                    base_repo,
+                    subfolder="text_encoder",
+                    torch_dtype=dtype,
+                    low_cpu_mem_usage=True,
+                    token=token,
+                )
+        else:
+            try:
+                text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+                    bundle["te_repo"],
+                    gguf_file=Path(bundle["te_path"]).name,
+                    config=te_cfg,
+                    torch_dtype=dtype,
+                    low_cpu_mem_usage=True,
+                    token=token,
+                )
+                logger.info("Loaded Qwen3-VL Q4_K_M GGUF text encoder from %s", bundle["te_filename"])
+            except Exception as te_gguf_exc:
+                logger.warning(
+                    "Transformers Qwen3-VL GGUF load unavailable (%s); falling back to 4-bit quantized %s text_encoder.",
+                    te_gguf_exc,
+                    base_repo,
+                )
+                try:
+                    from transformers import BitsAndBytesConfig
+
+                    bnb_cfg = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=dtype)
+                    text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+                        base_repo,
+                        subfolder="text_encoder",
+                        quantization_config=bnb_cfg,
+                        torch_dtype=dtype,
+                        low_cpu_mem_usage=True,
+                        token=token,
+                    )
+                except Exception as bnb_exc:
+                    logger.warning("4-bit BnB fallback unavailable (%s); falling back to TorchAO INT8 text encoder.", bnb_exc)
+                    from torchao.quantization import Int8WeightOnlyConfig
+                    from transformers import TorchAoConfig
+
+                    text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+                        base_repo,
+                        subfolder="text_encoder",
+                        quantization_config=TorchAoConfig(Int8WeightOnlyConfig()),
+                        torch_dtype=dtype,
+                        low_cpu_mem_usage=True,
+                        token=token,
+                    )
+
+        # 3) Load qwen_image_2.1_vae_bf16.safetensors
+        if job:
+            job.progress = max(job.progress, 0.78)
+            job.message = f"[{profile.display_name}] 正在加载 qwen_image_2.1_vae_bf16 VAE..."
+
+        vae = None
+        try:
+            vae = AutoencoderKLQwenImage21.from_single_file(
+                bundle["vae_path"],
+                config=base_cfg_dir,
+                subfolder="vae",
+                torch_dtype=torch.bfloat16,
+                local_files_only=True,
+            )
+            logger.info("Loaded BF16 VAE from %s", bundle["vae_filename"])
+        except Exception as vae_exc:
+            logger.warning("Single-file VAE load failed (%s); falling back to %s vae.", vae_exc, base_repo)
+            vae = AutoencoderKLQwenImage21.from_pretrained(
+                base_repo,
+                subfolder="vae",
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+                token=token,
+            )
+
+        try:
+            return QwenImage21Pipeline.from_pretrained(
+                base_cfg_dir,
+                transformer=transformer,
+                text_encoder=text_encoder,
+                vae=vae,
+                torch_dtype=dtype,
+                local_files_only=True,
+            )
+        except TypeError:
+            return QwenImage21Pipeline.from_pretrained(
+                base_cfg_dir,
+                transformer=transformer,
+                text_encoder=text_encoder,
+                vae=vae,
+                dtype=dtype,
+                local_files_only=True,
+            )
 
     def ensure_loaded(self, job: Optional[JobState] = None) -> None:
         if self.demo_mode:
@@ -716,6 +1004,7 @@ class QwenImage21Engine:
 
             eff = self.effective_settings()
             profile: GPUProfile = eff["profile"]
+            gguf_variant: Optional[str] = eff.get("gguf_variant")
             self.loading = True
             if job:
                 job.status = "loading_model"
@@ -734,21 +1023,6 @@ class QwenImage21Engine:
                         if tot_b > 0:
                             job.progress = min(0.28, max(0.02, 0.02 + 0.26 * (cur_b / tot_b)))
 
-                local_model_dir = download_model_fast(
-                    repo_id=self.model_id,
-                    token=self.hf_token or None,
-                    progress_cb=_dl_progress,
-                    use_tqdm=False,
-                )
-
-                if job and job.cancel_event.is_set():
-                    raise InterruptedError("用户已取消生成")
-
-                if job:
-                    job.status = "loading_model"
-                    job.progress = max(job.progress, 0.30)
-                    job.message = f"[{profile.display_name}] 正在载入模型权重 ({self.quant_mode})..."
-
                 # Apply hardware-specific TensorCore / TF32 settings
                 if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
                     torch.backends.cuda.matmul.allow_tf32 = eff["allow_tf32"]
@@ -758,89 +1032,108 @@ class QwenImage21Engine:
 
                 dtype = torch.bfloat16 if eff["dtype"] == "bfloat16" else torch.float16
                 logger.info(
-                    "GPU Profile=%s | dtype=%s | offload=%s | vae_tiling=%s | tf32=%s",
+                    "GPU Profile=%s | dtype=%s | offload=%s | vae_tiling=%s | tf32=%s | gguf=%s",
                     profile.display_name,
                     eff["dtype"],
                     eff["offload_mode"],
                     eff["vae_tiling"],
                     eff["allow_tf32"],
+                    gguf_variant,
                 )
 
-                load_kwargs: dict[str, Any] = {
-                    "torch_dtype": dtype,
-                    "low_cpu_mem_usage": True,
-                }
+                if gguf_variant is not None:
+                    pipe = self._load_gguf_pipeline(gguf_variant, eff, dtype, job, _dl_progress)
+                else:
+                    local_model_dir = download_model_fast(
+                        repo_id=self.model_id,
+                        token=self.hf_token or None,
+                        progress_cb=_dl_progress,
+                        use_tqdm=False,
+                    )
 
-                # Apply component-wise quantization (quantize BOTH DiT & Qwen3-VL text_encoder; keep VAE in BF16/FP16)
-                is_prequant = "8bit" in self.model_id.lower() or "int8" in self.model_id.lower() or "fp8" in self.model_id.lower()
-                if not is_prequant and self.quant_mode != "none":
-                    try:
-                        q_cfg, q_desc = build_pipeline_quant_config(self.quant_mode, profile)
-                        if q_cfg is not None:
-                            load_kwargs["quantization_config"] = q_cfg
-                            logger.info("Using PipelineQuantizationConfig: %s", q_desc)
-                            if job:
-                                job.message = f"[{profile.display_name}] 量化配置: {q_desc}..."
-                    except Exception as q_exc:
-                        logger.warning(
-                            "PipelineQuantizationConfig failed (%s); falling back to Diffusers TorchAoConfig('int8wo').",
-                            q_exc,
-                        )
-                        if self.quant_mode in {"fp8-int8", "fp8-all", "int8-torchao"}:
-                            try:
+                    if job and job.cancel_event.is_set():
+                        raise InterruptedError("用户已取消生成")
+
+                    if job:
+                        job.status = "loading_model"
+                        job.progress = max(job.progress, 0.30)
+                        job.message = f"[{profile.display_name}] 正在载入模型权重 ({self.quant_mode})..."
+
+                    load_kwargs: dict[str, Any] = {
+                        "torch_dtype": dtype,
+                        "low_cpu_mem_usage": True,
+                    }
+
+                    # Apply component-wise quantization (quantize BOTH DiT & Qwen3-VL text_encoder; keep VAE in BF16/FP16)
+                    is_prequant = "8bit" in self.model_id.lower() or "int8" in self.model_id.lower() or "fp8" in self.model_id.lower()
+                    if not is_prequant and self.quant_mode != "none":
+                        try:
+                            q_cfg, q_desc = build_pipeline_quant_config(self.quant_mode, profile)
+                            if q_cfg is not None:
+                                load_kwargs["quantization_config"] = q_cfg
+                                logger.info("Using PipelineQuantizationConfig: %s", q_desc)
+                                if job:
+                                    job.message = f"[{profile.display_name}] 量化配置: {q_desc}..."
+                        except Exception as q_exc:
+                            logger.warning(
+                                "PipelineQuantizationConfig failed (%s); falling back to Diffusers TorchAoConfig('int8wo').",
+                                q_exc,
+                            )
+                            if self.quant_mode in {"fp8-int8", "fp8-all", "int8-torchao"}:
                                 try:
-                                    from diffusers import TorchAoConfig
+                                    try:
+                                        from diffusers import TorchAoConfig
+                                    except ImportError:
+                                        from diffusers.quantizers import TorchAoConfig  # type: ignore
+
+                                    load_kwargs["quantization_config"] = TorchAoConfig("int8wo")
+                                except Exception as inner_exc:
+                                    logger.warning("TorchAoConfig fallback unavailable (%s).", inner_exc)
+
+                    def _load_pipe_once(extra_kwargs: dict[str, Any]) -> Any:
+                        try:
+                            return QwenImage21Pipeline.from_pretrained(local_model_dir, local_files_only=True, **extra_kwargs)
+                        except TypeError:
+                            alt_kwargs = dict(extra_kwargs)
+                            alt_kwargs.pop("torch_dtype", None)
+                            alt_kwargs["dtype"] = dtype
+                            return QwenImage21Pipeline.from_pretrained(local_model_dir, local_files_only=True, **alt_kwargs)
+
+                    try:
+                        pipe = _load_pipe_once(load_kwargs)
+                    except Exception as load_exc:
+                        err_text = str(load_exc)
+                        if "Int8WeightOnlyConfig" in err_text or "Version mismatch" in err_text:
+                            logger.warning("Detected torchao Int8WeightOnlyConfig version mismatch (%s); attempting version=2 fallback.", err_text)
+                            recovered = False
+                            try:
+                                from torchao.quantization import Int8WeightOnlyConfig
+
+                                try:
+                                    from diffusers import PipelineQuantizationConfig, TorchAoConfig
                                 except ImportError:
                                     from diffusers.quantizers import TorchAoConfig  # type: ignore
+                                    PipelineQuantizationConfig = None  # type: ignore
 
-                                load_kwargs["quantization_config"] = TorchAoConfig("int8wo")
-                            except Exception as inner_exc:
-                                logger.warning("TorchAoConfig fallback unavailable (%s).", inner_exc)
-
-                def _load_pipe_once(extra_kwargs: dict[str, Any]) -> Any:
-                    try:
-                        return QwenImage21Pipeline.from_pretrained(local_model_dir, local_files_only=True, **extra_kwargs)
-                    except TypeError:
-                        alt_kwargs = dict(extra_kwargs)
-                        alt_kwargs.pop("torch_dtype", None)
-                        alt_kwargs["dtype"] = dtype
-                        return QwenImage21Pipeline.from_pretrained(local_model_dir, local_files_only=True, **alt_kwargs)
-
-                try:
-                    pipe = _load_pipe_once(load_kwargs)
-                except Exception as load_exc:
-                    err_text = str(load_exc)
-                    if "Int8WeightOnlyConfig" in err_text or "Version mismatch" in err_text:
-                        logger.warning("Detected torchao Int8WeightOnlyConfig version mismatch (%s); attempting version=2 fallback.", err_text)
-                        recovered = False
-                        try:
-                            from torchao.quantization import Int8WeightOnlyConfig
-
-                            try:
-                                from diffusers import PipelineQuantizationConfig, TorchAoConfig
-                            except ImportError:
-                                from diffusers.quantizers import TorchAoConfig  # type: ignore
-                                PipelineQuantizationConfig = None  # type: ignore
-
-                            retry_kwargs = dict(load_kwargs)
-                            if PipelineQuantizationConfig is not None:
-                                retry_kwargs["quantization_config"] = PipelineQuantizationConfig(
-                                    quant_mapping={"transformer": TorchAoConfig(Int8WeightOnlyConfig(version=2))}
-                                )
-                            else:
-                                retry_kwargs["quantization_config"] = TorchAoConfig(Int8WeightOnlyConfig(version=2))
-                            pipe = _load_pipe_once(retry_kwargs)
-                            recovered = True
-                        except Exception as retry_exc:
-                            logger.error("torchao version=2 fallback failed: %s", retry_exc)
-                        if not recovered:
-                            raise RuntimeError(
-                                f"TorchAO 量化版本不兼容 ({err_text})。"
-                                "请先在 Colab 重新运行第 1 步（或执行 `pip install -U torchao` 升级 torchao），"
-                                "或在设置中将模型切换为 `Qwen/Qwen-Image-2.1-Turbo`（使用运行时 INT8 量化）。"
-                            ) from load_exc
-                    else:
-                        raise
+                                retry_kwargs = dict(load_kwargs)
+                                if PipelineQuantizationConfig is not None:
+                                    retry_kwargs["quantization_config"] = PipelineQuantizationConfig(
+                                        quant_mapping={"transformer": TorchAoConfig(Int8WeightOnlyConfig(version=2))}
+                                    )
+                                else:
+                                    retry_kwargs["quantization_config"] = TorchAoConfig(Int8WeightOnlyConfig(version=2))
+                                pipe = _load_pipe_once(retry_kwargs)
+                                recovered = True
+                            except Exception as retry_exc:
+                                logger.error("torchao version=2 fallback failed: %s", retry_exc)
+                            if not recovered:
+                                raise RuntimeError(
+                                    f"TorchAO 量化版本不兼容 ({err_text})。"
+                                    "请先在 Colab 重新运行第 1 步（或执行 `pip install -U torchao` 升级 torchao），"
+                                    "或在设置中将模型切换为 `Qwen/Qwen-Image-2.1-Turbo`（使用运行时 INT8 量化）。"
+                                ) from load_exc
+                        else:
+                            raise
 
                 if hasattr(pipe, "vae"):
                     if eff["vae_tiling"] and hasattr(pipe.vae, "enable_tiling"):
@@ -1458,10 +1751,19 @@ class LoraDownloadRequest(BaseModel):
     filename: Optional[str] = Field(default=None, max_length=200)
 
 
+class ComfyLaunchRequest(BaseModel):
+    gguf_variant: Literal["q8", "q4", "both", "none"] = "q4"
+
+
 def collect_models_inventory() -> dict[str, Any]:
     """Collect currently loaded pipeline/LoRA and downloaded HF / LoRA models on disk."""
     hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
     hub_dir = Path(os.environ.get("HF_HUB_CACHE", str(hf_home / "hub")))
+
+    cur_base_repo, _ = strip_model_variant_suffix(engine.model_id)
+    cur_aliases = {cur_base_repo.lower()}
+    if cur_base_repo.lower() == GGUF_BASE_REPO.lower():
+        cur_aliases.add(GGUF_REDIRECTED_REPO.lower())
 
     downloaded_hf: list[dict[str, Any]] = []
     if hub_dir.exists():
@@ -1472,14 +1774,15 @@ def collect_models_inventory() -> dict[str, Any]:
                     snaps_dir = entry / "snapshots"
                     has_snapshot = snaps_dir.exists() and any(snaps_dir.iterdir())
                     size_b = get_dir_size_bytes(entry)
+                    is_cur = repo_id.lower() in cur_aliases
                     downloaded_hf.append(
                         {
                             "repo_id": repo_id,
                             "size_gb": round(size_b / (1024**3), 2),
                             "size_mb": round(size_b / (1024**2), 1),
                             "ready": has_snapshot,
-                            "is_current": repo_id == engine.model_id,
-                            "is_loaded": engine.loaded and repo_id == engine.model_id,
+                            "is_current": is_cur,
+                            "is_loaded": engine.loaded and is_cur,
                         }
                     )
         except OSError:
@@ -1498,6 +1801,7 @@ def collect_models_inventory() -> dict[str, Any]:
             "demo_mode": engine.demo_mode,
             "model_id": engine.model_id,
             "quant_mode": engine.quant_mode,
+            "gguf_variant": resolve_gguf_variant(engine.model_id, engine.quant_mode),
             "device": engine.device,
             "active_lora": active_lora_name,
             "active_lora_weight": engine._active_lora_weight,
@@ -1525,6 +1829,7 @@ def collect_system_stats() -> dict[str, Any]:
 
     eff = engine.effective_settings()
     active_profile: GPUProfile = eff["profile"]
+    gguf_variant: Optional[str] = eff.get("gguf_variant")
 
     gpu_info: dict[str, Any] = {
         "available": False,
@@ -1590,6 +1895,8 @@ def collect_system_stats() -> dict[str, Any]:
         "engine": {
             "model_id": engine.model_id,
             "quant_mode": engine.quant_mode,
+            "gguf_variant": gguf_variant,
+            "is_gguf": gguf_variant is not None,
             "gpu_profile_override": engine.gpu_profile_override,
             "dtype_mode": engine.dtype_mode,
             "offload_mode": engine.offload_mode,
@@ -1834,8 +2141,8 @@ def _build_ai_system_prompt(scene: str, context: dict[str, Any]) -> str:
         f"- 当前模型: {eng.get('model_id')} | 量化: {eng.get('quant_mode')} | 显存调度: {eng.get('effective_offload')} | 已加载: {eng.get('loaded')}\n"
         f"- 可用 LoRA 列表: {', '.join(loras) if loras else '无'}\n"
         f"- 终端当前目录: {terminal.cwd}\n"
-        f"- 支持的仓库预设: Qwen/Qwen-Image-2.1-Turbo (推荐8步), Qwen/Qwen-Image-2.1 (推荐40步), addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit\n"
-        f"- 支持的量化模式: fp8-int8, fp8-all, int8-torchao, int8-bnb, none\n"
+        f"- 支持的仓库预设: Qwen/Qwen-Image-2.1-Turbo (推荐8步), Qwen/Qwen-Image-2.1 (推荐40步), addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit, abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8 (Q8满血, 推荐8步), abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4 (Q4轻量, 推荐8步)\n"
+        f"- 支持的量化模式: fp8-int8, fp8-all, int8-torchao, int8-bnb, gguf-q8-full, gguf-q4, none\n"
         f"- 支持的显存调度: auto, smart_stage_offload, none, model_cpu_offload, sequential_cpu_offload\n"
         f"- 支持的生成比例: 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3\n"
     )
@@ -1985,8 +2292,13 @@ def api_comfyui_status() -> dict[str, Any]:
 
 
 @app.post("/api/comfyui/launch")
-def api_comfyui_launch() -> dict[str, Any]:
-    return comfy_launcher.launch(demo_mode=engine.demo_mode)
+def api_comfyui_launch(req: Optional[ComfyLaunchRequest] = None) -> dict[str, Any]:
+    gguf_variant = req.gguf_variant if req is not None else "q4"
+    return comfy_launcher.launch(
+        demo_mode=engine.demo_mode,
+        gguf_variant=gguf_variant,
+        hf_token=engine.hf_token or None,
+    )
 
 
 @app.post("/api/comfyui/stop")
