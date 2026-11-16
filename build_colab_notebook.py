@@ -1,52 +1,20 @@
 """
-Build a self-contained Google Colab notebook (`Qwen_Image_21_INT8_Colab.ipynb`)
-with high-speed Hugging Face API download (`hf_transfer` + `HF_TOKEN`),
-native in-notebook tqdm progress bars, and direct QR code rendering.
+Build a clean Google Colab notebook (`Qwen_Image_21_INT8_Colab.ipynb`) that clones/syncs
+directly from GitHub (`https://github.com/tangxintx/qwen-image-21-int8-colab.git`),
+with high-speed Hugging Face API download, native tqdm progress bars, and QR rendering.
 """
 
 from __future__ import annotations
 
-import base64
-import io
 import json
-import zipfile
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 OUT_NB = BASE_DIR / "Qwen_Image_21_INT8_Colab.ipynb"
-
-BUNDLE_FILES = [
-    "colab_launch.py",
-    "hf_downloader.py",
-    "swap_manager.py",
-    "lora_manager.py",
-    "comfy_launcher.py",
-    "server.py",
-    "gpu_profiles.py",
-    "terminal_manager.py",
-    "requirements.txt",
-    "static/index.html",
-    "static/styles.css",
-    "static/app.js",
-]
-
-
-def build_bundle_b64() -> str:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-        for rel in BUNDLE_FILES:
-            fpath = BASE_DIR / rel
-            if not fpath.exists():
-                raise FileNotFoundError(f"Missing required file for notebook bundle: {fpath}")
-            zf.write(fpath, arcname=rel)
-    return base64.b64encode(buf.getvalue()).decode("ascii")
+REPO_URL = "https://github.com/tangxintx/qwen-image-21-int8-colab.git"
 
 
 def main() -> None:
-    bundle_b64 = build_bundle_b64()
-    chunks = [bundle_b64[i : i + 100] for i in range(0, len(bundle_b64), 100)]
-    b64_python_literal = "(\n    " + "\n    ".join(f'"{c}"' for c in chunks) + "\n)"
-
     cell1_source = '''#@title 1️⃣ 检查 GPU 并安装依赖环境（含 hf_transfer 极速下载与分步进度条）
 import subprocess
 import sys
@@ -76,16 +44,16 @@ pbar.close()
 print("全部依赖安装完成，请运行第 2 步！")
 '''
 
-    cell2_source = f'''#@title 2️⃣ 配置模型、HF/AI Token 与 GPU 档位并启动（含实时下载进度条与二维码）
-import base64
+    cell2_source = f'''#@title 2️⃣ 从 GitHub 同步最新代码并启动服务（含实时下载进度条与二维码）
 import importlib
-import io
 import os
+import subprocess
 import sys
-import zipfile
 from pathlib import Path
 from tqdm.auto import tqdm
 
+REPO_URL = "{REPO_URL}"  #@param {{type:"string"}}
+BRANCH = "main"  #@param {{type:"string"}}
 EDITION = "L4 24GB 黄金方案 · Turbo FP8 DiT + INT8 编码器 + BF16 VAE (推荐 L4)"  #@param ["L4 24GB 黄金方案 · Turbo FP8 DiT + INT8 编码器 + BF16 VAE (推荐 L4)", "L4 24GB 精绘方案 · Qwen-2.1 FP8 DiT + INT8 编码器 + BF16 VAE 40步", "INT8 轻量省显存版 (Turbo · 推荐 T4/L4)", "满血版 · Turbo 原生BF16/FP16不量化 (适合 A100/H100/G4)", "满血旗舰版 · Qwen-2.1 原生BF16/FP16 40步 (适合 A100-80G/H100/G4)", "自定义下方模型与量化参数"]
 MODEL_ID = "Qwen/Qwen-Image-2.1-Turbo"  #@param ["Qwen/Qwen-Image-2.1-Turbo", "Qwen/Qwen-Image-2.1", "addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit"] {{allow-input: true}}
 HF_TOKEN = ""  #@param {{type:"string"}}
@@ -98,16 +66,29 @@ PRELOAD_MODEL = True  #@param {{type:"boolean"}}
 MOUNT_GDRIVE = False  #@param {{type:"boolean"}}
 DEMO_MODE = False  #@param {{type:"boolean"}}
 
-APP_BUNDLE_B64 = {b64_python_literal}
-
-# 1) 自动释放/同步最新内置项目代码到 /content/qwen_studio（保留已有 outputs 作品目录与本地 .ai_config.json）
+# 1) 从 GitHub 拉取/更新项目代码到 /content/qwen_studio（保留 outputs/、loras/、.ai_config.json）
 work_dir = Path("/content/qwen_studio")
-work_dir.mkdir(parents=True, exist_ok=True)
-with zipfile.ZipFile(io.BytesIO(base64.b64decode(APP_BUNDLE_B64))) as zf:
-    members = zf.infolist()
-    for info in tqdm(members, desc="释放/更新项目文件", unit="文件"):
-        zf.extract(info, work_dir)
-print(f"项目文件已同步至: {{work_dir}}")
+with tqdm(total=2, desc="同步 GitHub 仓库", unit="步") as pbar:
+    if (work_dir / ".git").exists():
+        subprocess.run(["git", "-C", str(work_dir), "remote", "set-url", "origin", REPO_URL], check=True)
+        pbar.update(1)
+        subprocess.run(["git", "-C", str(work_dir), "fetch", "--depth", "1", "origin", BRANCH], check=True)
+        subprocess.run(["git", "-C", str(work_dir), "reset", "--hard", f"origin/{{BRANCH}}"], check=True)
+        pbar.update(1)
+    elif work_dir.exists() and any(work_dir.iterdir()):
+        # Migrate legacy non-git folder in-place without deleting outputs/loras/.ai_config.json
+        subprocess.run(["git", "init", "-b", BRANCH, str(work_dir)], check=True)
+        subprocess.run(["git", "-C", str(work_dir), "remote", "add", "origin", REPO_URL], check=True)
+        pbar.update(1)
+        subprocess.run(["git", "-C", str(work_dir), "fetch", "--depth", "1", "origin", BRANCH], check=True)
+        subprocess.run(["git", "-C", str(work_dir), "reset", "--hard", f"origin/{{BRANCH}}"], check=True)
+        pbar.update(1)
+    else:
+        pbar.update(1)
+        subprocess.run(["git", "clone", "--depth", "1", "--branch", BRANCH, REPO_URL, str(work_dir)], check=True)
+        pbar.update(1)
+
+print(f"已同步 GitHub 最新代码 ({{REPO_URL}} @ {{BRANCH}}) -> {{work_dir}}")
 
 os.chdir(work_dir)
 if str(work_dir) not in sys.path:
@@ -192,8 +173,9 @@ colab_launch.launch_in_colab()
                     "# Qwen-Image-2.1 INT8 · 手机网页创作台 (Google Colab)\n",
                     "\n",
                     "> **说明**：本项目代码由 AI 生成，交互设计与云端部署理念参考 [wy51ai/easycolab](https://github.com/wy51ai/easycolab)。\n",
+                    "> **GitHub 仓库**：[tangxintx/qwen-image-21-int8-colab](https://github.com/tangxintx/qwen-image-21-int8-colab)\n",
                     "\n",
-                    "单文件开箱即用，每一步均带实时进度条：\n",
+                    "每次运行第 2 步会自动从 GitHub 拉取最新代码，每一步均带实时进度条：\n",
                     "- **HF API 极速下载**：内置 `hf_transfer` + `HF_TOKEN` 支持，预下载显示实时 `GB / MB/s` 进度条\n",
                     "- **GPU 硬件自适应**：`G4 · RTX PRO 6000 (96GB)` / `H100 · Hopper SXM (80GB)` / `A100 · Ampere SXM (80GB)` / `L4 · Ada Lovelace (24GB)` / `T4 · Turing (16GB)`\n",
                     "- **四大创作模式**：文生图 / 图生图（多图 `@0,@1`） / 高清修复 / 涂抹局部重绘（支持非标准比例透明图层自动扩图与裁剪还原）\n",
@@ -218,7 +200,7 @@ colab_launch.launch_in_colab()
     }
 
     OUT_NB.write_text(json.dumps(nb, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Generated self-contained notebook: {OUT_NB} ({OUT_NB.stat().st_size} bytes)")
+    print(f"Generated GitHub-synced notebook: {OUT_NB} ({OUT_NB.stat().st_size} bytes)")
 
 
 if __name__ == "__main__":
