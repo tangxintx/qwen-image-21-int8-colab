@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.env
+.venv/
+venv/
+.ai_config.json
+
+outputs/*
+!outputs/.gitkeep
+loras/
+ComfyUI/
+*.log
+*.part
+.DS_Store
+Thumbs.db

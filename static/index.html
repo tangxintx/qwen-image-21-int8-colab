@@ -1,0 +1,1217 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0f19" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>Qwen-Image-2.1 INT8 · EasyColab 移动创作台</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <!-- Vector SVG Icon Sprite -->
+  <svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
+    <symbol id="ic-power" viewBox="0 0 24 24">
+      <path d="M12 2v10" />
+      <path d="M18.36 6.64a9 9 0 1 1-12.73 0" />
+    </symbol>
+    <symbol id="ic-folder" viewBox="0 0 24 24">
+      <path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+    </symbol>
+    <symbol id="ic-image" viewBox="0 0 24 24">
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <circle cx="8.5" cy="9.5" r="1.5" />
+      <path d="m21 16-5-5-5 5-2-2-6 5" />
+    </symbol>
+    <symbol id="ic-brush" viewBox="0 0 24 24">
+      <path d="m14.5 4.5 5 5L8 21l-5 1 1-5z" />
+      <path d="m12 7 5 5" />
+    </symbol>
+    <symbol id="ic-eraser" viewBox="0 0 24 24">
+      <path d="m7 21-4.3-4.3a1 1 0 0 1 0-1.4l9.6-9.6a1 1 0 0 1 1.4 0l5.6 5.6a1 1 0 0 1 0 1.4L11 21z" />
+      <path d="M22 21H7" />
+      <path d="m5 11 9 9" />
+    </symbol>
+    <symbol id="ic-undo" viewBox="0 0 24 24">
+      <path d="M9 14 4 9l5-5" />
+      <path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11" />
+    </symbol>
+    <symbol id="ic-trash" viewBox="0 0 24 24">
+      <path d="M3 6h18" />
+      <path d="M8 6V4h8v2" />
+      <path d="M6 6l1 14a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-14" />
+      <path d="M10 11v6M14 11v6" />
+    </symbol>
+    <symbol id="ic-film" viewBox="0 0 24 24">
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M7 4v16M17 4v16M3 9h4M3 15h4M17 9h4M17 15h4" />
+    </symbol>
+    <symbol id="ic-moon" viewBox="0 0 24 24">
+      <path d="M20.5 14.5A8.5 8.5 0 1 1 9.5 3.5a6.8 6.8 0 0 0 11 11z" />
+    </symbol>
+    <symbol id="ic-palette" viewBox="0 0 24 24">
+      <path d="M12 22a9.8 9.8 0 0 1-9.8-9.8C2.2 6.8 6.8 2.2 12.2 2.2c5.4 0 9.6 3.7 9.6 8.3 0 2.5-1.9 4-4 4h-1.8a1.5 1.5 0 0 0-1.5 1.5c0 .7.4 1.3.7 1.8.4.7.2 1.8-.6 2.5-.6.6-1.5 1.7-2.6 1.7z" />
+      <circle cx="7.5" cy="11.5" r="1" />
+      <circle cx="10.5" cy="7.5" r="1" />
+      <circle cx="15.5" cy="8.5" r="1" />
+    </symbol>
+    <symbol id="ic-camera" viewBox="0 0 24 24">
+      <path d="M4 7h3l2-2h6l2 2h3a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2z" />
+      <circle cx="12" cy="13" r="3.5" />
+    </symbol>
+    <symbol id="ic-sparkles" viewBox="0 0 24 24">
+      <path d="m12 3 1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z" />
+      <path d="M19 16v4M17 18h4M5 4v3M3.5 5.5h3" />
+    </symbol>
+    <symbol id="ic-swap" viewBox="0 0 24 24">
+      <path d="M16 3l4 4-4 4" />
+      <path d="M20 7H4" />
+      <path d="M8 21l-4-4 4-4" />
+      <path d="M4 17h16" />
+    </symbol>
+    <symbol id="ic-dice" viewBox="0 0 24 24">
+      <rect x="4" y="4" width="16" height="16" rx="3" />
+      <circle cx="9" cy="9" r="1" />
+      <circle cx="15" cy="9" r="1" />
+      <circle cx="12" cy="12" r="1" />
+      <circle cx="9" cy="15" r="1" />
+      <circle cx="15" cy="15" r="1" />
+    </symbol>
+    <symbol id="ic-lock" viewBox="0 0 24 24">
+      <rect x="4" y="11" width="16" height="10" rx="2" />
+      <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+    </symbol>
+    <symbol id="ic-play" viewBox="0 0 24 24">
+      <path d="M13 2 4 14h7l-1 8 9-12h-7z" />
+    </symbol>
+    <symbol id="ic-loader" viewBox="0 0 24 24">
+      <path d="M21 12a9 9 0 1 1-6.2-8.56" />
+    </symbol>
+    <symbol id="ic-stop" viewBox="0 0 24 24">
+      <rect x="6" y="6" width="12" height="12" rx="2" />
+    </symbol>
+    <symbol id="ic-refresh" viewBox="0 0 24 24">
+      <path d="M21 12a9 9 0 0 1-15.5 6.36L3 16" />
+      <path d="M3 21v-5h5" />
+      <path d="M3 12a9 9 0 0 1 15.5-6.36L21 8" />
+      <path d="M21 3v5h-5" />
+    </symbol>
+    <symbol id="ic-archive" viewBox="0 0 24 24">
+      <rect x="3" y="4" width="18" height="4" rx="1" />
+      <path d="M5 8v11a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8" />
+      <path d="M10 13h4" />
+    </symbol>
+    <symbol id="ic-check-square" viewBox="0 0 24 24">
+      <rect x="3" y="3" width="18" height="18" rx="3" />
+      <path d="m8 12 3 3 5-6" />
+    </symbol>
+    <symbol id="ic-check" viewBox="0 0 24 24">
+      <path d="m5 12 5 5 9-9" />
+    </symbol>
+    <symbol id="ic-close" viewBox="0 0 24 24">
+      <path d="M18 6 6 18M6 6l12 12" />
+    </symbol>
+    <symbol id="ic-download" viewBox="0 0 24 24">
+      <path d="M12 3v12" />
+      <path d="m7 11 5 5 5-5" />
+      <path d="M4 20h16" />
+    </symbol>
+    <symbol id="ic-repeat" viewBox="0 0 24 24">
+      <path d="m17 2 4 4-4 4" />
+      <path d="M3 11V9a4 4 0 0 1 4-4h14" />
+      <path d="m7 22-4-4 4-4" />
+      <path d="M21 13v2a4 4 0 0 1-4 4H3" />
+    </symbol>
+    <symbol id="ic-clean" viewBox="0 0 24 24">
+      <path d="m15 4 5 5" />
+      <path d="m17 2 5 5-9.5 9.5a2 2 0 0 1-2.8 0l-2.2-2.2a2 2 0 0 1 0-2.8z" />
+      <path d="M7 17l-4 4" />
+    </symbol>
+    <symbol id="ic-eject" viewBox="0 0 24 24">
+      <path d="m12 5-7 8h14z" />
+      <path d="M5 18h14" />
+    </symbol>
+    <symbol id="ic-save" viewBox="0 0 24 24">
+      <path d="M5 3h11l4 4v13a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z" />
+      <path d="M8 3v5h7V3" />
+      <path d="M8 21v-6h8v6" />
+    </symbol>
+    <symbol id="ic-chart" viewBox="0 0 24 24">
+      <path d="M4 20V10" />
+      <path d="M10 20V4" />
+      <path d="M16 20v-7" />
+      <path d="M22 20v-4" />
+    </symbol>
+    <symbol id="ic-terminal" viewBox="0 0 24 24">
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="m7 9 4 3-4 3" />
+      <path d="M13 15h4" />
+    </symbol>
+    <symbol id="ic-settings" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="3" />
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+    </symbol>
+    <symbol id="ic-arrow-up" viewBox="0 0 24 24">
+      <path d="M12 19V5" />
+      <path d="m6 11 6-6 6 6" />
+    </symbol>
+    <symbol id="ic-minus" viewBox="0 0 24 24">
+      <path d="M5 12h14" />
+    </symbol>
+    <symbol id="ic-plus" viewBox="0 0 24 24">
+      <path d="M12 5v14M5 12h14" />
+    </symbol>
+  </svg>
+
+  <div class="app-shell">
+    <!-- Top Sticky Header -->
+    <header class="top-bar">
+      <div class="top-bar-row">
+        <div class="brand">
+          <span class="brand-logo">Q2.1</span>
+          <div class="brand-text">
+            <div class="brand-title">Qwen-Image-2.1 <span class="badge-int8" id="headerQuantBadge">INT8</span></div>
+            <div class="brand-sub" id="engineStatusText">连接中...</div>
+          </div>
+        </div>
+        <button class="btn-power" id="headerShutdownBtn" title="一键关闭">
+          <svg class="icon"><use href="#ic-power" /></svg>
+          <span>关闭</span>
+        </button>
+      </div>
+
+      <!-- Global Top Slim Progress Bar -->
+      <div class="top-progress-track hidden" id="topProgressTrack">
+        <div class="top-progress-fill" id="topProgressFill"></div>
+      </div>
+    </header>
+
+    <!-- Main Scrollable Content -->
+    <main class="main-content">
+      <!-- ==================== TAB 1: STUDIO ==================== -->
+      <section class="tab-panel active" id="tab-studio">
+        <!-- 4 Mode Switcher -->
+        <div class="mode-tabs" role="tablist">
+          <button class="mode-tab active" data-mode="t2i">文生图</button>
+          <button class="mode-tab" data-mode="i2i">图生图</button>
+          <button class="mode-tab" data-mode="hires">高清修复</button>
+          <button class="mode-tab" data-mode="inpaint">局部重绘</button>
+        </div>
+
+        <!-- Reference Image / Mask Canvas Card (for i2i, hires, inpaint) -->
+        <div class="card hidden" id="imageInputCard">
+          <div class="card-header">
+            <span class="card-title" id="imageInputTitle">参考底图</span>
+            <div class="card-actions">
+              <label class="btn-chip btn-upload">
+                <svg class="icon"><use href="#ic-folder" /></svg>
+                <span>主图</span>
+                <input type="file" id="imageFileInput" accept="image/*" hidden />
+              </label>
+              <button class="btn-chip" id="pickFromGalleryBtn">
+                <svg class="icon"><use href="#ic-image" /></svg>
+                <span>作品库</span>
+              </button>
+              <button class="btn-chip danger hidden" id="clearImageBtn">清空</button>
+            </div>
+          </div>
+
+          <div class="upload-placeholder" id="uploadPlaceholder">
+            <div class="upload-icon">
+              <svg class="icon icon-xl"><use href="#ic-image" /></svg>
+            </div>
+            <div class="upload-hint">选择主图或从作品库导入</div>
+          </div>
+
+          <!-- Primary Preview (@0) -->
+          <div class="ref-preview-wrap hidden" id="refPreviewWrap">
+            <span class="ref-role-badge" id="primaryRefBadge" title="点击插入 @0">@0 主图</span>
+            <img id="refPreviewImg" alt="主图" />
+            <div class="ref-meta" id="refImageMeta"></div>
+          </div>
+
+          <!-- Secondary Multi-Image References (@1..@9 for i2i) -->
+          <div class="extra-refs-section hidden" id="extraRefsSection">
+            <div class="extra-refs-head">
+              <div class="extra-refs-title-row">
+                <span class="field-label">次图参考</span>
+                <span class="mini-count-badge" id="extraRefsCount">0/9</span>
+              </div>
+              <label class="btn-chip primary">
+                <svg class="icon"><use href="#ic-plus" /></svg>
+                <span>添加次图</span>
+                <input type="file" id="extraImageFileInput" accept="image/*" multiple hidden />
+              </label>
+            </div>
+            <div class="extra-refs-grid hidden" id="extraRefsGrid"></div>
+          </div>
+
+          <!-- Interactive Touch Inpaint Canvas -->
+          <div class="inpaint-editor hidden" id="inpaintEditor">
+            <div class="inpaint-toolbar">
+              <div class="tool-group">
+                <button class="tool-btn active" id="toolBrushBtn">
+                  <svg class="icon"><use href="#ic-brush" /></svg>
+                  <span>画笔</span>
+                </button>
+                <button class="tool-btn" id="toolEraserBtn">
+                  <svg class="icon"><use href="#ic-eraser" /></svg>
+                  <span>橡皮</span>
+                </button>
+                <button class="tool-btn" id="toolUndoBtn">
+                  <svg class="icon"><use href="#ic-undo" /></svg>
+                  <span>撤销</span>
+                </button>
+                <button class="tool-btn" id="toolClearMaskBtn">
+                  <svg class="icon"><use href="#ic-trash" /></svg>
+                  <span>清空</span>
+                </button>
+              </div>
+              <div class="brush-size-row">
+                <span><strong id="brushSizeVal">36</strong>px</span>
+                <input type="range" id="brushSizeInput" min="8" max="120" value="36" />
+                <label class="toggle-inline" title="勾选后锁定画布防止误涂抹，可上下滑动页面">
+                  <input type="checkbox" id="scrollLockToggle" />
+                  <span>锁屏</span>
+                </label>
+              </div>
+            </div>
+            <div class="canvas-stage" id="canvasStage">
+              <canvas id="bgCanvas"></canvas>
+              <canvas id="maskOverlayCanvas"></canvas>
+            </div>
+          </div>
+        </div>
+
+        <!-- Prompt Card -->
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">提示词</span>
+            <div class="card-actions">
+              <button class="btn-chip ai-btn" id="studioAiBtn" type="button">
+                <svg class="icon"><use href="#ic-sparkles" /></svg>
+                <span>AI 帮写/调参</span>
+              </button>
+              <button class="btn-chip" id="clearPromptBtn">清空</button>
+            </div>
+          </div>
+          <textarea
+            id="promptInput"
+            rows="3"
+            placeholder="输入画面描述（图生图可用 @0 指代主图，@1、@1,2 指代次图）"
+          ></textarea>
+          <div class="quick-tags hidden" id="refMentionBar"></div>
+          <div class="quick-tags" id="quickTags">
+            <button class="tag-chip" data-tag="电影级光影, 8K超清细节, 构图精致">
+              <svg class="icon"><use href="#ic-film" /></svg>
+              <span>电影质感</span>
+            </button>
+            <button class="tag-chip" data-tag="赛博朋克霓虹夜景, 潮湿地面倒影">
+              <svg class="icon"><use href="#ic-moon" /></svg>
+              <span>赛博夜景</span>
+            </button>
+            <button class="tag-chip" data-tag="时尚电商海报设计, 居中构图, 清晰中文排版">
+              <svg class="icon"><use href="#ic-palette" /></svg>
+              <span>海报文字</span>
+            </button>
+            <button class="tag-chip" data-tag="自然人像摄影, 柔焦背景, 细腻皮肤纹理">
+              <svg class="icon"><use href="#ic-camera" /></svg>
+              <span>写实人像</span>
+            </button>
+            <button class="tag-chip" data-tag="二次元日系插画, 厚涂质感, 通透光影">
+              <svg class="icon"><use href="#ic-sparkles" /></svg>
+              <span>二次元</span>
+            </button>
+          </div>
+
+          <details class="sub-details">
+            <summary>反向提示词</summary>
+            <textarea
+              id="negativePromptInput"
+              rows="2"
+              placeholder="不想出现的元素..."
+            ></textarea>
+          </details>
+        </div>
+
+        <!-- Resolution & Aspect Ratio Card -->
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">尺寸与比例</span>
+            <span class="res-badge" id="currentResBadge">1024 × 1024</span>
+          </div>
+
+          <div class="tier-row">
+            <span class="field-label">像素档位</span>
+            <div class="segmented-sm" id="tierSelector">
+              <button class="seg-btn active" data-tier="1k">1K</button>
+              <button class="seg-btn" data-tier="1.5k">1.5K</button>
+              <button class="seg-btn" data-tier="2k">2K</button>
+            </div>
+          </div>
+
+          <div class="ratio-grid" id="ratioSelector">
+            <button class="ratio-chip active" data-ratio="1:1">1:1</button>
+            <button class="ratio-chip" data-ratio="16:9">16:9</button>
+            <button class="ratio-chip" data-ratio="9:16">9:16</button>
+            <button class="ratio-chip" data-ratio="4:3">4:3</button>
+            <button class="ratio-chip" data-ratio="3:4">3:4</button>
+            <button class="ratio-chip" data-ratio="3:2">3:2</button>
+            <button class="ratio-chip" data-ratio="2:3">2:3</button>
+            <button class="ratio-chip" data-ratio="original">原图比例</button>
+            <button class="ratio-chip" data-ratio="custom">自定义</button>
+          </div>
+
+          <div class="manual-res-row">
+            <div class="num-field">
+              <label for="widthInput">宽 (W)</label>
+              <input type="number" id="widthInput" min="256" max="3072" step="16" value="1024" />
+            </div>
+            <button class="btn-swap" id="swapDimBtn" title="交换宽高">
+              <svg class="icon"><use href="#ic-swap" /></svg>
+            </button>
+            <div class="num-field">
+              <label for="heightInput">高 (H)</label>
+              <input type="number" id="heightInput" min="256" max="3072" step="16" value="1024" />
+            </div>
+          </div>
+        </div>
+
+        <!-- Sampling & Generation Parameters Card -->
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">生成参数</span>
+            <button class="btn-chip" id="resetParamsBtn">重置</button>
+          </div>
+
+          <!-- Steps -->
+          <div class="param-block">
+            <div class="param-top">
+              <span>步数 (Steps)</span>
+              <span class="param-val" id="stepsVal">8</span>
+            </div>
+            <input type="range" id="stepsSlider" min="1" max="60" step="1" value="8" />
+            <div class="preset-pills">
+              <button class="mini-pill" data-steps="8">8</button>
+              <button class="mini-pill" data-steps="20">20</button>
+              <button class="mini-pill" data-steps="28">28</button>
+              <button class="mini-pill" data-steps="40">40</button>
+            </div>
+          </div>
+
+          <!-- Denoise -->
+          <div class="param-block" id="denoiseBlock">
+            <div class="param-top">
+              <span>重绘幅度 (Denoise)</span>
+              <span class="param-val" id="denoiseVal">0.75</span>
+            </div>
+            <input type="range" id="denoiseSlider" min="0.05" max="1.0" step="0.05" value="0.75" />
+          </div>
+
+          <!-- Random Seed & Batch Count -->
+          <div class="two-col-params">
+            <div class="param-card-sub">
+              <label class="field-label" for="seedInput">种子 (Seed)</label>
+              <div class="seed-row">
+                <input type="number" id="seedInput" value="-1" />
+                <button class="btn-icon" id="randomSeedBtn" title="随机">
+                  <svg class="icon"><use href="#ic-dice" /></svg>
+                </button>
+                <button class="btn-icon" id="lockLastSeedBtn" title="锁定上次">
+                  <svg class="icon"><use href="#ic-lock" /></svg>
+                </button>
+              </div>
+            </div>
+
+            <div class="param-card-sub">
+              <label class="field-label">张数 (Batch)</label>
+              <div class="stepper">
+                <button class="step-btn" id="batchDecBtn" title="减少">
+                  <svg class="icon"><use href="#ic-minus" /></svg>
+                </button>
+                <span class="step-val" id="batchVal">1</span>
+                <button class="step-btn" id="batchIncBtn" title="增加">
+                  <svg class="icon"><use href="#ic-plus" /></svg>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Advanced Collapsible -->
+          <details class="sub-details">
+            <summary>高级参数</summary>
+            <div class="adv-grid">
+              <div class="param-block">
+                <div class="param-top">
+                  <span>True CFG</span>
+                  <span class="param-val" id="cfgVal">1.0</span>
+                </div>
+                <input type="range" id="cfgSlider" min="1.0" max="8.0" step="0.5" value="1.0" />
+              </div>
+
+              <div class="param-block">
+                <div class="param-top">
+                  <span>高清倍率</span>
+                  <span class="param-val" id="hiresScaleVal">1.5x</span>
+                </div>
+                <input type="range" id="hiresScaleSlider" min="1.0" max="2.5" step="0.25" value="1.5" />
+              </div>
+
+              <div class="param-block">
+                <div class="param-top">
+                  <span>遮罩羽化</span>
+                  <span class="param-val" id="maskBlurVal">8px</span>
+                </div>
+                <input type="range" id="maskBlurSlider" min="0" max="32" step="2" value="8" />
+              </div>
+            </div>
+          </details>
+        </div>
+
+        <!-- LoRA Settings Card (Switchable) -->
+        <div class="card" id="loraCard">
+          <div class="card-header">
+            <span class="card-title">LoRA 设置</span>
+            <label class="toggle-inline">
+              <input type="checkbox" id="loraEnableToggle" />
+              <span>启用</span>
+            </label>
+          </div>
+
+          <div class="lora-body hidden" id="loraPanelBody">
+            <div class="form-group">
+              <label for="loraSelect">/content/loras 模型</label>
+              <div class="seed-row">
+                <select id="loraSelect">
+                  <option value="">请选择 LoRA (.safetensors)...</option>
+                </select>
+                <button class="btn-icon" id="loraRefreshBtn" title="刷新 LoRA 列表">
+                  <svg class="icon"><use href="#ic-refresh" /></svg>
+                </button>
+                <button class="btn-icon danger hidden" id="loraDeleteBtn" title="删除选中的 LoRA">
+                  <svg class="icon"><use href="#ic-trash" /></svg>
+                </button>
+              </div>
+              <div class="lora-warn hidden" id="loraWarnText"></div>
+            </div>
+
+            <div class="form-group">
+              <label for="loraPanelUrlInput">Colab 直链下载 (支持 HF / Civitai)</label>
+              <div class="seed-row">
+                <input type="text" id="loraPanelUrlInput" placeholder="https://..." autocomplete="off" />
+                <button class="btn-chip primary" id="loraPanelDownloadBtn">
+                  <svg class="icon"><use href="#ic-download" /></svg>
+                  <span>下载</span>
+                </button>
+              </div>
+              <input type="password" id="loraPanelTokenInput" placeholder="Token (可选，Civitai/HF)" autocomplete="off" />
+              <div class="progress-wrap compact hidden" id="loraPanelDlProgressWrap">
+                <div class="progress-info">
+                  <span id="loraPanelDlMsg">准备下载...</span>
+                  <span id="loraPanelDlPct">0%</span>
+                </div>
+                <div class="progress-bar-bg">
+                  <div class="progress-bar-fill" id="loraPanelDlFill"></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="two-col-selects">
+              <div class="form-group">
+                <label for="loraTriggerInput">触发词</label>
+                <input type="text" id="loraTriggerInput" placeholder="输入触发词..." autocomplete="off" />
+              </div>
+
+              <div class="form-group">
+                <label for="loraActionMode">作用模式</label>
+                <select id="loraActionMode">
+                  <option value="standard">标准画风模式</option>
+                  <option value="control">参考图控制模式</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="param-block">
+              <div class="param-top">
+                <span>LoRA 权重</span>
+                <span class="param-val" id="loraWeightVal">0.85</span>
+              </div>
+              <input type="range" id="loraWeightSlider" min="0.0" max="1.5" step="0.05" value="0.85" />
+            </div>
+
+            <!-- Control Reference Sub-panel (Pose / Lineart / Edit LoRA) -->
+            <div class="lora-control-panel hidden" id="loraControlPanel">
+              <div class="card-header">
+                <span class="field-label">参考控制图 (Pose / Lineart / 编辑)</span>
+                <div class="card-actions">
+                  <label class="btn-chip">
+                    <svg class="icon"><use href="#ic-folder" /></svg>
+                    <span>上传</span>
+                    <input type="file" id="loraCtrlFileInput" accept="image/*" hidden />
+                  </label>
+                  <button class="btn-chip danger hidden" id="loraCtrlClearBtn">清除</button>
+                </div>
+              </div>
+              <div class="upload-placeholder compact" id="loraCtrlPlaceholder">
+                <div class="upload-hint">上传 Pose / 线稿 / 编辑参考图</div>
+              </div>
+              <div class="ref-preview-wrap hidden" id="loraCtrlPreviewWrap">
+                <img id="loraCtrlPreviewImg" alt="参考控制图" />
+              </div>
+              <div class="param-block">
+                <div class="param-top">
+                  <span>引导强度</span>
+                  <span class="param-val" id="loraCtrlStrengthVal">0.85</span>
+                </div>
+                <input type="range" id="loraCtrlStrengthSlider" min="0.0" max="1.5" step="0.05" value="0.85" />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Generate Action & Progress -->
+        <div class="generate-dock">
+          <div class="notice-banner hidden" id="genNoticeBanner"></div>
+          <div class="error-banner hidden" id="genErrorBanner">
+            <div class="error-banner-text" id="genErrorText"></div>
+            <button class="btn-chip ai-btn" id="errorAskAiBtn" type="button">
+              <svg class="icon"><use href="#ic-sparkles" /></svg>
+              <span>一键询问 AI</span>
+            </button>
+          </div>
+          <div class="progress-wrap hidden" id="progressWrap">
+            <div class="progress-info">
+              <span id="progressMsg">准备中...</span>
+              <span id="progressPct">0%</span>
+            </div>
+            <div class="progress-bar-bg">
+              <div class="progress-bar-fill" id="progressBarFill"></div>
+            </div>
+          </div>
+
+          <div class="action-row">
+            <button class="btn-primary" id="generateBtn">
+              <svg class="icon"><use href="#ic-play" /></svg>
+              <span>开始生成</span>
+            </button>
+            <button class="btn-stop hidden" id="cancelGenBtn">
+              <svg class="icon"><use href="#ic-stop" /></svg>
+              <span>停止</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Latest Output Results -->
+        <div class="card hidden" id="latestResultCard">
+          <div class="card-header">
+            <span class="card-title">本次生成结果</span>
+            <span class="card-sub" id="latestElapsedText"></span>
+          </div>
+          <div class="result-grid" id="latestResultGrid"></div>
+        </div>
+      </section>
+
+      <!-- ==================== TAB 2: GALLERY ==================== -->
+      <section class="tab-panel" id="tab-gallery">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">本地作品库</span>
+            <span class="card-sub" id="gallerySummary">0 张 · 0 MB</span>
+          </div>
+
+          <div class="gallery-controls">
+            <input type="search" id="gallerySearchInput" placeholder="搜索提示词或 Seed..." />
+            <div class="gallery-btn-row">
+              <button class="btn-chip" id="galleryRefreshBtn">
+                <svg class="icon"><use href="#ic-refresh" /></svg>
+                <span>刷新</span>
+              </button>
+              <button class="btn-chip" id="galleryExportBtn">
+                <svg class="icon"><use href="#ic-archive" /></svg>
+                <span>打包ZIP</span>
+              </button>
+              <button class="btn-chip" id="gallerySelectToggleBtn">
+                <svg class="icon"><use href="#ic-check-square" /></svg>
+                <span>多选</span>
+              </button>
+              <button class="btn-chip danger hidden" id="galleryBatchDeleteBtn">
+                <svg class="icon"><use href="#ic-trash" /></svg>
+                <span>删除选中</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="filter-chips" id="galleryFilterChips">
+            <button class="filter-chip active" data-filter="all">全部</button>
+            <button class="filter-chip" data-filter="t2i">文生图</button>
+            <button class="filter-chip" data-filter="i2i">图生图</button>
+            <button class="filter-chip" data-filter="hires">高清修复</button>
+            <button class="filter-chip" data-filter="inpaint">局部重绘</button>
+          </div>
+
+          <div class="progress-wrap compact hidden" id="galleryExportProgressWrap">
+            <div class="progress-info">
+              <span id="galleryExportMsg">正在打包 ZIP...</span>
+              <span id="galleryExportPct">0%</span>
+            </div>
+            <div class="progress-bar-bg">
+              <div class="progress-bar-fill" id="galleryExportBarFill"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="gallery-grid" id="galleryGrid"></div>
+        <div class="empty-state hidden" id="galleryEmptyState">
+          <div><svg class="icon icon-xl"><use href="#ic-image" /></svg></div>
+          <p>作品库暂无图片，快去创作吧！</p>
+        </div>
+      </section>
+
+      <!-- ==================== TAB 3: MONITOR ==================== -->
+      <section class="tab-panel" id="tab-monitor">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">系统资源实时监控</span>
+            <button class="btn-chip" id="refreshStatsBtn">
+              <svg class="icon"><use href="#ic-refresh" /></svg>
+              <span>刷新</span>
+            </button>
+          </div>
+
+          <!-- GPU VRAM -->
+          <div class="gauge-block">
+            <div class="gauge-head">
+              <div>
+                <div class="gauge-title">GPU 显存 (VRAM)</div>
+                <div class="gauge-sub" id="gpuNameText">检测中...</div>
+              </div>
+              <div class="gauge-val" id="vramText">-- / -- GB</div>
+            </div>
+            <div class="gauge-track"><div class="gauge-fill vram" id="vramBar"></div></div>
+          </div>
+
+          <!-- System RAM -->
+          <div class="gauge-block">
+            <div class="gauge-head">
+              <div>
+                <div class="gauge-title">系统内存 (RAM)</div>
+              </div>
+              <div class="gauge-val" id="ramText">-- / -- GB</div>
+            </div>
+            <div class="gauge-track"><div class="gauge-fill ram" id="ramBar"></div></div>
+          </div>
+
+          <!-- Linux Swap -->
+          <div class="gauge-block">
+            <div class="gauge-head">
+              <div>
+                <div class="gauge-title">虚拟内存 (Swap)</div>
+                <div class="gauge-sub" id="swapSubText">--</div>
+              </div>
+              <div class="gauge-val" id="swapText">-- / -- GB</div>
+            </div>
+            <div class="gauge-track"><div class="gauge-fill swap" id="swapBar"></div></div>
+          </div>
+
+          <!-- Disk Storage -->
+          <div class="gauge-block">
+            <div class="gauge-head">
+              <div>
+                <div class="gauge-title">磁盘储存空间 (Disk)</div>
+                <div class="gauge-sub" id="diskFreeText">可用 -- GB</div>
+              </div>
+              <div class="gauge-val" id="diskText">-- / -- GB</div>
+            </div>
+            <div class="gauge-track"><div class="gauge-fill disk" id="diskBar"></div></div>
+          </div>
+
+          <div class="storage-breakdown">
+            <div class="breakdown-item">
+              <span>作品库占用</span>
+              <strong id="outputsSizeText">-- MB</strong>
+            </div>
+            <div class="breakdown-item">
+              <span>HF 模型缓存</span>
+              <strong id="hfCacheSizeText">-- GB</strong>
+            </div>
+            <div class="breakdown-item">
+              <span>模型状态</span>
+              <strong id="modelLoadedText">--</strong>
+            </div>
+          </div>
+
+          <div class="uptime-bar-box">
+            <span>已运行时间：</span>
+            <strong id="uptimeText">00:00:00</strong>
+          </div>
+
+          <div class="gpu-profile-box" id="gpuProfileBox">
+            <div class="gpu-profile-head">
+              <span class="badge-int8" id="gpuProfileBadge">GPU 适配</span>
+              <strong id="gpuProfileTitle">检测中...</strong>
+            </div>
+            <div class="gpu-profile-meta" id="gpuProfileMeta">--</div>
+            <div class="gpu-profile-notes" id="gpuProfileNotes">--</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">运维与一键关闭</span>
+          </div>
+          <div class="ops-stack">
+            <button class="btn-ops" id="enableSwapBtn">
+              <svg class="icon"><use href="#ic-swap" /></svg>
+              <span>开启 8GB Swap</span>
+            </button>
+            <button class="btn-ops" id="freeVramBtn">
+              <svg class="icon"><use href="#ic-clean" /></svg>
+              <span>释放 CUDA 显存</span>
+            </button>
+            <button class="btn-ops" id="unloadModelBtn">
+              <svg class="icon"><use href="#ic-eject" /></svg>
+              <span>卸载模型</span>
+            </button>
+            <button class="btn-ops warn" id="clearHfCacheBtn">
+              <svg class="icon"><use href="#ic-trash" /></svg>
+              <span>清理 HF 缓存</span>
+            </button>
+            <button class="btn-ops danger" id="monitorShutdownBtn">
+              <svg class="icon"><use href="#ic-power" /></svg>
+              <span>关闭服务</span>
+            </button>
+          </div>
+
+          <div class="progress-wrap compact hidden" id="opsProgressWrap">
+            <div class="progress-info">
+              <span id="opsProgressMsg">正在执行...</span>
+              <span id="opsProgressPct">处理中</span>
+            </div>
+            <div class="progress-bar-bg">
+              <div class="progress-bar-fill indeterminate" id="opsProgressBarFill"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" id="monitorModelsCard">
+          <div class="card-header">
+            <span class="card-title">已加载与已下载模型</span>
+            <button class="btn-chip" id="refreshModelsBtn" type="button">
+              <svg class="icon"><use href="#ic-refresh" /></svg>
+              <span>刷新</span>
+            </button>
+          </div>
+
+          <div class="models-subsection">
+            <div class="field-label">当前已加载模型</div>
+            <div class="model-list" id="monitorLoadedModels"></div>
+          </div>
+
+          <div class="models-subsection">
+            <div class="field-label">已下载底模缓存 (Hugging Face)</div>
+            <div class="model-list" id="monitorDownloadedHf"></div>
+          </div>
+
+          <div class="models-subsection">
+            <div class="field-label">已下载 LoRA 权重 (/content/loras)</div>
+            <div class="model-list" id="monitorDownloadedLoras"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== TAB 4: TERMINAL ==================== -->
+      <section class="tab-panel" id="tab-terminal">
+        <div class="card terminal-card">
+          <div class="card-header">
+            <div>
+              <div class="card-title">Colab 手机端 Web 终端</div>
+              <div class="card-sub terminal-cwd" id="terminalCwdText">~</div>
+            </div>
+            <div class="card-actions">
+              <button class="btn-chip active" id="termModeShellBtn">Shell</button>
+              <button class="btn-chip" id="termDownloadLoraBtn">
+                <svg class="icon"><use href="#ic-download" /></svg>
+                <span>下载LORA</span>
+              </button>
+              <button class="btn-chip" id="termModeLogsBtn">服务日志</button>
+              <button class="btn-chip" id="termClearBtn">清屏</button>
+            </div>
+          </div>
+
+          <div class="quick-tags" id="termQuickCmds">
+            <button class="tag-chip ai-chip" id="termAskAiBtn" type="button">
+              <svg class="icon"><use href="#ic-sparkles" /></svg>
+              <span>询问AI</span>
+            </button>
+            <button class="tag-chip" data-cmd="nvidia-smi">nvidia-smi</button>
+            <button class="tag-chip" data-cmd="free -h">free -h</button>
+            <button class="tag-chip" data-cmd="df -h">df -h</button>
+            <button class="tag-chip" data-cmd="PYTHONPATH=/content/qwen_studio:. python -c &quot;from swap_manager import enable_linux_swap; print(enable_linux_swap(8)['message'])&quot; && free -h">开启8G Swap</button>
+            <button class="tag-chip" data-cmd="python -c &quot;import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')&quot;">PyTorch GPU</button>
+            <button class="tag-chip" data-cmd="pip list | grep -iE &quot;diffusers|torch|transformers|torchao|accelerate&quot;">核心库版本</button>
+            <button class="tag-chip" data-cmd="ls -lh outputs">查看作品文件</button>
+          </div>
+
+          <pre class="terminal-screen" id="terminalScreen">Web 终端就绪
+</pre>
+
+          <div class="progress-wrap compact hidden" id="termProgressWrap">
+            <div class="progress-info">
+              <span id="termProgressMsg">命令执行中...</span>
+              <span id="termProgressElapsed">0.0s</span>
+            </div>
+            <div class="progress-bar-bg">
+              <div class="progress-bar-fill indeterminate" id="termProgressBarFill"></div>
+            </div>
+          </div>
+
+          <div class="terminal-input-row" id="terminalInputBar">
+            <button class="btn-icon" id="termHistUpBtn" title="上一条历史">
+              <svg class="icon"><use href="#ic-arrow-up" /></svg>
+            </button>
+            <input type="text" id="terminalCmdInput" placeholder="输入 Shell 命令，如 nvidia-smi / ls -la ..." autocomplete="off" autocapitalize="off" spellcheck="false" />
+            <button class="btn-chip primary" id="termRunBtn">运行</button>
+            <button class="btn-chip danger hidden" id="termKillBtn">
+              <svg class="icon"><use href="#ic-stop" /></svg>
+              <span>中断</span>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== TAB 5: SETTINGS ==================== -->
+      <section class="tab-panel" id="tab-settings">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">模型版本、GPU 档位与量化配置</span>
+          </div>
+
+          <div class="form-group">
+            <label>一键版本切换（L4 FP8 黄金方案 / INT8 / 满血无损）</label>
+            <div class="quick-tags" id="editionQuickBtns">
+              <button class="tag-chip" data-model="Qwen/Qwen-Image-2.1-Turbo" data-quant="fp8-int8" data-offload="smart_stage_offload" data-steps="8">L4 黄金方案 (FP8 DiT + INT8编码 + BF16 VAE)</button>
+              <button class="tag-chip" data-model="Qwen/Qwen-Image-2.1" data-quant="fp8-int8" data-offload="smart_stage_offload" data-steps="40">L4 精绘 (Qwen-2.1 FP8+INT8 · 40步)</button>
+              <button class="tag-chip" data-model="Qwen/Qwen-Image-2.1-Turbo" data-quant="int8-torchao" data-offload="auto" data-steps="8">Turbo INT8 全8bit (8步)</button>
+              <button class="tag-chip" data-model="Qwen/Qwen-Image-2.1-Turbo" data-quant="none" data-offload="auto" data-steps="8">Turbo 满血原生不量化 (8步)</button>
+              <button class="tag-chip" data-model="Qwen/Qwen-Image-2.1" data-quant="none" data-offload="auto" data-steps="40">Qwen-2.1 满血旗舰版 (BF16 · 40步)</button>
+              <button class="tag-chip" data-model="addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit" data-quant="int8-torchao" data-offload="auto" data-steps="8">预量化 8bit (8步)</button>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="modelSelect">选择模型仓库</label>
+            <select id="modelSelect">
+              <option value="Qwen/Qwen-Image-2.1-Turbo">Qwen/Qwen-Image-2.1-Turbo (8步极速)</option>
+              <option value="Qwen/Qwen-Image-2.1">Qwen/Qwen-Image-2.1 (满血基础版 · 40步精绘)</option>
+              <option value="addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit">addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit (预量化)</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label for="gpuProfileSelect">GPU 硬件适配预设</label>
+            <select id="gpuProfileSelect">
+              <option value="auto">自动识别 Colab GPU (推荐)</option>
+              <option value="g4_rtx_pro_6000">G4 · RTX PRO 6000 (96GB · Blackwell)</option>
+              <option value="h100_sxm">H100 · Hopper SXM (80GB)</option>
+              <option value="a100_sxm">A100 · Ampere SXM (80GB)</option>
+              <option value="l4_ada">L4 · Ada Lovelace (24GB)</option>
+              <option value="t4_turing">T4 · Turing (16GB)</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label for="quantSelect">量化 / 满血精度模式（DiT &amp; Qwen3-VL 同级量化，VAE 固定原版 BF16）</label>
+            <select id="quantSelect">
+              <option value="fp8-int8">L4 FP8 混合 (FP8 DiT + INT8 文本编码器 + BF16 VAE)</option>
+              <option value="fp8-all">全 FP8 (FP8 DiT + FP8 文本编码器 + BF16 VAE)</option>
+              <option value="int8-torchao">TorchAO 全 INT8 (INT8 DiT + INT8 文本编码器 + BF16 VAE)</option>
+              <option value="int8-bnb">BitsAndBytes 8-bit</option>
+              <option value="none">满血原生精度 (BF16/FP16 不量化 · 适合 80G/96G 显卡)</option>
+            </select>
+          </div>
+
+          <div class="two-col-selects">
+            <div class="form-group">
+              <label for="dtypeSelect">计算精度 (Dtype)</label>
+              <select id="dtypeSelect">
+                <option value="auto">按显卡自动 (T4用FP16 / A100+用BF16)</option>
+                <option value="bfloat16">强制 BFloat16</option>
+                <option value="float16">强制 Float16</option>
+              </select>
+            </div>
+
+            <div class="form-group">
+              <label for="offloadSelect">显存卸载调度策略</label>
+              <select id="offloadSelect">
+                <option value="auto">按显卡自动 (L4用智能分阶段)</option>
+                <option value="smart_stage_offload">智能分阶段调度 (仿ComfyUI · 算完文本踢回内存)</option>
+                <option value="none">全显存驻留 (G4/H100/A100)</option>
+                <option value="model_cpu_offload">Model CPU Offload (T4)</option>
+                <option value="sequential_cpu_offload">Sequential Offload (极限省显存)</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="vaeTilingSelect">VAE 分块解码</label>
+            <select id="vaeTilingSelect">
+              <option value="auto">按显卡自动</option>
+              <option value="on">开启</option>
+              <option value="off">关闭</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label for="hfTokenInput">HF Token</label>
+            <input type="password" id="hfTokenInput" placeholder="hf_..." autocomplete="off" />
+          </div>
+
+          <button class="btn-primary full" id="saveConfigBtn">
+            <svg class="icon"><use href="#ic-save" /></svg>
+            <span>保存配置</span>
+          </button>
+        </div>
+
+        <!-- AI Assistant API Settings Card -->
+        <div class="card" id="aiConfigCard">
+          <div class="card-header">
+            <span class="card-title">AI 助手 API 配置</span>
+            <span class="badge-int8" id="aiModelBadge">qwen3.8-27b</span>
+          </div>
+
+          <div class="form-group">
+            <label for="aiEndpointInput">API 接口地址 (OpenAI 兼容)</label>
+            <input type="text" id="aiEndpointInput" value="https://api.pie-xian.com/v1/chat/completions" placeholder="https://api.pie-xian.com/v1/chat/completions" autocomplete="off" />
+          </div>
+
+          <div class="two-col-selects">
+            <div class="form-group">
+              <label for="aiModelInput">AI 模型名称</label>
+              <input type="text" id="aiModelInput" value="qwen3.8-27b" placeholder="qwen3.8-27b" autocomplete="off" />
+            </div>
+
+            <div class="form-group">
+              <label for="aiApiKeyInput">API Key</label>
+              <input type="password" id="aiApiKeyInput" placeholder="sk-... (可在 Colab 第2步或此处填入)" autocomplete="off" />
+            </div>
+          </div>
+
+          <div class="action-row">
+            <button class="btn-primary" id="saveAiConfigBtn" type="button">
+              <svg class="icon"><use href="#ic-save" /></svg>
+              <span>保存 AI 配置</span>
+            </button>
+            <button class="btn-chip" id="testAiConfigBtn" type="button">
+              <svg class="icon"><use href="#ic-sparkles" /></svg>
+              <span>测试连接</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- On-demand ComfyUI Launcher Card -->
+        <div class="card" id="comfyLauncherCard">
+          <div class="card-header">
+            <span class="card-title">ComfyUI 启动器</span>
+            <span class="badge-int8" id="comfyStatusBadge">未启动</span>
+          </div>
+          <div class="progress-wrap compact hidden" id="comfyProgressWrap">
+            <div class="progress-info">
+              <span id="comfyProgressMsg">准备中...</span>
+              <span id="comfyProgressPct">0%</span>
+            </div>
+            <div class="progress-bar-bg">
+              <div class="progress-bar-fill" id="comfyProgressFill"></div>
+            </div>
+          </div>
+          <div class="action-row">
+            <button class="btn-primary" id="comfyLaunchBtn">
+              <svg class="icon"><use href="#ic-play" /></svg>
+              <span>下载并启动 ComfyUI</span>
+            </button>
+            <a class="btn-chip primary hidden" id="comfyOpenLink" href="#" target="_blank">打开 ComfyUI</a>
+            <button class="btn-stop hidden" id="comfyStopBtn">
+              <svg class="icon"><use href="#ic-stop" /></svg>
+              <span>停止</span>
+            </button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Bottom Mobile Navigation -->
+    <nav class="bottom-nav">
+      <button class="nav-item active" data-tab="studio">
+        <span class="nav-icon"><svg class="icon icon-lg"><use href="#ic-palette" /></svg></span>
+        <span class="nav-label">创作</span>
+      </button>
+      <button class="nav-item" data-tab="gallery">
+        <span class="nav-icon"><svg class="icon icon-lg"><use href="#ic-image" /></svg></span>
+        <span class="nav-label">作品库</span>
+      </button>
+      <button class="nav-item" data-tab="monitor">
+        <span class="nav-icon"><svg class="icon icon-lg"><use href="#ic-chart" /></svg></span>
+        <span class="nav-label">监控</span>
+      </button>
+      <button class="nav-item" data-tab="terminal">
+        <span class="nav-icon"><svg class="icon icon-lg"><use href="#ic-terminal" /></svg></span>
+        <span class="nav-label">终端</span>
+      </button>
+      <button class="nav-item" data-tab="settings">
+        <span class="nav-icon"><svg class="icon icon-lg"><use href="#ic-settings" /></svg></span>
+        <span class="nav-label">设置</span>
+      </button>
+    </nav>
+  </div>
+
+  <!-- Lightbox Modal -->
+  <div class="modal hidden" id="lightboxModal">
+    <div class="modal-backdrop" id="lightboxBackdrop"></div>
+    <div class="modal-sheet lightbox-sheet">
+      <div class="modal-top">
+        <span class="modal-title" id="lightboxTitle">作品详情</span>
+        <button class="btn-close" id="lightboxCloseBtn" title="关闭">
+          <svg class="icon"><use href="#ic-close" /></svg>
+        </button>
+      </div>
+      <div class="lightbox-img-wrap">
+        <img id="lightboxImg" alt="Preview" />
+      </div>
+      <div class="lightbox-meta" id="lightboxMeta"></div>
+      <div class="lightbox-actions">
+        <a class="btn-chip primary" id="lbDownloadBtn" download>
+          <svg class="icon"><use href="#ic-download" /></svg>
+          <span>下载原图</span>
+        </a>
+        <button class="btn-chip" id="lbReuseParamsBtn">
+          <svg class="icon"><use href="#ic-repeat" /></svg>
+          <span>复用参数</span>
+        </button>
+        <button class="btn-chip" id="lbToI2IBtn">
+          <svg class="icon"><use href="#ic-palette" /></svg>
+          <span>主图(@0)</span>
+        </button>
+        <button class="btn-chip" id="lbAddExtraRefBtn">
+          <svg class="icon"><use href="#ic-plus" /></svg>
+          <span>添为次图</span>
+        </button>
+        <button class="btn-chip" id="lbToHiresBtn">
+          <svg class="icon"><use href="#ic-sparkles" /></svg>
+          <span>高清修复</span>
+        </button>
+        <button class="btn-chip" id="lbToInpaintBtn">
+          <svg class="icon"><use href="#ic-brush" /></svg>
+          <span>局部重绘</span>
+        </button>
+        <button class="btn-chip danger" id="lbDeleteBtn">
+          <svg class="icon"><use href="#ic-trash" /></svg>
+          <span>删除</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Shutdown Confirm Modal -->
+  <div class="modal hidden" id="shutdownModal">
+    <div class="modal-backdrop" id="shutdownBackdrop"></div>
+    <div class="modal-sheet confirm-sheet">
+      <div class="modal-top">
+        <span class="modal-title modal-title-row">
+          <svg class="icon"><use href="#ic-power" /></svg>
+          <span>一键关闭确认</span>
+        </span>
+        <button class="btn-close" id="shutdownCancelBtn" title="关闭">
+          <svg class="icon"><use href="#ic-close" /></svg>
+        </button>
+      </div>
+      <p class="confirm-desc">
+        将立即卸载 Qwen-Image-2.1 模型、释放显存并停止 Web 服务与内网穿透隧道。
+      </p>
+      <label class="switch-row compact">
+        <div>
+          <div class="switch-title">同时断开 Google Colab GPU 运行时</div>
+          <div class="switch-desc">调用 runtime.unassign() 停止消耗 Colab 计算单元</div>
+        </div>
+        <input type="checkbox" id="unassignColabCheck" />
+      </label>
+      <div class="confirm-btns">
+        <button class="btn-secondary" id="shutdownDismissBtn">取消</button>
+        <button class="btn-danger" id="shutdownConfirmBtn">确认关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- LoRA Download Modal (from Terminal) -->
+  <div class="modal hidden" id="loraDownloadModal">
+    <div class="modal-backdrop" id="loraModalBackdrop"></div>
+    <div class="modal-sheet confirm-sheet">
+      <div class="modal-top">
+        <span class="modal-title modal-title-row">
+          <svg class="icon"><use href="#ic-download" /></svg>
+          <span>下载 LoRA 到 /content/loras</span>
+        </span>
+        <button class="btn-close" id="loraModalCloseBtn" title="关闭">
+          <svg class="icon"><use href="#ic-close" /></svg>
+        </button>
+      </div>
+      <div class="form-group">
+        <label for="modalLoraUrlInput">下载链接 (HF / Civitai / 直链)</label>
+        <input type="text" id="modalLoraUrlInput" placeholder="https://civitai.com/api/download/models/..." autocomplete="off" />
+      </div>
+      <div class="form-group">
+        <label for="modalLoraTokenInput">Token (可选，支持 Civitai / HF)</label>
+        <input type="password" id="modalLoraTokenInput" placeholder="可选填写 API Token..." autocomplete="off" />
+      </div>
+      <div class="progress-wrap compact hidden" id="modalLoraProgressWrap">
+        <div class="progress-info">
+          <span id="modalLoraProgressMsg">准备下载...</span>
+          <span id="modalLoraProgressPct">0%</span>
+        </div>
+        <div class="progress-bar-bg">
+          <div class="progress-bar-fill" id="modalLoraProgressFill"></div>
+        </div>
+      </div>
+      <div class="confirm-btns">
+        <button class="btn-secondary" id="loraModalCancelBtn">取消</button>
+        <button class="btn-primary" id="loraModalConfirmBtn">开始下载</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- AI Assistant Modal -->
+  <div class="modal hidden" id="aiAssistantModal">
+    <div class="modal-backdrop" id="aiModalBackdrop"></div>
+    <div class="modal-sheet ai-sheet">
+      <div class="modal-top">
+        <span class="modal-title modal-title-row">
+          <svg class="icon"><use href="#ic-sparkles" /></svg>
+          <span id="aiModalTitle">AI 智能助手</span>
+        </span>
+        <div class="card-actions">
+          <button class="btn-chip" id="aiClearChatBtn" type="button">清空对话</button>
+          <button class="btn-close" id="aiModalCloseBtn" title="关闭" type="button">
+            <svg class="icon"><use href="#ic-close" /></svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="quick-tags" id="aiQuickPrompts"></div>
+
+      <div class="ai-chat-list" id="aiChatList"></div>
+
+      <div class="ai-input-row">
+        <textarea id="aiChatInput" rows="2" placeholder="向 AI 提问：写提示词、调参数、改设置、排错或生成终端命令..."></textarea>
+        <button class="btn-primary ai-send-btn" id="aiChatSendBtn" type="button">
+          <svg class="icon"><use href="#ic-sparkles" /></svg>
+          <span>发送</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Notification -->
+  <div class="toast hidden" id="toastEl"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,469 @@
+"""
+LoRA Manager for Qwen-Image-2.1 INT8 / FP8 Colab Studio.
+- Manages `/content/loras` (Colab) or local fallback directory
+- Downloads LoRA weights from direct URLs, Hugging Face, and Civitai (with API page resolution + token)
+- Validates `.safetensors` headers to reject HTML/login error pages before saving
+- Auto-remaps non-standard `.safetensors` prefixes (e.g., ComfyUI `diffusion_model.`) for Diffusers
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import struct
+import threading
+import time
+import urllib.parse
+import urllib.request
+import uuid
+from pathlib import Path
+from typing import Any, Optional
+
+logger = logging.getLogger("qwen_easycolab.lora")
+
+ALLOWED_LORA_EXTS = {".safetensors", ".pt", ".bin", ".ckpt"}
+_MIN_VALID_LORA_BYTES = 16 * 1024  # 16 KB minimum sanity floor for real weight files
+_MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024  # 100 MB safety cap
+
+
+def get_loras_dir(base_dir: Optional[Path] = None) -> Path:
+    """Resolve `/content/loras` on Colab/Linux when writable, otherwise `<base_dir>/loras`."""
+    env_dir = os.environ.get("QWEN_LORAS_DIR", "").strip()
+    if env_dir:
+        p = Path(env_dir).expanduser().resolve()
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    colab_root = Path("/content")
+    if os.name != "nt" and colab_root.exists() and os.access(colab_root, os.W_OK):
+        p = colab_root / "loras"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    fallback_base = base_dir or Path(__file__).resolve().parent
+    p = (fallback_base / "loras").resolve()
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def validate_lora_file(lora_path: Path) -> tuple[bool, Optional[str]]:
+    """
+    Validate that a LoRA file is a genuine binary weight file and not a saved HTML/JSON error page.
+    Returns `(is_valid, issue_reason)`.
+    """
+    if not lora_path.exists() or not lora_path.is_file():
+        return False, "文件不存在"
+    try:
+        size = lora_path.stat().st_size
+    except OSError as exc:
+        return False, f"无法读取文件大小: {exc}"
+
+    if size == 0:
+        return False, "文件为空 (0 B)"
+
+    try:
+        with open(lora_path, "rb") as f:
+            prefix = f.read(16)
+    except OSError as exc:
+        return False, f"无法读取文件头: {exc}"
+
+    stripped = prefix.lstrip()
+    if stripped.startswith((b"<!DOCTYPE", b"<!doctype", b"<html", b"<HTML", b"<?xml")):
+        return False, "文件内容为 HTML 网页（可能缺少 Civitai Token 或下载链接不是权重直链）"
+
+    if lora_path.suffix.lower() == ".safetensors":
+        if len(prefix) < 8:
+            return False, "safetensors 文件头过短"
+        header_len = struct.unpack("<Q", prefix[:8])[0]
+        if header_len < 2 or header_len > _MAX_SAFETENSORS_HEADER_BYTES or (8 + header_len) > size:
+            return (
+                False,
+                f"safetensors 文件头异常 (header_len={header_len}, size={size})，文件可能已损坏或为网页错误页",
+            )
+        try:
+            with open(lora_path, "rb") as f:
+                f.seek(8)
+                header_bytes = f.read(min(header_len, 4096))
+                # Quick sanity check that header starts like JSON object
+                if not header_bytes.lstrip().startswith(b"{"):
+                    return False, "safetensors 元数据非 JSON 格式"
+                if header_len <= 1024 * 1024:
+                    f.seek(8)
+                    full_hdr = f.read(header_len).decode("utf-8")
+                    parsed = json.loads(full_hdr)
+                    if not isinstance(parsed, dict):
+                        return False, "safetensors 元数据结构异常"
+        except Exception:
+            return False, "safetensors 文件头解析失败，请重新下载"
+    elif size < _MIN_VALID_LORA_BYTES and b"DEMO_LORA_PLACEHOLDER" not in prefix:
+        return False, f"权重文件过小 ({size} B)，可能下载不完整"
+
+    return True, None
+
+
+def list_loras(loras_dir: Path) -> list[dict[str, Any]]:
+    """List available LoRA files under `loras_dir` sorted by newest first."""
+    if not loras_dir.exists():
+        return []
+    items: list[dict[str, Any]] = []
+    for entry in loras_dir.iterdir():
+        if entry.is_file() and entry.suffix.lower() in ALLOWED_LORA_EXTS:
+            st = entry.stat()
+            valid, issue = validate_lora_file(entry)
+            # Allow demo placeholder in test/demo environments without flagging broken
+            if not valid and entry.stat().st_size < 128:
+                try:
+                    if entry.read_bytes().startswith(b"DEMO_LORA_PLACEHOLDER"):
+                        valid, issue = True, None
+                except OSError:
+                    pass
+            items.append(
+                {
+                    "name": entry.name,
+                    "path": str(entry),
+                    "size_mb": round(st.st_size / (1024 * 1024), 2),
+                    "size_bytes": st.st_size,
+                    "mtime": st.st_mtime,
+                    "valid": valid,
+                    "issue": issue,
+                }
+            )
+    items.sort(key=lambda x: x["mtime"], reverse=True)
+    return items
+
+
+def delete_lora(loras_dir: Path, filename: str) -> bool:
+    """Safely delete a LoRA file inside `loras_dir`."""
+    safe_name = Path(filename).name
+    if not safe_name:
+        return False
+    target = (loras_dir / safe_name).resolve()
+    if target.parent != loras_dir.resolve() or not target.exists() or not target.is_file():
+        return False
+    target.unlink()
+    return True
+
+
+def normalize_download_url(url: str, token: Optional[str] = None) -> tuple[str, dict[str, str]]:
+    """Normalize Hugging Face `/blob/` links and Civitai download auth cleanly."""
+    clean_url = url.strip()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Qwen-Image-2.1-EasyColab/1.0",
+    }
+    tok = (token or "").strip()
+
+    if "huggingface.co/" in clean_url and "/blob/" in clean_url:
+        clean_url = clean_url.replace("/blob/", "/resolve/")
+
+    if "civitai.com" in clean_url:
+        parsed = urllib.parse.urlparse(clean_url)
+        qs = urllib.parse.parse_qs(parsed.query)
+        if parsed.path.startswith("/models/") and "/api/download/" not in parsed.path:
+            ver_id = qs.get("modelVersionId", [None])[0]
+            if ver_id:
+                clean_url = f"https://civitai.com/api/download/models/{ver_id}"
+        elif parsed.path.startswith("/model-versions/"):
+            ver_m = re.match(r"^/model-versions/(\d+)", parsed.path)
+            if ver_m:
+                clean_url = f"https://civitai.com/api/download/models/{ver_m.group(1)}"
+        if tok:
+            headers["Authorization"] = f"Bearer {tok}"
+            sep = "&" if "?" in clean_url else "?"
+            if "token=" not in clean_url:
+                clean_url = f"{clean_url}{sep}token={urllib.parse.quote(tok)}"
+    elif tok:
+        headers["Authorization"] = f"Bearer {tok}"
+
+    return clean_url, headers
+
+
+def resolve_download_target(url: str, token: Optional[str] = None) -> tuple[str, dict[str, str], Optional[str]]:
+    """
+    Resolve Civitai model page URLs lacking `?modelVersionId=...` (such as
+    `https://civitai.com/models/3027392/poselineartlora`) via Civitai's v1 API
+    so we download the actual model weights instead of an HTML web page.
+    Returns `(download_url, headers, suggested_filename)`.
+    """
+    req_url, headers = normalize_download_url(url, token=token)
+    suggested_name: Optional[str] = None
+
+    parsed = urllib.parse.urlparse(req_url)
+    if "civitai.com" in parsed.netloc.lower() and "/api/download/" not in parsed.path:
+        model_match = re.match(r"^/models/(\d+)", parsed.path)
+        if model_match:
+            model_id = model_match.group(1)
+            api_url = f"https://civitai.com/api/v1/models/{model_id}"
+            api_headers = {
+                "User-Agent": headers["User-Agent"],
+                "Accept": "application/json",
+            }
+            if "Authorization" in headers:
+                api_headers["Authorization"] = headers["Authorization"]
+            api_req = urllib.request.Request(api_url, headers=api_headers)
+            try:
+                with urllib.request.urlopen(api_req, timeout=20) as resp:
+                    payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+            except Exception as exc:
+                raise RuntimeError(
+                    f"解析 Civitai 模型页面失败 ({exc})。请检查链接或改用带 modelVersionId 的下载直链（如需登录请填写 Civitai Token）"
+                ) from exc
+
+            versions = payload.get("modelVersions") or []
+            if not versions:
+                raise RuntimeError("Civitai API 未返回可用的模型版本，可能需要填写 Civitai API Token")
+            ver = versions[0]
+            ver_id = ver.get("id")
+            files = ver.get("files") or []
+            primary_file = next(
+                (f for f in files if f.get("primary") or f.get("type") == "Model"),
+                files[0] if files else {},
+            )
+            dl_url = primary_file.get("downloadUrl") or ver.get("downloadUrl")
+            if not dl_url and ver_id:
+                dl_url = f"https://civitai.com/api/download/models/{ver_id}"
+            if not dl_url:
+                raise RuntimeError("未在 Civitai 模型版本中找到下载链接")
+            suggested_name = primary_file.get("name")
+            req_url, headers = normalize_download_url(dl_url, token=token)
+
+    return req_url, headers, suggested_name
+
+
+def _extract_filename(url: str, content_disp: str) -> str:
+    if content_disp:
+        m_utf = re.search(r"filename\*\s*=\s*UTF-8''([^;]+)", content_disp, re.IGNORECASE)
+        if m_utf:
+            name = urllib.parse.unquote(m_utf.group(1)).strip().strip('"\'')
+            if name:
+                return Path(name).name
+        m_std = re.search(r'filename\s*=\s*"?([^";]+)"?', content_disp, re.IGNORECASE)
+        if m_std:
+            name = m_std.group(1).strip().strip('"\'')
+            if name:
+                return Path(name).name
+
+    parsed = urllib.parse.urlparse(url)
+    candidate = Path(urllib.parse.unquote(parsed.path)).name
+    if candidate and candidate not in {"download", "models", ""}:
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", candidate)
+        if not Path(safe).suffix:
+            safe += ".safetensors"
+        return safe
+    return f"lora_{int(time.time())}.safetensors"
+
+
+class LoraDownloadManager:
+    """Manages async LoRA file downloads into `LORAS_DIR` with real-time progress."""
+
+    def __init__(self, loras_dir: Path) -> None:
+        self.loras_dir = loras_dir
+        self._lock = threading.Lock()
+        self._tasks: dict[str, dict[str, Any]] = {}
+
+    def start_download(
+        self,
+        url: str,
+        token: Optional[str] = None,
+        filename_override: Optional[str] = None,
+        demo_mode: bool = False,
+    ) -> str:
+        task_id = uuid.uuid4().hex[:10]
+        state = {
+            "task_id": task_id,
+            "status": "downloading",
+            "progress": 0.0,
+            "downloaded_mb": 0.0,
+            "total_mb": 0.0,
+            "speed_mb_s": 0.0,
+            "filename": "",
+            "message": "正在解析并连接下载地址...",
+            "error": None,
+        }
+        with self._lock:
+            self._tasks[task_id] = state
+
+        def _worker() -> None:
+            tmp_dest: Optional[Path] = None
+            try:
+                if demo_mode:
+                    fname = filename_override or _extract_filename(url, "")
+                    if not Path(fname).suffix:
+                        fname += ".safetensors"
+                    for i in range(1, 6):
+                        time.sleep(0.12)
+                        with self._lock:
+                            state["progress"] = i * 0.2
+                            state["downloaded_mb"] = round(i * 25.6, 1)
+                            state["total_mb"] = 128.0
+                            state["speed_mb_s"] = 48.5
+                            state["filename"] = fname
+                            state["message"] = f"[演示模式] 正在下载 {fname}: {i * 20}%"
+                    target = self.loras_dir / fname
+                    target.write_bytes(b"DEMO_LORA_PLACEHOLDER")
+                    with self._lock:
+                        state["status"] = "completed"
+                        state["progress"] = 1.0
+                        state["message"] = f"下载完成: {fname}"
+                    return
+
+                req_url, headers, suggested_name = resolve_download_target(url, token=token)
+                req = urllib.request.Request(req_url, headers=headers)
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    final_url = resp.geturl()
+                    ctype = (resp.headers.get("Content-Type") or "").lower()
+                    if "text/html" in ctype or "application/json" in ctype or "text/plain" in ctype:
+                        raise RuntimeError(
+                            f"下载地址返回了非模型内容 (Content-Type: {ctype})。"
+                            "若为 Civitai 模型，请在 Token 框填入 Civitai API Key 或检查链接是否正确"
+                        )
+
+                    cd = resp.headers.get("Content-Disposition", "")
+                    total_bytes = int(resp.headers.get("Content-Length") or 0)
+                    if filename_override and filename_override.strip():
+                        fname = Path(filename_override).name
+                    elif cd:
+                        fname = _extract_filename(final_url, cd)
+                    elif suggested_name:
+                        fname = Path(suggested_name).name
+                    else:
+                        fname = _extract_filename(final_url, cd)
+
+                    if not Path(fname).suffix:
+                        fname += ".safetensors"
+                    fname = re.sub(r"[^A-Za-z0-9._\-\u4e00-\u9fff]", "_", fname)
+
+                    self.loras_dir.mkdir(parents=True, exist_ok=True)
+                    dest = self.loras_dir / fname
+                    tmp_dest = self.loras_dir / f".{fname}.{task_id}.part"
+
+                    downloaded = 0
+                    t_last = time.time()
+                    b_last = 0
+                    with open(tmp_dest, "wb") as f:
+                        while True:
+                            chunk = resp.read(262_144)
+                            if not chunk:
+                                break
+                            if downloaded == 0:
+                                head_trim = chunk[:32].lstrip()
+                                if head_trim.startswith((b"<!DOCTYPE", b"<!doctype", b"<html", b"<HTML")):
+                                    raise RuntimeError(
+                                        "服务器返回了 HTML 登录/拦截页面而非 LoRA 权重。请在 Token 框填写 Civitai / HF API Token 后重试"
+                                    )
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            now = time.time()
+                            if now - t_last >= 0.25:
+                                dt = max(0.05, now - t_last)
+                                spd = (downloaded - b_last) / (1024 * 1024) / dt
+                                b_last = downloaded
+                                t_last = now
+                                with self._lock:
+                                    state["filename"] = fname
+                                    state["downloaded_mb"] = round(downloaded / (1024 * 1024), 2)
+                                    state["total_mb"] = round(total_bytes / (1024 * 1024), 2)
+                                    state["speed_mb_s"] = round(spd, 1)
+                                    state["progress"] = (
+                                        min(0.99, downloaded / total_bytes) if total_bytes > 0 else 0.0
+                                    )
+                                    pct_str = f"{int(state['progress'] * 100)}%" if total_bytes > 0 else f"{state['downloaded_mb']} MB"
+                                    state["message"] = f"下载 {fname}: {pct_str} ({spd:.1f} MB/s)"
+
+                    # Validate downloaded file header before committing to destination
+                    # Temporarily validate using a path with the target suffix
+                    check_path = self.loras_dir / f".validate_{task_id}_{fname}"
+                    tmp_dest.replace(check_path)
+                    tmp_dest = check_path
+                    valid, issue = validate_lora_file(check_path)
+                    if not valid:
+                        raise RuntimeError(issue or "下载的 LoRA 权重文件校验失败")
+
+                    check_path.replace(dest)
+                    tmp_dest = None
+                    with self._lock:
+                        state["filename"] = fname
+                        state["status"] = "completed"
+                        state["progress"] = 1.0
+                        state["downloaded_mb"] = round(downloaded / (1024 * 1024), 2)
+                        if total_bytes <= 0:
+                            state["total_mb"] = state["downloaded_mb"]
+                        state["message"] = f"已保存至 {dest}"
+            except Exception as exc:
+                logger.warning("LoRA download failed (%s): %s", url, exc)
+                if tmp_dest is not None and tmp_dest.exists():
+                    try:
+                        tmp_dest.unlink()
+                    except OSError:
+                        pass
+                with self._lock:
+                    state["status"] = "error"
+                    state["error"] = str(exc)
+                    state["message"] = f"下载失败: {exc}"
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return task_id
+
+    def get_status(self, task_id: str) -> Optional[dict[str, Any]]:
+        with self._lock:
+            item = self._tasks.get(task_id)
+            return dict(item) if item else None
+
+
+def normalize_lora_state_dict(lora_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """
+    Load a LoRA `.safetensors` / `.pt` file on CPU and remap non-standard prefixes
+    (e.g., ComfyUI `diffusion_model.`, `model.diffusion_model.`, `base_model.model.`)
+    so Diffusers `load_lora_weights(..., strict=False)` handles custom node LoRAs cleanly.
+    """
+    valid, issue = validate_lora_file(lora_path)
+    if not valid:
+        raise RuntimeError(
+            f"LoRA 文件 {lora_path.name} 无效或已损坏 ({issue})。请在 LoRA 设置或监控页删除后重新下载（Civitai 链接请附带 API Token）"
+        )
+
+    if lora_path.suffix.lower() == ".safetensors":
+        from safetensors.torch import load_file
+
+        raw_sd = load_file(str(lora_path), device="cpu")
+    else:
+        import torch
+
+        raw_sd = torch.load(str(lora_path), map_location="cpu", weights_only=True)
+        if isinstance(raw_sd, dict) and "state_dict" in raw_sd:
+            raw_sd = raw_sd["state_dict"]
+
+    remapped: dict[str, Any] = {}
+    stripped_prefixes: set[str] = set()
+
+    for orig_key, tensor in raw_sd.items():
+        k = orig_key
+        for prefix in ("model.diffusion_model.", "diffusion_model.", "base_model.model."):
+            if k.startswith(prefix):
+                k = "transformer." + k[len(prefix) :]
+                stripped_prefixes.add(prefix)
+                break
+
+        # Normalize Kohya / ComfyUI `.lora_down.weight` / `.lora_up.weight` if present
+        if ".lora_down." in k:
+            k = k.replace(".lora_down.", ".lora_A.")
+        elif ".lora_up." in k:
+            k = k.replace(".lora_up.", ".lora_B.")
+
+        # Convert Kohya `lora_unet_` style underscores only if no dot hierarchy exists before weight suffix
+        if k.startswith("lora_unet_"):
+            stripped_prefixes.add("lora_unet_")
+            body = k[len("lora_unet_") :]
+            if "." in body:
+                mod_part, attr_part = body.split(".", 1)
+                k = f"transformer.{mod_part}.{attr_part}"
+
+        remapped[k] = tensor
+
+    info = {
+        "orig_keys": len(raw_sd),
+        "mapped_keys": len(remapped),
+        "stripped_prefixes": sorted(stripped_prefixes),
+    }
+    return remapped, info

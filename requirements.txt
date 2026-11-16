@@ -1,0 +1,15 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+pillow>=10.4.0
+psutil>=6.0.0
+qrcode[pil]>=7.4.2
+accelerate>=1.0.0
+safetensors>=0.4.5
+torchao>=0.14.0
+transformers>=5.17.0
+# Qwen-Image-2.1 requires diffusers >= 0.41 or latest main:
+# pip install git+https://github.com/huggingface/diffusers.git
+diffusers>=0.41.0
+huggingface_hub>=0.26.0
+hf_transfer>=0.1.8
