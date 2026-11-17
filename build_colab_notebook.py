@@ -26,7 +26,7 @@ steps = [
     ("检查 GPU 硬件状态", ["nvidia-smi"]),
     ("更新 pip 包管理器", [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", "--upgrade", "pip"]),
     ("安装 Diffusers (Qwen-Image-2.1 支持)", [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", "--upgrade", "git+https://github.com/huggingface/diffusers.git"]),
-    ("安装 Transformers / TorchAO INT8 / HF 极速下载", [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", "--upgrade", "transformers>=5.17.0", "accelerate", "safetensors", "torchao>=0.14.0", "bitsandbytes", "huggingface_hub", "hf_transfer"]),
+    ("安装 Transformers / TorchAO / GGUF / HF 极速下载", [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", "--upgrade", "transformers>=5.17.0", "accelerate", "safetensors", "torchao>=0.14.0", "bitsandbytes", "gguf>=0.13.0", "protobuf>=4.25.0", "sentencepiece>=0.2.0", "huggingface_hub", "hf_transfer"]),
     ("安装 Web 服务与二维码组件", [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", "--upgrade", "fastapi", "uvicorn[standard]", "python-multipart", "psutil", "qrcode", "pillow"]),
 ]
 
@@ -54,13 +54,13 @@ from tqdm.auto import tqdm
 
 REPO_URL = "{REPO_URL}"  #@param {{type:"string"}}
 BRANCH = "main"  #@param {{type:"string"}}
-EDITION = "L4 24GB 黄金方案 · Turbo FP8 DiT + INT8 编码器 + BF16 VAE (推荐 L4)"  #@param ["L4 24GB 黄金方案 · Turbo FP8 DiT + INT8 编码器 + BF16 VAE (推荐 L4)", "L4 24GB 精绘方案 · Qwen-2.1 FP8 DiT + INT8 编码器 + BF16 VAE 40步", "INT8 轻量省显存版 (Turbo · 推荐 T4/L4)", "满血版 · Turbo 原生BF16/FP16不量化 (适合 A100/H100/G4)", "满血旗舰版 · Qwen-2.1 原生BF16/FP16 40步 (适合 A100-80G/H100/G4)", "自定义下方模型与量化参数"]
-MODEL_ID = "Qwen/Qwen-Image-2.1-Turbo"  #@param ["Qwen/Qwen-Image-2.1-Turbo", "Qwen/Qwen-Image-2.1", "addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit"] {{allow-input: true}}
+EDITION = "L4 24GB 黄金方案 · Turbo FP8 DiT + INT8 编码器 + BF16 VAE (推荐 L4)"  #@param ["L4 24GB 黄金方案 · Turbo FP8 DiT + INT8 编码器 + BF16 VAE (推荐 L4)", "L4 24GB 精绘方案 · Qwen-2.1 FP8 DiT + INT8 编码器 + BF16 VAE 40步", "Uncensored GGUF Q8 满血版 (Q8_0 DiT + 全精度BF16编码器 + BF16 VAE)", "Uncensored GGUF Q4 轻量版 (Q4_K_M DiT + Qwen3-VL-8B Q4_K_M + BF16 VAE)", "INT8 轻量省显存版 (Turbo · 推荐 T4/L4)", "满血版 · Turbo 原生BF16/FP16不量化 (适合 A100/H100/G4)", "满血旗舰版 · Qwen-2.1 原生BF16/FP16 40步 (适合 A100-80G/H100/G4)", "自定义下方模型与量化参数"]
+MODEL_ID = "Qwen/Qwen-Image-2.1-Turbo"  #@param ["Qwen/Qwen-Image-2.1-Turbo", "Qwen/Qwen-Image-2.1", "abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8", "abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4", "addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit"] {{allow-input: true}}
 HF_TOKEN = ""  #@param {{type:"string"}}
 AI_API_KEY = ""  #@param {{type:"string"}}
 AI_MODEL = "qwen3.8-27b"  #@param {{type:"string"}}
 GPU_PROFILE = "auto"  #@param ["auto", "g4_rtx_pro_6000", "h100_sxm", "a100_sxm", "l4_ada", "t4_turing"]
-QUANT_MODE = "fp8-int8"  #@param ["fp8-int8", "fp8-all", "int8-torchao", "int8-bnb", "none"]
+QUANT_MODE = "fp8-int8"  #@param ["fp8-int8", "fp8-all", "int8-torchao", "int8-bnb", "gguf-q8-full", "gguf-q4", "none"]
 SWAP_OPTION = "跳过 (默认关闭)"  #@param ["跳过 (默认关闭)", "尝试开启 8GB Swap (仅支持虚拟机)", "尝试开启 16GB Swap (仅支持虚拟机)"]
 PRELOAD_MODEL = True  #@param {{type:"boolean"}}
 MOUNT_GDRIVE = False  #@param {{type:"boolean"}}
@@ -103,6 +103,14 @@ elif "L4 24GB 精绘方案" in EDITION:
     eff_model_id = "Qwen/Qwen-Image-2.1"
     eff_quant_mode = "fp8-int8"
     eff_offload_mode = "smart_stage_offload"
+elif "Uncensored GGUF Q8" in EDITION:
+    eff_model_id = "abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8"
+    eff_quant_mode = "gguf-q8-full"
+    eff_offload_mode = "auto"
+elif "Uncensored GGUF Q4" in EDITION:
+    eff_model_id = "abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4"
+    eff_quant_mode = "gguf-q4"
+    eff_offload_mode = "auto"
 elif "满血旗舰版" in EDITION:
     eff_model_id = "Qwen/Qwen-Image-2.1"
     eff_quant_mode = "none"

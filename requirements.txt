@@ -13,3 +13,6 @@ transformers>=5.17.0
 diffusers>=0.41.0
 huggingface_hub>=0.26.0
 hf_transfer>=0.1.8
+gguf>=0.13.0
+protobuf>=4.25.0
+sentencepiece>=0.2.0

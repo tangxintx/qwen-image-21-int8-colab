@@ -161,6 +161,35 @@ def _run_http_tests() -> None:
     swap_data = client.post("/api/system/enable-swap", json={"size_gb": 8}).json()
     assert "ok" in swap_data and "message" in swap_data and "swap" in swap_data and "stats" in swap_data
 
+    # ComfyUI on-demand launcher with GGUF Q8 / default Q4 variants
+    assert client.get("/api/comfyui/status").json()["status"] == "idle"
+    launch_q8 = client.post("/api/comfyui/launch", json={"gguf_variant": "q8"})
+    assert launch_q8.status_code == 200
+    cst = {}
+    for _ in range(30):
+        cst = client.get("/api/comfyui/status").json()
+        if cst["status"] == "running":
+            break
+        time.sleep(0.08)
+    assert cst["status"] == "running", cst
+    assert cst["gguf_variant"] == "q8"
+    assert cst["gguf_plugin_url"] == "https://github.com/city96/ComfyUI-GGUF"
+    assert "qwen_image_2.1_vae_bf16.safetensors" in cst["staged_files"]
+    assert "Qwen_Image_2.1_Uncensored_GGUF_Q8.json" in cst["workflows"]
+    assert client.post("/api/comfyui/stop").json()["status"] == "idle"
+
+    # Empty POST body should fall back to default Q4 variant
+    assert client.post("/api/comfyui/launch").status_code == 200
+    for _ in range(30):
+        cst4 = client.get("/api/comfyui/status").json()
+        if cst4["status"] == "running":
+            assert cst4["gguf_variant"] == "q4"
+            break
+        time.sleep(0.08)
+    assert client.post("/api/comfyui/stop").json()["status"] == "idle"
+
+    _assert_gguf_and_comfy_extensions()
+
 
 def _run_direct_inprocess_tests() -> None:
     """Run identical endpoint & engine checks without asyncio socketpair when blocked by sandbox."""
@@ -311,15 +340,19 @@ def _run_direct_inprocess_tests() -> None:
     )
     assert lora_ctrl["status"] == "completed"
 
-    # ComfyUI on-demand launcher (idle by default -> launch -> stop)
+    # ComfyUI on-demand launcher with GGUF Q8 & default Q4 variants
     assert server.api_comfyui_status()["status"] == "idle"
-    server.api_comfyui_launch()
+    server.api_comfyui_launch(server.ComfyLaunchRequest(gguf_variant="q8"))
+    cst = {}
     for _ in range(30):
         cst = server.api_comfyui_status()
         if cst["status"] == "running":
             break
         time.sleep(0.08)
-    assert server.api_comfyui_status()["status"] == "running"
+    assert cst["status"] == "running" and cst["gguf_variant"] == "q8"
+    assert cst["gguf_plugin_url"] == "https://github.com/city96/ComfyUI-GGUF"
+    assert "qwen_image_2.1_vae_bf16.safetensors" in cst["staged_files"]
+    assert "Qwen_Image_2.1_Uncensored_GGUF_Q8.json" in cst["workflows"]
     assert server.api_comfyui_stop()["status"] == "idle"
 
     # New: Auto transparent padding + notice + auto crop back to original aspect ratio
@@ -418,7 +451,6 @@ def _run_direct_inprocess_tests() -> None:
     assert fast_inpaint_job["notice"] and "局部重绘加速" in fast_inpaint_job["notice"]
     assert fast_inpaint_job["results"][0]["width"] == 640 and fast_inpaint_job["results"][0]["height"] == 640
     stitched_out = Image.open(Path(_TMP_DIR) / fast_inpaint_job["results"][0]["filename"])
-    # Top-left corner outside crop box must stay aligned with original background color (40, 90, 160)
     assert stitched_out.getpixel((5, 5)) == (40, 90, 160)
 
     # New: Auto-select downloaded HF model on first load unless user modified in Settings
@@ -427,6 +459,7 @@ def _run_direct_inprocess_tests() -> None:
     cached_snap.mkdir(parents=True, exist_ok=True)
     (cached_snap / "model_index.json").write_text("{}", encoding="utf-8")
     old_hf_hub = os.environ.get("HF_HUB_CACHE")
+    old_qwen_env = os.environ.pop("QWEN_MODEL_ID", None)
     try:
         os.environ["HF_HUB_CACHE"] = str(tmp_hf_hub)
         server.engine._user_modified_model = False
@@ -434,7 +467,6 @@ def _run_direct_inprocess_tests() -> None:
         picked = server.engine._auto_select_downloaded_model()
         assert picked == "Qwen/Qwen-Image-2.1" and server.engine.model_id == "Qwen/Qwen-Image-2.1"
 
-        # If user explicitly changes model in Settings, auto-select must respect user choice
         server.api_update_config(server.ConfigUpdateRequest(model_id="Qwen/Qwen-Image-2.1-Turbo"))
         assert server.engine._user_modified_model is True
         assert server.engine._auto_select_downloaded_model() is None
@@ -444,6 +476,8 @@ def _run_direct_inprocess_tests() -> None:
             os.environ.pop("HF_HUB_CACHE", None)
         else:
             os.environ["HF_HUB_CACHE"] = old_hf_hub
+        if old_qwen_env is not None:
+            os.environ["QWEN_MODEL_ID"] = old_qwen_env
 
     # New: AI Vision toggle sends multimodal image_url when enabled
     server.api_update_config(server.ConfigUpdateRequest(ai_vision_enabled=True))
@@ -463,6 +497,8 @@ def _run_direct_inprocess_tests() -> None:
         assert any(part.get("type") == "image_url" for part in captured_msgs[0][-1]["content"])
     finally:
         server._call_ai_endpoint = orig_call_ai2
+
+    _assert_gguf_and_comfy_extensions()
 
 
 def _assert_profiles_and_modes(update_fn) -> None:
@@ -522,6 +558,178 @@ def _assert_profiles_and_modes(update_fn) -> None:
     assert l4_cfg["effective_dtype"] == "bfloat16"
     assert l4_cfg["effective_offload"] == "smart_stage_offload"
 
+    # Uncensored GGUF Q8 ("Q8直接拉满") & Q4 presets + offload rules
+    assert "abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8" in server.MODEL_PRESETS
+    assert server.MODEL_PRESETS["abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8"]["default_steps"] == 8
+    assert server.MODEL_PRESETS["abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8"]["quant_mode"] == "gguf-q8-full"
+    assert "abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4" in server.MODEL_PRESETS
+    assert server.MODEL_PRESETS["abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4"]["default_steps"] == 8
+    assert server.MODEL_PRESETS["abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4"]["quant_mode"] == "gguf-q4"
+
+    q8_l4 = update_fn(
+        {
+            "model_id": "abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8",
+            "quant_mode": "gguf-q8-full",
+            "gpu_profile_override": "l4_ada",
+            "offload_mode": "auto",
+            "dtype_mode": "auto",
+        }
+    )
+    assert q8_l4["gguf_variant"] == "q8" and q8_l4["is_gguf"] is True
+    assert q8_l4["effective_offload"] == "smart_stage_offload"
+
+    q8_t4 = update_fn(
+        {
+            "model_id": "abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8",
+            "quant_mode": "gguf-q8-full",
+            "gpu_profile_override": "t4_turing",
+            "offload_mode": "auto",
+            "dtype_mode": "auto",
+        }
+    )
+    assert q8_t4["gguf_variant"] == "q8" and q8_t4["is_gguf"] is True
+    assert q8_t4["effective_offload"] == "sequential_cpu_offload"
+
+    q4_t4 = update_fn(
+        {
+            "model_id": "abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4",
+            "quant_mode": "gguf-q4",
+            "gpu_profile_override": "t4_turing",
+            "offload_mode": "auto",
+            "dtype_mode": "auto",
+        }
+    )
+    assert q4_t4["gguf_variant"] == "q4" and q4_t4["is_gguf"] is True
+    assert q4_t4["effective_offload"] == "model_cpu_offload"
+
+
+def _assert_gguf_and_comfy_extensions() -> None:
+    """Verify GGUF HF redirect resolution, selective Q8/Q4 download, ComfyUI workflows, and Colab notebook."""
+    import json
+    from pathlib import Path
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    import comfy_launcher
+    import hf_downloader
+
+    assert hf_downloader.strip_model_variant_suffix("abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8") == (
+        "abenzerps/Qwen-Image-2.1-Uncensored-GGUF",
+        "q8",
+    )
+    assert hf_downloader.strip_model_variant_suffix("abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4") == (
+        "abenzerps/Qwen-Image-2.1-Uncensored-GGUF",
+        "q4",
+    )
+    assert hf_downloader.strip_model_variant_suffix("Qwen/Qwen-Image-2.1-Turbo") == (
+        "Qwen/Qwen-Image-2.1-Turbo",
+        None,
+    )
+
+    fake_repos = {
+        "abenzerps/Qwen-Image-2.1-Uncensored-GGUF": SimpleNamespace(
+            id="abenzerps/Qwen-Image-2.1-Turbo-Quantized",
+            siblings=[
+                SimpleNamespace(rfilename="qwen-image-2.1-turbo-Q8_0.gguf", size=22_000_000_000),
+                SimpleNamespace(rfilename="qwen-image-2.1-turbo-Q4_K_M.gguf", size=12_000_000_000),
+                SimpleNamespace(rfilename="text_encoders/qwen3vl_8b_bf16.safetensors", size=17_500_000_000),
+                SimpleNamespace(rfilename="vae/qwen_image_2.1_vae_bf16.safetensors", size=254_000_000),
+            ],
+        ),
+        "Qwen/Qwen3-VL-8B-Instruct-GGUF": SimpleNamespace(
+            id="Qwen/Qwen3-VL-8B-Instruct-GGUF",
+            siblings=[
+                SimpleNamespace(rfilename="Qwen3VL-8B-Instruct-Q4_K_M.gguf", size=5_030_000_000),
+                SimpleNamespace(rfilename="mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf", size=700_000_000),
+            ],
+        ),
+    }
+
+    class _FakeHfApi:
+        def __init__(self, token=None):
+            self.token = token
+
+        def model_info(self, repo_id, files_metadata=True):
+            return fake_repos[repo_id]
+
+    dl_calls: list[tuple[str, str]] = []
+
+    import sys
+
+    def _fake_hf_hub_download(repo_id, filename, token=None):
+        dl_calls.append((repo_id, filename))
+        return f"/tmp/fake_hf/{repo_id}/{filename}"
+
+    fake_hf_mod = SimpleNamespace(
+        HfApi=_FakeHfApi,
+        hf_hub_download=_fake_hf_hub_download,
+        snapshot_download=lambda *a, **kw: "/tmp/fake_hf/snapshot",
+    )
+
+    with patch.dict(sys.modules, {"huggingface_hub": fake_hf_mod}):
+        r_repo, r_file, r_size = hf_downloader.resolve_repo_file(
+            "abenzerps/Qwen-Image-2.1-Uncensored-GGUF",
+            ["*Q8_0.gguf"],
+        )
+        assert r_repo == "abenzerps/Qwen-Image-2.1-Turbo-Quantized"
+        assert r_file == "qwen-image-2.1-turbo-Q8_0.gguf"
+        assert r_size == 22_000_000_000
+
+        dl_calls.clear()
+        q8_bundle = hf_downloader.download_gguf_bundle_fast("q8", use_tqdm=False)
+        assert q8_bundle["dit_filename"] == "qwen-image-2.1-turbo-Q8_0.gguf"
+        assert q8_bundle["te_filename"] == "text_encoders/qwen3vl_8b_bf16.safetensors"
+        assert q8_bundle["vae_filename"] == "vae/qwen_image_2.1_vae_bf16.safetensors"
+        assert q8_bundle["mmproj_path"] is None
+        assert dl_calls == [
+            ("abenzerps/Qwen-Image-2.1-Turbo-Quantized", "qwen-image-2.1-turbo-Q8_0.gguf"),
+            ("abenzerps/Qwen-Image-2.1-Turbo-Quantized", "text_encoders/qwen3vl_8b_bf16.safetensors"),
+            ("abenzerps/Qwen-Image-2.1-Turbo-Quantized", "vae/qwen_image_2.1_vae_bf16.safetensors"),
+        ]
+
+        dl_calls.clear()
+        q4_bundle = hf_downloader.download_gguf_bundle_fast("q4", use_tqdm=False)
+        assert q4_bundle["dit_filename"] == "qwen-image-2.1-turbo-Q4_K_M.gguf"
+        assert q4_bundle["te_filename"] == "Qwen3VL-8B-Instruct-Q4_K_M.gguf"
+        assert q4_bundle["mmproj_filename"] == "mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf"
+        assert q4_bundle["vae_filename"] == "vae/qwen_image_2.1_vae_bf16.safetensors"
+        assert dl_calls == [
+            ("abenzerps/Qwen-Image-2.1-Turbo-Quantized", "qwen-image-2.1-turbo-Q4_K_M.gguf"),
+            ("Qwen/Qwen3-VL-8B-Instruct-GGUF", "Qwen3VL-8B-Instruct-Q4_K_M.gguf"),
+            ("Qwen/Qwen3-VL-8B-Instruct-GGUF", "mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf"),
+            ("abenzerps/Qwen-Image-2.1-Turbo-Quantized", "vae/qwen_image_2.1_vae_bf16.safetensors"),
+        ]
+
+    # Verify ComfyUI-GGUF Q8/Q4 workflows
+    with tempfile.TemporaryDirectory(prefix="qwen_comfy_wf_") as tmp_comfy:
+        wf_names = comfy_launcher.write_gguf_workflows(Path(tmp_comfy))
+        assert wf_names == [
+            "Qwen_Image_2.1_Uncensored_GGUF_Q8.json",
+            "Qwen_Image_2.1_Uncensored_GGUF_Q4.json",
+        ]
+        wf_dir = Path(tmp_comfy) / "user" / "default" / "workflows"
+        q8_wf = json.loads((wf_dir / "Qwen_Image_2.1_Uncensored_GGUF_Q8.json").read_text(encoding="utf-8"))
+        q4_wf = json.loads((wf_dir / "Qwen_Image_2.1_Uncensored_GGUF_Q4.json").read_text(encoding="utf-8"))
+
+        q8_types = {n["type"] for n in q8_wf["nodes"]}
+        q4_types = {n["type"] for n in q4_wf["nodes"]}
+        assert {"UnetLoaderGGUF", "CLIPLoader", "VAELoader", "TextEncodeQwenImage21", "SamplerCustomAdvanced", "SaveImage"} <= q8_types
+        assert {"UnetLoaderGGUF", "CLIPLoaderGGUF", "VAELoader", "TextEncodeQwenImage21", "SamplerCustomAdvanced", "SaveImage"} <= q4_types
+
+        q4_clip = next(n for n in q4_wf["nodes"] if n["type"] == "CLIPLoaderGGUF")
+        q4_vae = next(n for n in q4_wf["nodes"] if n["type"] == "VAELoader")
+        assert q4_clip["widgets_values"][0] == "Qwen3VL-8B-Instruct-Q4_K_M.gguf"
+        assert q4_vae["widgets_values"][0] == "qwen_image_2.1_vae_bf16.safetensors"
+
+    # Verify regenerated Colab notebook is valid JSON and includes GGUF Q8/Q4 & gguf dep
+    nb_path = Path(__file__).resolve().parent / "Qwen_Image_21_INT8_Colab.ipynb"
+    nb_data = json.loads(nb_path.read_text(encoding="utf-8"))
+    assert isinstance(nb_data.get("cells"), list) and len(nb_data["cells"]) >= 2
+    nb_src = "\n".join("".join(c.get("source", [])) for c in nb_data["cells"])
+    assert "gguf>=0.13.0" in nb_src
+    assert "Uncensored GGUF Q8" in nb_src
+    assert "Uncensored GGUF Q4" in nb_src
+
 
 def run_tests() -> None:
     if _can_use_socketpair():
@@ -530,7 +738,7 @@ def run_tests() -> None:
     else:
         mode = "direct_inprocess"
         _run_direct_inprocess_tests()
-    print(f"ALL TESTS PASSED ({mode} | 5 generation assertions + 5 GPU profiles + L4 FP8 + terminal + gallery in {_TMP_DIR})")
+    print(f"ALL TESTS PASSED ({mode} | 5 generation assertions + 5 GPU profiles + L4 FP8 + GGUF Q8/Q4 + ComfyUI-GGUF + terminal + gallery in {_TMP_DIR})")
 
 
 if __name__ == "__main__":
