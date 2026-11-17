@@ -355,6 +355,79 @@ def crop_back_to_original_ratio(img: Image.Image, crop_info: Optional[dict[str, 
     return img.crop((x0, y0, x1, y1))
 
 
+def compute_inpaint_crop_box(mask: Image.Image, img_w: int, img_h: int) -> Optional[tuple[int, int, int, int]]:
+    """
+    Compute an expanded context crop box `(x0, y0, x1, y1)` around the non-zero mask region
+    for accelerated inpainting. Returns `None` if the mask is empty or covers >= 82% of the image.
+    """
+    bin_mask = mask.convert("L").point(lambda p: 255 if p > 16 else 0)
+    bbox = bin_mask.getbbox()
+    if not bbox:
+        return None
+    bx0, by0, bx1, by1 = bbox
+    bw = max(1, bx1 - bx0)
+    bh = max(1, by1 - by0)
+    if bw * bh >= 0.82 * img_w * img_h:
+        return None
+
+    pad_x = max(64, int(round(bw * 0.40)))
+    pad_y = max(64, int(round(bh * 0.40)))
+    cx0 = max(0, bx0 - pad_x)
+    cy0 = max(0, by0 - pad_y)
+    cx1 = min(img_w, bx1 + pad_x)
+    cy1 = min(img_h, by1 + pad_y)
+
+    # Ensure minimum context size when image allows
+    min_w = min(img_w, 256)
+    min_h = min(img_h, 256)
+    if (cx1 - cx0) < min_w:
+        need = min_w - (cx1 - cx0)
+        cx0 = max(0, cx0 - need // 2)
+        cx1 = min(img_w, cx0 + min_w)
+        cx0 = max(0, cx1 - min_w)
+    if (cy1 - cy0) < min_h:
+        need = min_h - (cy1 - cy0)
+        cy0 = max(0, cy0 - need // 2)
+        cy1 = min(img_h, cy0 + min_h)
+        cy0 = max(0, cy1 - min_h)
+
+    return (cx0, cy0, cx1, cy1)
+
+
+def stitch_inpaint_crop_patch(
+    full_orig: Image.Image,
+    patch_img: Image.Image,
+    full_mask: Image.Image,
+    crop_box: tuple[int, int, int, int],
+    mask_blur: int = 8,
+    denoise: float = 1.0,
+) -> Image.Image:
+    """Resize and feather-composite a cropped inpaint result back onto the full original image."""
+    cx0, cy0, cx1, cy1 = crop_box
+    cw = max(1, cx1 - cx0)
+    ch = max(1, cy1 - cy0)
+    base_rgb = full_orig.convert("RGB")
+    patch_rgb = patch_img.convert("RGB")
+    if patch_rgb.size != (cw, ch):
+        patch_rgb = patch_rgb.resize((cw, ch), Image.Resampling.LANCZOS)
+
+    orig_patch = base_rgb.crop(crop_box)
+    if denoise < 0.99:
+        patch_rgb = Image.blend(orig_patch, patch_rgb, alpha=max(0.05, min(1.0, denoise)))
+
+    mask_patch = full_mask.convert("L")
+    if mask_patch.size != base_rgb.size:
+        mask_patch = mask_patch.resize(base_rgb.size, Image.Resampling.BILINEAR)
+    mask_crop = mask_patch.crop(crop_box)
+    if mask_blur > 0:
+        mask_crop = mask_crop.filter(ImageFilter.GaussianBlur(radius=mask_blur))
+
+    composited_patch = Image.composite(patch_rgb, orig_patch, mask_crop)
+    out_img = base_rgb.copy()
+    out_img.paste(composited_patch, (cx0, cy0))
+    return out_img
+
+
 def get_dir_size_bytes(path: Path) -> int:
     """Safely compute total bytes of all files under a directory."""
     if not path.exists():
@@ -603,9 +676,12 @@ class QwenImage21Engine:
         self.offload_mode: str = os.environ.get("QWEN_OFFLOAD", "auto")
         self.vae_tiling_mode: str = os.environ.get("QWEN_VAE_TILING", "auto")
         self.hf_token: str = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
+        self.inpaint_fast_crop: bool = False
         self.ai_endpoint: str = DEFAULT_AI_ENDPOINT
         self.ai_api_key: str = DEFAULT_AI_API_KEY
         self.ai_model: str = DEFAULT_AI_MODEL
+        self.ai_vision_enabled: bool = False
+        self._user_modified_model: bool = False
         self._load_ai_config()
         self.demo_mode: bool = DEMO_MODE
         self.pipe: Any = None
@@ -630,6 +706,10 @@ class QwenImage21Engine:
                         self.ai_api_key = str(data["ai_api_key"]).strip()
                     if data.get("ai_model"):
                         self.ai_model = str(data["ai_model"]).strip()
+                    if "ai_vision_enabled" in data:
+                        self.ai_vision_enabled = bool(data["ai_vision_enabled"])
+                    if "inpaint_fast_crop" in data:
+                        self.inpaint_fast_crop = bool(data["inpaint_fast_crop"])
             except Exception as exc:
                 logger.warning("Failed to load AI config: %s", exc)
 
@@ -641,6 +721,8 @@ class QwenImage21Engine:
                         "ai_endpoint": self.ai_endpoint,
                         "ai_api_key": self.ai_api_key,
                         "ai_model": self.ai_model,
+                        "ai_vision_enabled": self.ai_vision_enabled,
+                        "inpaint_fast_crop": self.inpaint_fast_crop,
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -649,6 +731,40 @@ class QwenImage21Engine:
             )
         except Exception as exc:
             logger.warning("Failed to persist AI config: %s", exc)
+
+    def _auto_select_downloaded_model(self) -> Optional[str]:
+        """
+        On first generation, if the user has NOT explicitly changed the model in Settings,
+        prefer any already-downloaded model present in HF cache instead of re-downloading.
+        """
+        if self._user_modified_model:
+            return None
+        hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+        hub_dir = Path(os.environ.get("HF_HUB_CACHE", str(hf_home / "hub")))
+        if not hub_dir.exists():
+            return None
+
+        ready_repos: list[tuple[bool, int, str]] = []
+        try:
+            for entry in hub_dir.iterdir():
+                if entry.is_dir() and entry.name.startswith("models--"):
+                    snaps_dir = entry / "snapshots"
+                    if snaps_dir.exists() and any(snaps_dir.iterdir()):
+                        repo_id = entry.name[len("models--") :].replace("--", "/", 1)
+                        if repo_id == self.model_id:
+                            return repo_id
+                        size_b = get_dir_size_bytes(entry)
+                        ready_repos.append((repo_id in MODEL_PRESETS, size_b, repo_id))
+        except OSError:
+            return None
+
+        if not ready_repos:
+            return None
+        ready_repos.sort(reverse=True)
+        chosen = ready_repos[0][2]
+        logger.info("Auto-selected downloaded HF cached model on first load: %s", chosen)
+        self.model_id = chosen
+        return chosen
 
     def _detect_torch(self) -> tuple[Any, bool]:
         try:
@@ -707,6 +823,7 @@ class QwenImage21Engine:
             if self.loaded and self.pipe is not None:
                 return
 
+            auto_picked = self._auto_select_downloaded_model()
             torch, has_cuda = self._detect_torch()
             if torch is None or not has_cuda:
                 raise RuntimeError(
@@ -720,7 +837,10 @@ class QwenImage21Engine:
             if job:
                 job.status = "loading_model"
                 job.progress = 0.06
-                job.message = f"[{profile.display_name}] 正在下载/加载 {self.model_id} ({self.quant_mode})..."
+                if auto_picked:
+                    job.message = f"[{profile.display_name}] 首次生图自动加载已下载模型 {self.model_id} ({self.quant_mode})..."
+                else:
+                    job.message = f"[{profile.display_name}] 正在下载/加载 {self.model_id} ({self.quant_mode})..."
 
             try:
                 if job and job.cancel_event.is_set():
@@ -974,30 +1094,40 @@ class QwenImage21Engine:
         hf_token: Optional[str] = None,
         cpu_offload: Optional[bool] = None,
         vae_tiling: Optional[bool] = None,
+        inpaint_fast_crop: Optional[bool] = None,
         ai_endpoint: Optional[str] = None,
         ai_api_key: Optional[str] = None,
         ai_model: Optional[str] = None,
+        ai_vision_enabled: Optional[bool] = None,
     ) -> None:
         needs_reload = False
-        ai_changed = False
+        prefs_changed = False
         if ai_endpoint is not None and ai_endpoint.strip():
             self.ai_endpoint = ai_endpoint.strip()
-            ai_changed = True
+            prefs_changed = True
         if ai_api_key is not None and ai_api_key.strip():
             self.ai_api_key = ai_api_key.strip()
-            ai_changed = True
+            prefs_changed = True
         if ai_model is not None and ai_model.strip():
             self.ai_model = ai_model.strip()
-            ai_changed = True
-        if ai_changed:
+            prefs_changed = True
+        if ai_vision_enabled is not None:
+            self.ai_vision_enabled = bool(ai_vision_enabled)
+            prefs_changed = True
+        if inpaint_fast_crop is not None:
+            self.inpaint_fast_crop = bool(inpaint_fast_crop)
+            prefs_changed = True
+        if prefs_changed:
             self._save_ai_config()
 
         if hf_token is not None and hf_token.strip():
             self.hf_token = hf_token.strip()
             os.environ["HF_TOKEN"] = self.hf_token
-        if model_id and model_id != self.model_id:
-            self.model_id = model_id
-            needs_reload = True
+        if model_id:
+            self._user_modified_model = True
+            if model_id != self.model_id:
+                self.model_id = model_id
+                needs_reload = True
         if quant_mode and quant_mode != self.quant_mode:
             self.quant_mode = quant_mode
             needs_reload = True
@@ -1132,6 +1262,7 @@ class QwenImage21Engine:
         lora_action_mode: str = "standard",
         lora_control_image: Optional[Image.Image] = None,
         lora_control_strength: float = 0.85,
+        inpaint_fast_crop: Optional[bool] = None,
     ) -> Image.Image:
         width = align_dim(width, 16)
         height = align_dim(height, 16)
@@ -1143,7 +1274,9 @@ class QwenImage21Engine:
             if trig.lower() not in working_prompt.lower():
                 working_prompt = f"{trig}, {working_prompt}"
         resolved_prompt = (
-            resolve_multi_image_prompt(working_prompt, total_refs) if mode == "i2i" and total_refs > 0 else working_prompt
+            resolve_multi_image_prompt(working_prompt, total_refs)
+            if mode in {"i2i", "inpaint"} and total_refs > 0
+            else working_prompt
         )
 
         lora_summary = ""
@@ -1151,6 +1284,26 @@ class QwenImage21Engine:
             lora_summary = f"LoRA:{lora_name[:18]}({lora_weight:.2f})"
 
         using_lora_control = bool(lora_enabled and lora_action_mode == "control" and lora_control_image is not None)
+        eff_fast_crop = self.inpaint_fast_crop if inpaint_fast_crop is None else bool(inpaint_fast_crop)
+        fast_crop_box: Optional[tuple[int, int, int, int]] = None
+        fast_crop_orig_img: Optional[Image.Image] = None
+        fast_crop_orig_mask: Optional[Image.Image] = None
+        fast_crop_notice: Optional[str] = None
+
+        if mode == "inpaint" and eff_fast_crop and init_image is not None and mask_image is not None:
+            aligned_mask = (
+                mask_image if mask_image.size == init_image.size else mask_image.resize(init_image.size, Image.Resampling.BILINEAR)
+            )
+            fast_crop_box = compute_inpaint_crop_box(aligned_mask, init_image.width, init_image.height)
+            if fast_crop_box is not None:
+                fast_crop_orig_img = init_image
+                fast_crop_orig_mask = aligned_mask
+                init_image = init_image.crop(fast_crop_box)
+                mask_image = aligned_mask.crop(fast_crop_box)
+                cw, ch = init_image.size
+                fast_crop_notice = (
+                    f"已启用「局部重绘加速」：自动裁剪重绘区 ({cw}×{ch}) 推理，输出已精准对齐回原图 ({fast_crop_orig_img.width}×{fast_crop_orig_img.height})。"
+                )
 
         if self.demo_mode:
             if lora_enabled:
@@ -1171,13 +1324,17 @@ class QwenImage21Engine:
             target_w = align_dim(int(width * hires_scale), 16) if mode == "hires" and demo_init else width
             target_h = align_dim(int(height * hires_scale), 16) if mode == "hires" and demo_init else height
             if demo_init is not None:
-                req_base_w = align_dim(int(demo_init.width * hires_scale), 16) if mode == "hires" else width
-                req_base_h = align_dim(int(demo_init.height * hires_scale), 16) if mode == "hires" else height
+                if fast_crop_box is not None:
+                    req_base_w = align_dim(max(512, demo_init.width), 16)
+                    req_base_h = align_dim(max(512, demo_init.height), 16)
+                else:
+                    req_base_w = align_dim(int(demo_init.width * hires_scale), 16) if mode == "hires" else width
+                    req_base_h = align_dim(int(demo_init.height * hires_scale), 16) if mode == "hires" else height
                 demo_init, demo_mask, target_w, target_h, crop_info, pad_notice = auto_pad_transparent_to_supported(
                     demo_init, demo_mask, req_w=req_base_w, req_h=req_base_h
                 )
-                if pad_notice:
-                    job.notice = pad_notice
+                if fast_crop_notice or pad_notice:
+                    job.notice = " ".join(x for x in (fast_crop_notice, pad_notice) if x)
             demo_out = self._run_demo_image(
                 mode=mode,
                 prompt=resolved_prompt,
@@ -1188,12 +1345,17 @@ class QwenImage21Engine:
                 seed=seed,
                 init_image=demo_init,
                 mask_image=demo_mask,
-                extra_ref_images=refs_list if mode == "i2i" else [],
+                extra_ref_images=refs_list if mode in {"i2i", "inpaint"} else [],
                 lora_summary=lora_summary,
                 job=job,
                 batch_idx=batch_idx,
             )
-            return crop_back_to_original_ratio(demo_out, crop_info)
+            demo_out = crop_back_to_original_ratio(demo_out, crop_info)
+            if fast_crop_box is not None and fast_crop_orig_img is not None and fast_crop_orig_mask is not None:
+                demo_out = stitch_inpaint_crop_patch(
+                    fast_crop_orig_img, demo_out, fast_crop_orig_mask, fast_crop_box, mask_blur=mask_blur, denoise=denoise
+                )
+            return demo_out
 
         if job.cancel_event.is_set():
             raise InterruptedError("用户已取消生成")
@@ -1218,22 +1380,27 @@ class QwenImage21Engine:
                 lora_control_image if (mode == "t2i" and using_lora_control) else None
             )
             if src_primary is not None:
-                req_base_w = align_dim(int(src_primary.width * hires_scale), 16) if mode == "hires" else width
-                req_base_h = align_dim(int(src_primary.height * hires_scale), 16) if mode == "hires" else height
+                if fast_crop_box is not None:
+                    area_scale = math.sqrt(max(512 * 512, min(width * height, 1024 * 1024)) / max(1, src_primary.width * src_primary.height))
+                    req_base_w = align_dim(int(round(src_primary.width * area_scale)), 16)
+                    req_base_h = align_dim(int(round(src_primary.height * area_scale)), 16)
+                else:
+                    req_base_w = align_dim(int(src_primary.width * hires_scale), 16) if mode == "hires" else width
+                    req_base_h = align_dim(int(src_primary.height * hires_scale), 16) if mode == "hires" else height
                 padded_img, padded_mask, target_w, target_h, crop_info, pad_notice = auto_pad_transparent_to_supported(
                     src_primary,
                     mask_image if mode == "inpaint" else None,
                     req_w=req_base_w,
                     req_h=req_base_h,
                 )
-                if pad_notice:
-                    job.notice = pad_notice
-                    logger.info("Auto-pad applied for job %s: %s", job.job_id, pad_notice)
+                if fast_crop_notice or pad_notice:
+                    job.notice = " ".join(x for x in (fast_crop_notice, pad_notice) if x)
+                    logger.info("Notice for job %s: %s", job.job_id, job.notice)
 
                 ref_image = padded_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
                 if mode == "inpaint" and padded_mask is not None:
                     prepared_mask = padded_mask.resize((target_w, target_h), Image.Resampling.BILINEAR)
-                if mode == "i2i":
+                if mode in {"i2i", "inpaint"}:
                     if refs_list:
                         max_edge = max(target_w, target_h, 1024)
                         prepared_extras = [resize_preserve_aspect(rimg, max_edge=max_edge) for rimg in refs_list]
@@ -1362,7 +1529,12 @@ class QwenImage21Engine:
                     alpha = max(0.1, min(1.0, denoise))
                     result_img = Image.blend(ref_rgb, result_img, alpha=alpha)
 
-            return crop_back_to_original_ratio(result_img, crop_info)
+            final_img = crop_back_to_original_ratio(result_img, crop_info)
+            if fast_crop_box is not None and fast_crop_orig_img is not None and fast_crop_orig_mask is not None:
+                final_img = stitch_inpaint_crop_patch(
+                    fast_crop_orig_img, final_img, fast_crop_orig_mask, fast_crop_box, mask_blur=mask_blur, denoise=denoise
+                )
+            return final_img
 
 
 # ---------------------------------------------------------------------------
@@ -1412,6 +1584,7 @@ class GenerateRequest(BaseModel):
     lora_action_mode: Literal["standard", "control"] = "standard"
     lora_control_image_b64: Optional[str] = None
     lora_control_strength: float = Field(default=0.85, ge=0.0, le=1.5)
+    inpaint_fast_crop: Optional[bool] = None
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -1424,9 +1597,11 @@ class ConfigUpdateRequest(BaseModel):
     hf_token: Optional[str] = None
     cpu_offload: Optional[bool] = None
     vae_tiling: Optional[bool] = None
+    inpaint_fast_crop: Optional[bool] = None
     ai_endpoint: Optional[str] = None
     ai_api_key: Optional[str] = None
     ai_model: Optional[str] = None
+    ai_vision_enabled: Optional[bool] = None
 
 
 class AIChatRequest(BaseModel):
@@ -1434,6 +1609,7 @@ class AIChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=8000)
     history: list[dict[str, str]] = Field(default_factory=list, max_length=20)
     context: dict[str, Any] = Field(default_factory=dict)
+    images: list[str] = Field(default_factory=list, max_length=6)
 
 
 class TerminalRunRequest(BaseModel):
@@ -1586,6 +1762,7 @@ def collect_system_stats() -> dict[str, Any]:
             "api_key": engine.ai_api_key,
             "model": engine.ai_model,
             "has_api_key": bool(engine.ai_api_key),
+            "vision_enabled": engine.ai_vision_enabled,
         },
         "engine": {
             "model_id": engine.model_id,
@@ -1594,6 +1771,7 @@ def collect_system_stats() -> dict[str, Any]:
             "dtype_mode": engine.dtype_mode,
             "offload_mode": engine.offload_mode,
             "vae_tiling_mode": engine.vae_tiling_mode,
+            "inpaint_fast_crop": engine.inpaint_fast_crop,
             "effective_dtype": eff["dtype"],
             "effective_offload": eff["offload_mode"],
             "effective_vae_tiling": eff["vae_tiling"],
@@ -1668,6 +1846,7 @@ def _run_generation_job(job_id: str, req: GenerateRequest) -> None:
                 lora_action_mode=req.lora_action_mode,
                 lora_control_image=lora_ctrl_img,
                 lora_control_strength=req.lora_control_strength,
+                inpaint_fast_crop=req.inpaint_fast_crop,
             )
             elapsed = time.time() - t0
 
@@ -1685,7 +1864,7 @@ def _run_generation_job(job_id: str, req: GenerateRequest) -> None:
                     "quant_mode": "DEMO" if engine.demo_mode else engine.quant_mode,
                     "elapsed_sec": elapsed,
                     "hires_scale": req.hires_scale if req.mode == "hires" else 1.0,
-                    "ref_count": (1 + len(extra_refs)) if (req.mode == "i2i" and init_img is not None) else (1 if init_img is not None else 0),
+                    "ref_count": (1 + len(extra_refs)) if (req.mode in {"i2i", "inpaint"} and init_img is not None) else (1 if init_img is not None else 0),
                 },
             )
             job.results.append(record)
@@ -1743,9 +1922,11 @@ def api_update_config(req: ConfigUpdateRequest) -> dict[str, Any]:
         hf_token=req.hf_token,
         cpu_offload=req.cpu_offload,
         vae_tiling=req.vae_tiling,
+        inpaint_fast_crop=req.inpaint_fast_crop,
         ai_endpoint=req.ai_endpoint,
         ai_api_key=req.ai_api_key,
         ai_model=req.ai_model,
+        ai_vision_enabled=req.ai_vision_enabled,
     )
     return {"ok": True, "stats": collect_system_stats()}
 
@@ -1898,7 +2079,12 @@ def _build_ai_system_prompt(scene: str, context: dict[str, Any]) -> str:
     )
 
 
-def _call_ai_endpoint(messages: list[dict[str, str]]) -> str:
+def _strip_think_tags(text: str) -> str:
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+    return cleaned or text.strip()
+
+
+def _call_ai_endpoint(messages: list[dict[str, Any]]) -> str:
     endpoint = (engine.ai_endpoint or "").strip()
     api_key = (engine.ai_api_key or "").strip()
     model = (engine.ai_model or "").strip()
@@ -1937,27 +2123,49 @@ def _call_ai_endpoint(messages: list[dict[str, str]]) -> str:
         raise RuntimeError(f"AI 返回格式异常: {str(body)[:300]}")
     msg = choices[0].get("message") or {}
     content = msg.get("content") or choices[0].get("text") or ""
-    return str(content).strip()
+    return _strip_think_tags(str(content))
 
 
 @app.post("/api/ai/chat")
 def api_ai_chat(req: AIChatRequest) -> dict[str, Any]:
     sys_prompt = _build_ai_system_prompt(req.scene, req.context)
-    messages: list[dict[str, str]] = [{"role": "system", "content": sys_prompt}]
+    messages: list[dict[str, Any]] = [{"role": "system", "content": sys_prompt}]
     for item in (req.history or [])[-10:]:
         role = item.get("role", "user")
         content = item.get("content", "")
         if role in {"user", "assistant"} and content:
             messages.append({"role": role, "content": str(content)[:4000]})
-    messages.append({"role": "user", "content": req.message})
 
-    try:
-        reply = _call_ai_endpoint(messages)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    valid_images = [
+        img for img in (req.images or [])[:6]
+        if isinstance(img, str) and (img.startswith("data:image/") or img.startswith("http://") or img.startswith("https://"))
+    ]
+    use_vision = bool(engine.ai_vision_enabled and valid_images and req.scene == "studio")
+
+    if use_vision:
+        mm_content: list[dict[str, Any]] = [{"type": "text", "text": req.message}]
+        for img_url in valid_images:
+            mm_content.append({"type": "image_url", "image_url": {"url": img_url}})
+        messages_mm = [*messages, {"role": "user", "content": mm_content}]
+        try:
+            reply = _call_ai_endpoint(messages_mm)
+        except Exception as exc:
+            logger.warning("Vision AI call failed (%s); falling back to text-only prompt.", exc)
+            messages_txt = [*messages, {"role": "user", "content": req.message}]
+            try:
+                reply = _call_ai_endpoint(messages_txt)
+                reply = f"（当前 AI 模型未接受图片输入，已自动退回纯文本模式）\n\n{reply}"
+            except Exception as exc2:
+                raise HTTPException(status_code=502, detail=str(exc2)) from exc2
+    else:
+        messages.append({"role": "user", "content": req.message})
+        try:
+            reply = _call_ai_endpoint(messages)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     actions = _extract_ai_actions(reply)
-    return {"ok": True, "reply": reply, "actions": actions, "model": engine.ai_model}
+    return {"ok": True, "reply": reply, "actions": actions, "model": engine.ai_model, "used_vision": use_vision}
 
 
 @app.post("/api/loras/download")

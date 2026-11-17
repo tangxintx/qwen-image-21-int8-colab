@@ -67,7 +67,9 @@
     gallerySelecting: false,
     selectedIds: new Set(),
     lightboxItem: null,
-    // Inpaint canvas state
+    // Inpaint canvas & multi-image state
+    inpaintItems: [], // { id, b64, width, height, maskB64, hasMask }
+    editingInpaintIdx: -1,
     inpaintTool: "brush",
     brushSize: 36,
     drawing: false,
@@ -144,8 +146,16 @@
   });
 
   // -------------------------------------------------------------------------
-  // Mode Switching
+  // Mode Switching & Sticky Top Bar Height
   // -------------------------------------------------------------------------
+  function syncTopBarHeight() {
+    const bar = document.querySelector(".top-bar");
+    if (bar) {
+      document.documentElement.style.setProperty("--top-bar-h", `${bar.offsetHeight + 4}px`);
+    }
+  }
+  window.addEventListener("resize", syncTopBarHeight);
+
   function setMode(mode) {
     state.mode = mode;
     document.querySelectorAll(".mode-tab").forEach((t) => {
@@ -158,9 +168,17 @@
     const titles = {
       i2i: "图生图 · 多图参考 (@0主图)",
       hires: "高清修复 · 原图",
-      inpaint: "局部重绘 · 遮罩",
+      inpaint: "局部重绘 · 多选图片（点击图片涂抹）",
     };
     if (titles[mode]) $("imageInputTitle").textContent = titles[mode];
+    if ($("uploadPrimaryLabel")) {
+      $("uploadPrimaryLabel").textContent = mode === "inpaint" ? "多选图" : "主图";
+    }
+    if ($("uploadHintText")) {
+      $("uploadHintText").textContent = mode === "inpaint"
+        ? "支持一次多选图片，点击图片即可进入涂抹遮罩"
+        : "选择主图或从作品库导入";
+    }
 
     const denoiseSlider = $("denoiseSlider");
     if (mode === "hires") {
@@ -322,16 +340,26 @@
 
     // Quick @0 / @1 / @1,2 mention chips above prompt quick tags
     const bar = $("refMentionBar");
-    const showMentions = isI2I && (Boolean(state.initImageObj) || extras.length > 0);
+    const inpaintRefCount = state.mode === "inpaint" ? Math.max(0, state.inpaintItems.length - 1) : 0;
+    const showMentions =
+      (isI2I && (Boolean(state.initImageObj) || extras.length > 0)) ||
+      (state.mode === "inpaint" && state.inpaintItems.length > 0);
     bar.classList.toggle("hidden", !showMentions);
     bar.innerHTML = "";
     if (showMentions) {
       const tokens = [];
-      if (state.initImageObj) tokens.push({ label: "@0 主图", val: "@0" });
-      extras.forEach((_, idx) => tokens.push({ label: `@${idx + 1}`, val: `@${idx + 1}` }));
-      if (extras.length >= 2) {
-        const multi = extras.map((_, idx) => idx + 1).join(",");
-        tokens.push({ label: `@${multi}`, val: `@${multi}` });
+      if (state.mode === "inpaint") {
+        tokens.push({ label: "@0 主图", val: "@0" });
+        for (let i = 1; i <= inpaintRefCount; i++) {
+          tokens.push({ label: `@${i}`, val: `@${i}` });
+        }
+      } else {
+        if (state.initImageObj) tokens.push({ label: "@0 主图", val: "@0" });
+        extras.forEach((_, idx) => tokens.push({ label: `@${idx + 1}`, val: `@${idx + 1}` }));
+        if (extras.length >= 2) {
+          const multi = extras.map((_, idx) => idx + 1).join(",");
+          tokens.push({ label: `@${multi}`, val: `@${multi}` });
+        }
       }
       tokens.forEach((t) => {
         const b = document.createElement("button");
@@ -343,27 +371,96 @@
     }
   }
 
+  function renderInpaintMultiGrid() {
+    const isInpaint = state.mode === "inpaint";
+    const items = state.inpaintItems;
+    $("inpaintMultiSection").classList.toggle("hidden", !isInpaint || items.length === 0);
+    $("inpaintCountBadge").textContent = `${items.length} 张`;
+    const grid = $("inpaintMultiGrid");
+    grid.innerHTML = "";
+    if (!isInpaint || !items.length) return;
+
+    items.forEach((item, idx) => {
+      const card = document.createElement("div");
+      card.className = `inpaint-item-card ${idx === 0 ? "primary" : ""}`;
+      const roleLabel = idx === 0 ? "@0 主图" : `@${idx} 参考`;
+      card.innerHTML = `
+        <div class="inpaint-thumb-wrap" title="点击图片进入涂抹遮罩">
+          <img class="inpaint-thumb-img" src="${item.b64}" alt="inpaint-${idx}" />
+          ${item.hasMask && item.maskPreviewB64 ? `<img class="inpaint-mask-overlay-img" src="${item.maskPreviewB64}" alt="mask" />` : ""}
+          <span class="ref-role-badge">${roleLabel}</span>
+          ${item.hasMask ? '<span class="inpaint-mask-badge">已涂抹</span>' : ""}
+          <div class="inpaint-tap-hint">点击涂抹遮罩</div>
+        </div>
+        <div class="inpaint-item-foot">
+          <span>${item.width}×${item.height}</span>
+          <div style="display:flex;gap:4px">
+            ${idx !== 0 ? '<button class="mini-action" data-act="primary" type="button">主图</button>' : ""}
+            <button class="mini-action" data-act="del" type="button">删</button>
+          </div>
+        </div>
+      `;
+      card.querySelector(".inpaint-thumb-wrap").addEventListener("click", () => openInpaintModal(idx));
+      const priBtn = card.querySelector('[data-act="primary"]');
+      if (priBtn) {
+        priBtn.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          const [picked] = state.inpaintItems.splice(idx, 1);
+          state.inpaintItems.unshift(picked);
+          syncPrimaryFromInpaintTop();
+          refreshImageStage();
+        });
+      }
+      card.querySelector('[data-act="del"]').addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        state.inpaintItems.splice(idx, 1);
+        syncPrimaryFromInpaintTop();
+        refreshImageStage();
+      });
+      grid.appendChild(card);
+    });
+  }
+
+  function syncPrimaryFromInpaintTop() {
+    const top = state.inpaintItems[0];
+    if (!top) {
+      if (state.mode === "inpaint") {
+        state.initImageB64 = null;
+        state.initImageObj = null;
+      }
+      return;
+    }
+    const img = new Image();
+    img.onload = () => {
+      state.initImageB64 = top.b64;
+      state.initImageObj = img;
+      if (state.ratio === "original") applyOriginalAspectResolution(img);
+    };
+    img.src = top.b64;
+  }
+
   function refreshImageStage() {
-    const hasImg = Boolean(state.initImageObj);
+    const isInpaint = state.mode === "inpaint";
+    const hasImg = isInpaint ? state.inpaintItems.length > 0 : Boolean(state.initImageObj);
     $("uploadPlaceholder").classList.toggle("hidden", hasImg);
-    $("clearImageBtn").classList.toggle("hidden", !hasImg && state.extraRefImages.length === 0);
+    $("clearImageBtn").classList.toggle(
+      "hidden",
+      isInpaint ? state.inpaintItems.length === 0 : (!hasImg && state.extraRefImages.length === 0)
+    );
 
     if (!hasImg) {
       $("refPreviewWrap").classList.add("hidden");
-      $("inpaintEditor").classList.add("hidden");
+      $("inpaintMultiSection").classList.add("hidden");
       renderExtraRefs();
       return;
     }
 
-    const isInpaint = state.mode === "inpaint";
     $("refPreviewWrap").classList.toggle("hidden", isInpaint);
-    $("inpaintEditor").classList.toggle("hidden", !isInpaint);
-
     if (!isInpaint) {
       $("refPreviewImg").src = state.initImageB64;
       $("refImageMeta").textContent = `${state.initImageObj.width} × ${state.initImageObj.height}`;
     } else {
-      setupInpaintCanvases(state.initImageObj);
+      renderInpaintMultiGrid();
     }
     renderExtraRefs();
   }
@@ -385,7 +482,42 @@
     return SUPPORTED_RATIOS.some((sr) => Math.abs(Math.log(sr / r)) <= 0.025);
   }
 
+  function addInpaintImageFromDataUrl(dataUrl) {
+    if (state.inpaintItems.length >= 10) {
+      showToast("局部重绘最多支持 10 张图片");
+      return;
+    }
+    const img = new Image();
+    img.onload = () => {
+      state.inpaintItems.push({
+        id: `${Date.now()}_${Math.random().toString(16).slice(2, 7)}`,
+        b64: dataUrl,
+        width: img.width,
+        height: img.height,
+        maskB64: null,
+        maskPreviewB64: null,
+        hasMask: false,
+      });
+      if (state.inpaintItems.length === 1) {
+        state.initImageB64 = dataUrl;
+        state.initImageObj = img;
+        state.ratio = "original";
+        updateRatioChipUI();
+        applyOriginalAspectResolution(img);
+      }
+      refreshImageStage();
+      if (!isSupportedAspectRatio(img.width, img.height)) {
+        showToast("存在非预设比例图片，生成时将自动透明扩图并在输出后裁剪还原", 3500);
+      }
+    };
+    img.src = dataUrl;
+  }
+
   function loadInitImageFromDataUrl(dataUrl) {
+    if (state.mode === "inpaint") {
+      addInpaintImageFromDataUrl(dataUrl);
+      return;
+    }
     const img = new Image();
     img.onload = () => {
       state.initImageB64 = dataUrl;
@@ -434,12 +566,37 @@
 
   $("primaryRefBadge").addEventListener("click", () => insertPromptToken("@0"));
 
+  function handleMultiFileSelection(fileList) {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    if (state.mode === "inpaint") {
+      files.forEach((file) => {
+        const reader = new FileReader();
+        reader.onload = () => addInpaintImageFromDataUrl(reader.result);
+        reader.readAsDataURL(file);
+      });
+      return;
+    }
+    const first = files[0];
+    const r0 = new FileReader();
+    r0.onload = () => loadInitImageFromDataUrl(r0.result);
+    r0.readAsDataURL(first);
+    if (state.mode === "i2i" && files.length > 1) {
+      files.slice(1).forEach((f) => {
+        const rx = new FileReader();
+        rx.onload = () => addExtraRefFromDataUrl(rx.result);
+        rx.readAsDataURL(f);
+      });
+    }
+  }
+
   $("imageFileInput").addEventListener("change", (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => loadInitImageFromDataUrl(reader.result);
-    reader.readAsDataURL(file);
+    handleMultiFileSelection(e.target.files);
+    e.target.value = "";
+  });
+
+  $("inpaintAddFileInput").addEventListener("change", (e) => {
+    handleMultiFileSelection(e.target.files);
     e.target.value = "";
   });
 
@@ -457,6 +614,7 @@
     state.initImageB64 = null;
     state.initImageObj = null;
     state.extraRefImages = [];
+    state.inpaintItems = [];
     state.undoStack = [];
     resetMaskCanvas();
     if (state.ratio === "original") {
@@ -472,14 +630,48 @@
     switchTab("gallery");
   });
 
-  function setupInpaintCanvases(img) {
+  function openInpaintModal(idx) {
+    const item = state.inpaintItems[idx];
+    if (!item) return;
+    state.editingInpaintIdx = idx;
+    state.undoStack = [];
+    $("inpaintModalTitle").textContent = `涂抹遮罩 · #${idx + 1} (${item.width}×${item.height})`;
+    $("inpaintCanvasModal").classList.remove("hidden");
+
+    const img = new Image();
+    img.onload = () => {
+      setupInpaintCanvases(img, item.maskB64);
+    };
+    img.src = item.b64;
+  }
+
+  function closeInpaintModal(save) {
+    const idx = state.editingInpaintIdx;
+    if (save && idx >= 0 && state.inpaintItems[idx]) {
+      const painted = hasNonEmptyMask();
+      state.inpaintItems[idx].hasMask = painted;
+      state.inpaintItems[idx].maskB64 = painted ? maskDataCanvas.toDataURL("image/png") : null;
+      state.inpaintItems[idx].maskPreviewB64 = painted ? $("maskOverlayCanvas").toDataURL("image/png") : null;
+      renderInpaintMultiGrid();
+      showToast(painted ? `已保存 #${idx + 1} 遮罩` : `已清空 #${idx + 1} 遮罩`);
+    }
+    state.editingInpaintIdx = -1;
+    $("inpaintCanvasModal").classList.add("hidden");
+  }
+
+  $("inpaintModalSaveBtn").addEventListener("click", () => closeInpaintModal(true));
+  $("inpaintModalCancelBtn").addEventListener("click", () => closeInpaintModal(false));
+  $("inpaintModalCloseBtn").addEventListener("click", () => closeInpaintModal(false));
+  $("inpaintModalBackdrop").addEventListener("click", () => closeInpaintModal(false));
+
+  function setupInpaintCanvases(img, existingMaskB64 = null) {
     const bgCanvas = $("bgCanvas");
     const overlayCanvas = $("maskOverlayCanvas");
     const bgCtx = bgCanvas.getContext("2d");
     const ovCtx = overlayCanvas.getContext("2d");
 
     // Display size up to 640px wide while keeping exact aspect ratio
-    const maxDisplayW = Math.min(640, $("canvasStage").clientWidth || 360);
+    const maxDisplayW = Math.min(640, $("canvasStage").clientWidth || 340);
     const scale = maxDisplayW / img.width;
     const dispW = Math.max(200, Math.round(img.width * scale));
     const dispH = Math.max(120, Math.round(img.height * scale));
@@ -493,14 +685,19 @@
     bgCtx.drawImage(img, 0, 0, dispW, dispH);
 
     // Exact pixel mask canvas
-    if (maskDataCanvas.width !== img.width || maskDataCanvas.height !== img.height) {
-      maskDataCanvas.width = img.width;
-      maskDataCanvas.height = img.height;
-      maskDataCtx.fillStyle = "#000000";
-      maskDataCtx.fillRect(0, 0, img.width, img.height);
-      ovCtx.clearRect(0, 0, dispW, dispH);
-    } else {
-      syncOverlayFromMaskData();
+    maskDataCanvas.width = img.width;
+    maskDataCanvas.height = img.height;
+    maskDataCtx.fillStyle = "#000000";
+    maskDataCtx.fillRect(0, 0, img.width, img.height);
+    ovCtx.clearRect(0, 0, dispW, dispH);
+
+    if (existingMaskB64) {
+      const mImg = new Image();
+      mImg.onload = () => {
+        maskDataCtx.drawImage(mImg, 0, 0, img.width, img.height);
+        syncOverlayFromMaskData();
+      };
+      mImg.src = existingMaskB64;
     }
   }
 
@@ -763,6 +960,77 @@
     $("genNoticeBanner").classList.add("hidden");
   }
 
+  async function runSingleGenerationPayload(payload, appendResults = false, accumulatedResults = [], totalElapsedAcc = 0) {
+    state.lastGenPayload = {
+      ...payload,
+      init_image_b64: Boolean(payload.init_image_b64),
+      mask_image_b64: Boolean(payload.mask_image_b64),
+      ref_images_b64: (payload.ref_images_b64 || []).length,
+    };
+
+    const resp = await apiFetch("/api/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    state.activeJobId = resp.job_id;
+    return await waitJobCompletion(resp.job_id, appendResults, accumulatedResults, totalElapsedAcc);
+  }
+
+  function waitJobCompletion(jobId, appendResults = false, accumulatedResults = [], totalElapsedAcc = 0) {
+    return new Promise((resolve, reject) => {
+      clearInterval(state.pollTimer);
+      state.pollTimer = setInterval(async () => {
+        try {
+          const job = await apiFetch(`/api/jobs/${jobId}`);
+          const isQueued = job.status === "queued";
+          const pct = Math.round((job.progress || 0) * 100);
+          const showIndeterminate = isQueued || (job.status === "loading_model" && pct <= 2);
+          $("progressMsg").textContent = job.message || "生成中...";
+          $("progressPct").textContent = showIndeterminate ? "准备中" : `${pct}%`;
+          $("progressBarFill").classList.toggle("indeterminate", showIndeterminate);
+          if (!showIndeterminate) {
+            $("progressBarFill").style.width = `${pct}%`;
+          }
+
+          if (job.notice) {
+            $("genNoticeBanner").textContent = job.notice;
+            $("genNoticeBanner").classList.remove("hidden");
+            if (state.notifiedJobId !== jobId) {
+              state.notifiedJobId = jobId;
+              showToast(job.notice, 4500);
+            }
+          }
+
+          if (["completed", "cancelled", "error"].includes(job.status)) {
+            clearInterval(state.pollTimer);
+            state.activeJobId = null;
+
+            if (job.status === "completed") {
+              const allItems = appendResults ? [...accumulatedResults, ...(job.results || [])] : (job.results || []);
+              const totTime = Number((totalElapsedAcc + (job.elapsed_sec || 0)).toFixed(2));
+              renderLatestResults(allItems, totTime);
+              if (job.results?.length) {
+                state.lastSeed = job.results[job.results.length - 1].seed;
+              }
+              resolve({ status: "completed", results: allItems, elapsed: totTime });
+            } else if (job.status === "cancelled") {
+              const allItems = appendResults ? [...accumulatedResults, ...(job.results || [])] : (job.results || []);
+              if (allItems.length) renderLatestResults(allItems, Number((totalElapsedAcc + (job.elapsed_sec || 0)).toFixed(2)));
+              resolve({ status: "cancelled", results: allItems });
+            } else {
+              reject(new Error(job.error || "未知错误"));
+            }
+          }
+        } catch (err) {
+          clearInterval(state.pollTimer);
+          state.activeJobId = null;
+          reject(err);
+        }
+      }, 350);
+    });
+  }
+
   $("generateBtn").addEventListener("click", async () => {
     const prompt = $("promptInput").value.trim();
     if (!prompt) {
@@ -771,12 +1039,80 @@
       return;
     }
 
-    if (state.mode !== "t2i" && !state.initImageB64) {
-      showToast("当前模式需要先上传或导入参考底图");
+    if (state.mode === "inpaint") {
+      if (!state.inpaintItems.length) {
+        showToast("请先选择需要局部重绘的图片");
+        return;
+      }
+      const maskedItems = state.inpaintItems.filter((x) => x.hasMask && x.maskB64);
+      if (!maskedItems.length) {
+        showToast("请点击图片进入涂抹界面，涂抹需要重绘的区域");
+        return;
+      }
+      const unmaskedRefs = state.inpaintItems.filter((x) => !x.hasMask).map((x) => x.b64);
+
+      hideGenBanners();
+      state.notifiedJobId = null;
+      setGeneratingUI(true);
+      $("progressMsg").textContent = "提交局部重绘任务...";
+      $("progressPct").textContent = "0%";
+
+      let accResults = [];
+      let accTime = 0;
+      try {
+        for (let i = 0; i < maskedItems.length; i++) {
+          const target = maskedItems[i];
+          const otherRefs = state.inpaintItems
+            .filter((x) => x.id !== target.id)
+            .map((x) => x.b64);
+          const refsForJob = maskedItems.length === 1 ? otherRefs : unmaskedRefs;
+          const payload = {
+            mode: "inpaint",
+            prompt,
+            negative_prompt: $("negativePromptInput").value.trim(),
+            width: align16($("widthInput").value),
+            height: align16($("heightInput").value),
+            steps: Number($("stepsSlider").value),
+            denoise: Number($("denoiseSlider").value),
+            true_cfg_scale: Number($("cfgSlider").value),
+            seed: Number($("seedInput").value || -1),
+            batch_size: state.batchSize,
+            hires_scale: Number($("hiresScaleSlider").value),
+            mask_blur: Number($("maskBlurSlider").value),
+            init_image_b64: target.b64,
+            ref_images_b64: refsForJob.slice(0, 9),
+            mask_image_b64: target.maskB64,
+            lora_enabled: $("loraEnableToggle").checked,
+            lora_name: $("loraSelect").value || null,
+            lora_weight: Number($("loraWeightSlider").value),
+            lora_trigger: $("loraTriggerInput").value.trim(),
+            lora_action_mode: $("loraActionMode").value,
+            lora_control_image_b64: $("loraActionMode").value === "control" ? state.loraControlB64 : null,
+            lora_control_strength: Number($("loraCtrlStrengthSlider").value),
+            inpaint_fast_crop: $("inpaintFastCropToggle").checked,
+          };
+          const out = await runSingleGenerationPayload(payload, i > 0, accResults, accTime);
+          accResults = out.results || accResults;
+          accTime = out.elapsed || accTime;
+          if (out.status === "cancelled") {
+            showToast("生成已停止");
+            setGeneratingUI(false);
+            return;
+          }
+        }
+        setGeneratingUI(false);
+        showToast(`局部重绘完成 (${accResults.length} 张 · ${accTime}s)`);
+        refreshStats();
+      } catch (err) {
+        setGeneratingUI(false);
+        showGenErrorBanner(err.message);
+        showToast(`生成失败: ${err.message}`, 8000);
+      }
       return;
     }
-    if (state.mode === "inpaint" && !hasNonEmptyMask()) {
-      showToast("请在画面上涂抹需要重绘的区域");
+
+    if (state.mode !== "t2i" && !state.initImageB64) {
+      showToast("当前模式需要先上传或导入参考底图");
       return;
     }
 
@@ -798,7 +1134,7 @@
       mask_blur: Number($("maskBlurSlider").value),
       init_image_b64: state.mode === "t2i" ? null : state.initImageB64,
       ref_images_b64: state.mode === "i2i" ? state.extraRefImages.map((x) => x.b64) : [],
-      mask_image_b64: state.mode === "inpaint" ? maskDataCanvas.toDataURL("image/png") : null,
+      mask_image_b64: null,
       lora_enabled: $("loraEnableToggle").checked,
       lora_name: $("loraSelect").value || null,
       lora_weight: Number($("loraWeightSlider").value),
@@ -806,24 +1142,25 @@
       lora_action_mode: $("loraActionMode").value,
       lora_control_image_b64: $("loraActionMode").value === "control" ? state.loraControlB64 : null,
       lora_control_strength: Number($("loraCtrlStrengthSlider").value),
+      inpaint_fast_crop: $("inpaintFastCropToggle").checked,
     };
-    state.lastGenPayload = { ...payload, init_image_b64: Boolean(payload.init_image_b64), mask_image_b64: Boolean(payload.mask_image_b64), ref_images_b64: payload.ref_images_b64.length };
 
     try {
       setGeneratingUI(true);
       $("progressMsg").textContent = "提交生成任务...";
       $("progressPct").textContent = "0%";
-      const resp = await apiFetch("/api/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      state.activeJobId = resp.job_id;
-      startPollingJob(resp.job_id);
+      const out = await runSingleGenerationPayload(payload);
+      setGeneratingUI(false);
+      if (out.status === "cancelled") {
+        showToast("生成已停止");
+      } else {
+        showToast(`生成完成 (${out.results.length} 张 · ${out.elapsed}s)`);
+        refreshStats();
+      }
     } catch (err) {
       setGeneratingUI(false);
       showGenErrorBanner(err.message);
-      showToast(`启动失败: ${err.message}`, 3500);
+      showToast(`生成失败: ${err.message}`, 8000);
     }
   });
 
@@ -837,60 +1174,6 @@
       showToast("已发送中断指令，正在停止...");
     } catch (_) {}
   });
-
-  function startPollingJob(jobId) {
-    clearInterval(state.pollTimer);
-    state.pollTimer = setInterval(async () => {
-      try {
-        const job = await apiFetch(`/api/jobs/${jobId}`);
-        const isQueued = job.status === "queued";
-        const pct = Math.round((job.progress || 0) * 100);
-        const showIndeterminate = isQueued || (job.status === "loading_model" && pct <= 2);
-        $("progressMsg").textContent = job.message || "生成中...";
-        $("progressPct").textContent = showIndeterminate ? "准备中" : `${pct}%`;
-        $("progressBarFill").classList.toggle("indeterminate", showIndeterminate);
-        if (!showIndeterminate) {
-          $("progressBarFill").style.width = `${pct}%`;
-        }
-
-        if (job.notice) {
-          $("genNoticeBanner").textContent = job.notice;
-          $("genNoticeBanner").classList.remove("hidden");
-          if (state.notifiedJobId !== jobId) {
-            state.notifiedJobId = jobId;
-            showToast(job.notice, 4500);
-          }
-        }
-
-        if (["completed", "cancelled", "error"].includes(job.status)) {
-          clearInterval(state.pollTimer);
-          state.activeJobId = null;
-          setGeneratingUI(false);
-
-          if (job.status === "completed") {
-            renderLatestResults(job.results, job.elapsed_sec);
-            if (job.results?.length) {
-              state.lastSeed = job.results[job.results.length - 1].seed;
-            }
-            showToast(`生成完成 (${job.results.length} 张 · ${job.elapsed_sec}s)`);
-            refreshStats();
-          } else if (job.status === "cancelled") {
-            if (job.results?.length) renderLatestResults(job.results, job.elapsed_sec);
-            showToast("生成已停止");
-          } else {
-            const errText = job.error || "未知错误";
-            showGenErrorBanner(errText);
-            showToast(`生成失败: ${errText}`, 8000);
-          }
-        }
-      } catch (err) {
-        clearInterval(state.pollTimer);
-        state.activeJobId = null;
-        setGeneratingUI(false);
-        showToast(`轮询中断: ${err.message}`);
-      }
-    }, 350);
-  }
 
   function renderLatestResults(items, totalElapsed) {
     const card = $("latestResultCard");
@@ -1290,13 +1573,20 @@
       const disk = s.disk;
       const eng = s.engine;
 
-      const statusMode = eng.demo_mode ? "演示模式" : eng.loaded ? "模型已驻留" : "待加载(按需)";
       let quantTag = "INT8";
       if (eng.quant_mode === "none") quantTag = `${eng.effective_dtype.toUpperCase()} 满血`;
       else if (eng.quant_mode === "fp8-int8") quantTag = "FP8+INT8";
       else if (eng.quant_mode === "fp8-all") quantTag = "FP8";
       $("headerQuantBadge").textContent = quantTag;
-      $("engineStatusText").textContent = `${eng.model_id.split("/").pop()} · ${statusMode}`;
+      const modelShort = (eng.model_id || "Qwen-Image-2.1").split("/").pop();
+      const ramPct = Math.round(Number(ram.percent || 0));
+      const diskPct = Math.round(Number(disk.percent || 0));
+      $("engineStatusText").textContent = `${modelShort} · 内存 ${ramPct}% · 存储 ${diskPct}%`;
+      if (eng.model_id && $("modelSelect").value !== eng.model_id) {
+        if (Array.from($("modelSelect").options).some((o) => o.value === eng.model_id)) {
+          $("modelSelect").value = eng.model_id;
+        }
+      }
 
       // Monitor gauges
       $("gpuNameText").textContent = gpu.name;
@@ -1618,9 +1908,11 @@
             offload_mode: $("offloadSelect").value,
             vae_tiling_mode: $("vaeTilingSelect").value,
             hf_token: $("hfTokenInput").value.trim() || null,
+            inpaint_fast_crop: $("inpaintFastCropToggle").checked,
             ai_endpoint: $("aiEndpointInput").value.trim() || null,
             ai_model: $("aiModelInput").value.trim() || null,
             ai_api_key: $("aiApiKeyInput").value.trim() || null,
+            ai_vision_enabled: $("aiVisionToggle").checked,
           }),
         },
         true
@@ -1648,6 +1940,7 @@
             ai_endpoint: $("aiEndpointInput").value.trim() || null,
             ai_model: $("aiModelInput").value.trim() || null,
             ai_api_key: $("aiApiKeyInput").value.trim() || null,
+            ai_vision_enabled: $("aiVisionToggle").checked,
           }),
         },
         true
@@ -1658,6 +1951,9 @@
       showToast(`保存 AI 配置失败: ${err.message}`);
     }
   }
+
+  $("inpaintFastCropToggle").addEventListener("change", () => saveEngineConfig());
+  $("aiVisionToggle").addEventListener("change", () => saveAiConfigOnly());
 
   document.querySelectorAll("#editionQuickBtns .tag-chip").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -2131,6 +2427,62 @@
     list.scrollTop = list.scrollHeight;
   }
 
+  function compressDataUrlForVision(dataUrl, maxEdge = 768) {
+    return new Promise((resolve) => {
+      if (!dataUrl) return resolve(null);
+      const img = new Image();
+      img.onload = () => {
+        const scale = Math.min(1, maxEdge / Math.max(img.width, img.height, 1));
+        const w = Math.max(64, Math.round(img.width * scale));
+        const h = Math.max(64, Math.round(img.height * scale));
+        const cvs = document.createElement("canvas");
+        cvs.width = w;
+        cvs.height = h;
+        const ctx = cvs.getContext("2d");
+        ctx.drawImage(img, 0, 0, w, h);
+        resolve(cvs.toDataURL("image/jpeg", 0.82));
+      };
+      img.onerror = () => resolve(null);
+      img.src = dataUrl;
+    });
+  }
+
+  async function collectStudioVisionImages() {
+    if (!$("aiVisionToggle")?.checked || aiState.scene !== "studio") return [];
+    const rawList = [];
+    if (state.mode === "inpaint" && state.inpaintItems.length) {
+      state.inpaintItems.slice(0, 4).forEach((x) => rawList.push(x.b64));
+    } else {
+      if (state.initImageB64) rawList.push(state.initImageB64);
+      state.extraRefImages.slice(0, 3).forEach((x) => rawList.push(x.b64));
+    }
+    if (state.loraControlB64) rawList.push(state.loraControlB64);
+    const out = [];
+    for (const r of rawList.slice(0, 4)) {
+      const compressed = await compressDataUrlForVision(r);
+      if (compressed) out.push(compressed);
+    }
+    return out;
+  }
+
+  function updateAiVisionHint() {
+    const hint = $("aiVisionHint");
+    if (!hint) return;
+    const visionOn = Boolean($("aiVisionToggle")?.checked) && aiState.scene === "studio";
+    const imgCount = state.mode === "inpaint"
+      ? state.inpaintItems.length
+      : (state.initImageB64 ? 1 : 0) + state.extraRefImages.length + (state.loraControlB64 ? 1 : 0);
+    if (visionOn && imgCount > 0) {
+      hint.textContent = `识图功能已开启：强化提示词时将一并发送当前 ${Math.min(4, imgCount)} 张参考图给对话 AI`;
+      hint.classList.remove("hidden");
+    } else if (visionOn) {
+      hint.textContent = "识图功能已开启（当前未上传图片，将仅发送文本）";
+      hint.classList.remove("hidden");
+    } else {
+      hint.classList.add("hidden");
+    }
+  }
+
   function openAiModal(scene = "studio", autoPrompt = null) {
     aiState.scene = scene;
     const meta = AI_SCENE_META[scene] || AI_SCENE_META.studio;
@@ -2146,6 +2498,7 @@
       qWrap.appendChild(b);
     });
 
+    updateAiVisionHint();
     $("aiAssistantModal").classList.remove("hidden");
     renderAiChat();
     if (autoPrompt) {
@@ -2174,6 +2527,7 @@
     $("aiChatSendBtn").innerHTML = '<svg class="icon icon-spin"><use href="#ic-loader" /></svg><span>思考中</span>';
 
     try {
+      const visionImages = await collectStudioVisionImages();
       const res = await apiFetch("/api/ai/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2182,6 +2536,7 @@
           message: text,
           history: aiState.history.slice(-10, -1).map((m) => ({ role: m.role, content: m.content })),
           context: collectAiContext(aiState.scene),
+          images: visionImages,
         }),
       }, true);
       aiState.history.push({
@@ -2287,6 +2642,7 @@
   // Init
   // -------------------------------------------------------------------------
   async function init() {
+    syncTopBarHeight();
     setMode("t2i");
     applyResolution(1024, 1024);
     try {
@@ -2298,6 +2654,9 @@
       if (eng.dtype_mode) $("dtypeSelect").value = eng.dtype_mode;
       if (eng.offload_mode) $("offloadSelect").value = eng.offload_mode;
       if (eng.vae_tiling_mode) $("vaeTilingSelect").value = eng.vae_tiling_mode;
+      if (typeof eng.inpaint_fast_crop === "boolean") {
+        $("inpaintFastCropToggle").checked = eng.inpaint_fast_crop;
+      }
       if (eng.default_steps) {
         $("stepsSlider").value = String(eng.default_steps);
         $("stepsVal").textContent = String(eng.default_steps);
@@ -2312,6 +2671,9 @@
           $("aiModelBadge").textContent = stats.ai.model;
         }
         if (stats.ai.api_key) $("aiApiKeyInput").value = stats.ai.api_key;
+        if (typeof stats.ai.vision_enabled === "boolean") {
+          $("aiVisionToggle").checked = stats.ai.vision_enabled;
+        }
       }
     } catch (_) {}
     refreshStats();

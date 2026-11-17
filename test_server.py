@@ -387,6 +387,83 @@ def _run_direct_inprocess_tests() -> None:
     cancelled_job = _wait_job(cancel_job_id)
     assert cancelled_job["status"] == "cancelled", cancelled_job
 
+    # New: Inpaint Fast Crop ("局部重绘加速") crops around mask and stitches back aligned to original
+    full_img_b64 = _make_b64_png(640, 640, (40, 90, 160))
+    small_mask = Image.new("L", (640, 640), 0)
+    ImageDraw.Draw(small_mask).rectangle([280, 280, 360, 360], fill=255)
+    small_mask_buf = io.BytesIO()
+    small_mask.save(small_mask_buf, format="PNG")
+    small_mask_b64 = "data:image/png;base64," + base64.b64encode(small_mask_buf.getvalue()).decode()
+
+    server.api_update_config(server.ConfigUpdateRequest(inpaint_fast_crop=True))
+    assert server.api_stats()["engine"]["inpaint_fast_crop"] is True
+    fast_inpaint_job = _wait_job(
+        server.api_generate(
+            server.GenerateRequest(
+                mode="inpaint",
+                prompt="add gold emblem to @0 using @1",
+                width=640,
+                height=640,
+                steps=3,
+                denoise=0.9,
+                seed=77,
+                init_image_b64=full_img_b64,
+                ref_images_b64=[init_b64],
+                mask_image_b64=small_mask_b64,
+                inpaint_fast_crop=True,
+            )
+        )["job_id"]
+    )
+    assert fast_inpaint_job["status"] == "completed", fast_inpaint_job
+    assert fast_inpaint_job["notice"] and "局部重绘加速" in fast_inpaint_job["notice"]
+    assert fast_inpaint_job["results"][0]["width"] == 640 and fast_inpaint_job["results"][0]["height"] == 640
+    stitched_out = Image.open(Path(_TMP_DIR) / fast_inpaint_job["results"][0]["filename"])
+    # Top-left corner outside crop box must stay aligned with original background color (40, 90, 160)
+    assert stitched_out.getpixel((5, 5)) == (40, 90, 160)
+
+    # New: Auto-select downloaded HF model on first load unless user modified in Settings
+    tmp_hf_hub = Path(_TMP_DIR) / "hf_hub_test"
+    cached_snap = tmp_hf_hub / "models--Qwen--Qwen-Image-2.1" / "snapshots" / "rev1"
+    cached_snap.mkdir(parents=True, exist_ok=True)
+    (cached_snap / "model_index.json").write_text("{}", encoding="utf-8")
+    old_hf_hub = os.environ.get("HF_HUB_CACHE")
+    try:
+        os.environ["HF_HUB_CACHE"] = str(tmp_hf_hub)
+        server.engine._user_modified_model = False
+        server.engine.model_id = "Qwen/Qwen-Image-2.1-Turbo"
+        picked = server.engine._auto_select_downloaded_model()
+        assert picked == "Qwen/Qwen-Image-2.1" and server.engine.model_id == "Qwen/Qwen-Image-2.1"
+
+        # If user explicitly changes model in Settings, auto-select must respect user choice
+        server.api_update_config(server.ConfigUpdateRequest(model_id="Qwen/Qwen-Image-2.1-Turbo"))
+        assert server.engine._user_modified_model is True
+        assert server.engine._auto_select_downloaded_model() is None
+        assert server.engine.model_id == "Qwen/Qwen-Image-2.1-Turbo"
+    finally:
+        if old_hf_hub is None:
+            os.environ.pop("HF_HUB_CACHE", None)
+        else:
+            os.environ["HF_HUB_CACHE"] = old_hf_hub
+
+    # New: AI Vision toggle sends multimodal image_url when enabled
+    server.api_update_config(server.ConfigUpdateRequest(ai_vision_enabled=True))
+    assert server.api_stats()["ai"]["vision_enabled"] is True
+    captured_msgs: list = []
+    orig_call_ai2 = server._call_ai_endpoint
+    try:
+        def _capture_ai(msgs):
+            captured_msgs.append(msgs)
+            return '视觉分析完成：\n```json\n{"prompt": "detailed neon portrait"}\n```'
+        server._call_ai_endpoint = _capture_ai
+        vis_res = server.api_ai_chat(
+            server.AIChatRequest(scene="studio", message="根据图片强化提示词", images=[init_b64])
+        )
+        assert vis_res["used_vision"] is True
+        assert isinstance(captured_msgs[0][-1]["content"], list)
+        assert any(part.get("type") == "image_url" for part in captured_msgs[0][-1]["content"])
+    finally:
+        server._call_ai_endpoint = orig_call_ai2
+
 
 def _assert_profiles_and_modes(update_fn) -> None:
     assert server.resolve_multi_image_prompt("把 @1，2 放进 @0", 3) == "把 图2、图3 放进 图1"

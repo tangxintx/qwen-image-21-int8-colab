@@ -206,8 +206,8 @@
             <div class="card-actions">
               <label class="btn-chip btn-upload">
                 <svg class="icon"><use href="#ic-folder" /></svg>
-                <span>主图</span>
-                <input type="file" id="imageFileInput" accept="image/*" hidden />
+                <span id="uploadPrimaryLabel">主图</span>
+                <input type="file" id="imageFileInput" accept="image/*" multiple hidden />
               </label>
               <button class="btn-chip" id="pickFromGalleryBtn">
                 <svg class="icon"><use href="#ic-image" /></svg>
@@ -221,7 +221,7 @@
             <div class="upload-icon">
               <svg class="icon icon-xl"><use href="#ic-image" /></svg>
             </div>
-            <div class="upload-hint">选择主图或从作品库导入</div>
+            <div class="upload-hint" id="uploadHintText">选择主图或从作品库导入</div>
           </div>
 
           <!-- Primary Preview (@0) -->
@@ -247,40 +247,20 @@
             <div class="extra-refs-grid hidden" id="extraRefsGrid"></div>
           </div>
 
-          <!-- Interactive Touch Inpaint Canvas -->
-          <div class="inpaint-editor hidden" id="inpaintEditor">
-            <div class="inpaint-toolbar">
-              <div class="tool-group">
-                <button class="tool-btn active" id="toolBrushBtn">
-                  <svg class="icon"><use href="#ic-brush" /></svg>
-                  <span>画笔</span>
-                </button>
-                <button class="tool-btn" id="toolEraserBtn">
-                  <svg class="icon"><use href="#ic-eraser" /></svg>
-                  <span>橡皮</span>
-                </button>
-                <button class="tool-btn" id="toolUndoBtn">
-                  <svg class="icon"><use href="#ic-undo" /></svg>
-                  <span>撤销</span>
-                </button>
-                <button class="tool-btn" id="toolClearMaskBtn">
-                  <svg class="icon"><use href="#ic-trash" /></svg>
-                  <span>清空</span>
-                </button>
+          <!-- Multi-image Inpaint Grid (Tap any image to open Paint Modal) -->
+          <div class="inpaint-multi-section hidden" id="inpaintMultiSection">
+            <div class="extra-refs-head">
+              <div class="extra-refs-title-row">
+                <span class="field-label">已选重绘图片（点击图片进入涂抹）</span>
+                <span class="mini-count-badge" id="inpaintCountBadge">0张</span>
               </div>
-              <div class="brush-size-row">
-                <span><strong id="brushSizeVal">36</strong>px</span>
-                <input type="range" id="brushSizeInput" min="8" max="120" value="36" />
-                <label class="toggle-inline" title="勾选后锁定画布防止误涂抹，可上下滑动页面">
-                  <input type="checkbox" id="scrollLockToggle" />
-                  <span>锁屏</span>
-                </label>
-              </div>
+              <label class="btn-chip primary">
+                <svg class="icon"><use href="#ic-plus" /></svg>
+                <span>多选添加</span>
+                <input type="file" id="inpaintAddFileInput" accept="image/*" multiple hidden />
+              </label>
             </div>
-            <div class="canvas-stage" id="canvasStage">
-              <canvas id="bgCanvas"></canvas>
-              <canvas id="maskOverlayCanvas"></canvas>
-            </div>
+            <div class="inpaint-multi-grid" id="inpaintMultiGrid"></div>
           </div>
         </div>
 
@@ -967,6 +947,14 @@
             <input type="password" id="hfTokenInput" placeholder="hf_..." autocomplete="off" />
           </div>
 
+          <label class="switch-row compact">
+            <div>
+              <div class="switch-title">局部重绘加速</div>
+              <div class="switch-desc">开启后自动裁剪涂抹区域给模型推理，生成后自动无缝对齐回原图</div>
+            </div>
+            <input type="checkbox" id="inpaintFastCropToggle" />
+          </label>
+
           <button class="btn-primary full" id="saveConfigBtn">
             <svg class="icon"><use href="#ic-save" /></svg>
             <span>保存配置</span>
@@ -996,6 +984,14 @@
               <input type="password" id="aiApiKeyInput" placeholder="sk-... (可在 Colab 第2步或此处填入)" autocomplete="off" />
             </div>
           </div>
+
+          <label class="switch-row compact">
+            <div>
+              <div class="switch-title">对话 AI 支持识图功能</div>
+              <div class="switch-desc">开启后，创作台强化提示词时将自动附带当前参考图发送给对话 AI</div>
+            </div>
+            <input type="checkbox" id="aiVisionToggle" />
+          </label>
 
           <div class="action-row">
             <button class="btn-primary" id="saveAiConfigBtn" type="button">
@@ -1178,6 +1174,62 @@
     </div>
   </div>
 
+  <!-- Inpaint Canvas Painter Modal (Tap an image card to enter and paint) -->
+  <div class="modal hidden" id="inpaintCanvasModal">
+    <div class="modal-backdrop" id="inpaintModalBackdrop"></div>
+    <div class="modal-sheet inpaint-sheet">
+      <div class="modal-top">
+        <span class="modal-title modal-title-row">
+          <svg class="icon"><use href="#ic-brush" /></svg>
+          <span id="inpaintModalTitle">涂抹局部重绘遮罩</span>
+        </span>
+        <button class="btn-close" id="inpaintModalCloseBtn" title="关闭" type="button">
+          <svg class="icon"><use href="#ic-close" /></svg>
+        </button>
+      </div>
+
+      <div class="inpaint-editor" id="inpaintEditor">
+        <div class="inpaint-toolbar">
+          <div class="tool-group">
+            <button class="tool-btn active" id="toolBrushBtn" type="button">
+              <svg class="icon"><use href="#ic-brush" /></svg>
+              <span>画笔</span>
+            </button>
+            <button class="tool-btn" id="toolEraserBtn" type="button">
+              <svg class="icon"><use href="#ic-eraser" /></svg>
+              <span>橡皮</span>
+            </button>
+            <button class="tool-btn" id="toolUndoBtn" type="button">
+              <svg class="icon"><use href="#ic-undo" /></svg>
+              <span>撤销</span>
+            </button>
+            <button class="tool-btn" id="toolClearMaskBtn" type="button">
+              <svg class="icon"><use href="#ic-trash" /></svg>
+              <span>清空</span>
+            </button>
+          </div>
+          <div class="brush-size-row">
+            <span><strong id="brushSizeVal">36</strong>px</span>
+            <input type="range" id="brushSizeInput" min="8" max="120" value="36" />
+            <label class="toggle-inline" title="勾选后锁定画布防止误涂抹，可上下滑动页面">
+              <input type="checkbox" id="scrollLockToggle" />
+              <span>锁屏</span>
+            </label>
+          </div>
+        </div>
+        <div class="canvas-stage" id="canvasStage">
+          <canvas id="bgCanvas"></canvas>
+          <canvas id="maskOverlayCanvas"></canvas>
+        </div>
+      </div>
+
+      <div class="confirm-btns">
+        <button class="btn-secondary" id="inpaintModalCancelBtn" type="button">取消</button>
+        <button class="btn-primary" id="inpaintModalSaveBtn" type="button">保存遮罩</button>
+      </div>
+    </div>
+  </div>
+
   <!-- AI Assistant Modal -->
   <div class="modal hidden" id="aiAssistantModal">
     <div class="modal-backdrop" id="aiModalBackdrop"></div>
@@ -1195,6 +1247,7 @@
         </div>
       </div>
 
+      <div class="ai-vision-hint hidden" id="aiVisionHint"></div>
       <div class="quick-tags" id="aiQuickPrompts"></div>
 
       <div class="ai-chat-list" id="aiChatList"></div>
