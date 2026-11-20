@@ -335,6 +335,9 @@ def write_gguf_workflows(
     return written
 
 
+_UNSET: Any = object()
+
+
 class ComfyUILauncher:
     """Manages on-demand ComfyUI installation, ComfyUI-GGUF plugin, GGUF model staging, LoRA symlinking, and tunnel."""
 
@@ -383,7 +386,7 @@ class ComfyUILauncher:
         status: Optional[str] = None,
         progress: Optional[float] = None,
         message: Optional[str] = None,
-        public_url: Optional[str] = None,
+        public_url: Any = _UNSET,
         error: Optional[str] = None,
     ) -> None:
         with self._lock:
@@ -393,7 +396,7 @@ class ComfyUILauncher:
                 self._progress = progress
             if message is not None:
                 self._message = message
-            if public_url is not None:
+            if public_url is not _UNSET:
                 self._public_url = public_url
             self._error = error
 
@@ -514,12 +517,20 @@ class ComfyUILauncher:
             return CLOUDFLARED_BIN
         if os.name == "nt":
             return None
+        part_path = CLOUDFLARED_BIN.with_suffix(".comfy.part")
         try:
             url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
-            urllib.request.urlretrieve(url, str(CLOUDFLARED_BIN))
-            CLOUDFLARED_BIN.chmod(CLOUDFLARED_BIN.stat().st_mode | 0o111)
-            return CLOUDFLARED_BIN
+            req = urllib.request.Request(url, headers={"User-Agent": "Qwen-Image-2.1-EasyColab/1.0"})
+            with urllib.request.urlopen(req, timeout=30) as resp, open(part_path, "wb") as f:
+                shutil.copyfileobj(resp, f, length=262_144)
+            if part_path.exists() and part_path.stat().st_size > 1_000_000:
+                part_path.replace(CLOUDFLARED_BIN)
+                CLOUDFLARED_BIN.chmod(CLOUDFLARED_BIN.stat().st_mode | 0o111)
+                return CLOUDFLARED_BIN
+            part_path.unlink(missing_ok=True)
+            return None
         except Exception as exc:
+            part_path.unlink(missing_ok=True)
             logger.warning("Failed to download cloudflared for ComfyUI: %s", exc)
             return None
 
@@ -652,13 +663,17 @@ class ComfyUILauncher:
                     done_evt = threading.Event()
 
                     def _read_tunnel() -> None:
-                        assert self._tunnel_proc is not None and self._tunnel_proc.stdout is not None
-                        for line in self._tunnel_proc.stdout:
-                            m = pat.search(line)
-                            if m:
-                                found.append(m.group(0))
-                                done_evt.set()
-                                break
+                        proc_ref = self._tunnel_proc
+                        if proc_ref is None or proc_ref.stdout is None:
+                            done_evt.set()
+                            return
+                        # Keep draining stdout for the entire lifetime of cloudflared to avoid pipe buffer deadlock
+                        for line in proc_ref.stdout:
+                            if not found:
+                                m = pat.search(line)
+                                if m:
+                                    found.append(m.group(0))
+                                    done_evt.set()
                         done_evt.set()
 
                     threading.Thread(target=_read_tunnel, daemon=True).start()
@@ -679,6 +694,7 @@ class ComfyUILauncher:
                     status="error",
                     progress=0.0,
                     message=f"ComfyUI 启动失败: {exc}",
+                    public_url=None,
                     error=str(exc),
                 )
 
@@ -686,7 +702,15 @@ class ComfyUILauncher:
         return self.get_status()
 
     def stop(self) -> dict[str, Any]:
-        for proc in (self._tunnel_proc, self._proc):
+        with self._lock:
+            tunnel_proc = self._tunnel_proc
+            main_proc = self._proc
+            log_file = self._log_file
+            self._proc = None
+            self._tunnel_proc = None
+            self._log_file = None
+
+        for proc in (tunnel_proc, main_proc):
             if proc is not None and proc.poll() is None:
                 try:
                     proc.terminate()
@@ -696,14 +720,11 @@ class ComfyUILauncher:
                         proc.kill()
                     except Exception:
                         pass
-        self._proc = None
-        self._tunnel_proc = None
-        if self._log_file is not None:
+        if log_file is not None:
             try:
-                self._log_file.close()
+                log_file.close()
             except Exception:
                 pass
-            self._log_file = None
-        self._set_state(status="idle", progress=0.0, message="ComfyUI 已停止", public_url=None)
+        self._set_state(status="idle", progress=0.0, message="ComfyUI 已停止", public_url=None, error=None)
         return self.get_status()
 

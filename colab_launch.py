@@ -1,13 +1,13 @@
 """
-Optimized Launcher for Qwen-Image-2.1 INT8 Mobile Web Studio.
+Optimized Launcher for Qwen-Image-2.1 Studio (Google Colab & Local).
 Reference: https://github.com/wy51ai/easycolab (AI-generated codebase).
 
 Features:
-- Stale port / process cleanup before startup (safe Colab cell re-runs)
-- Atomic, retried `cloudflared` binary download with progress bar
-- Continuous non-blocking tunnel stdout drain (prevents pipe buffer deadlock)
-- Native Colab tqdm progress bars + QR code rendering
-- Supports both Colab tunnel mode and `--local` / `--demo` local mode
+- Deep stale-process & port-holder cleanup before startup (safe Colab cell re-runs)
+- Timeout-protected, atomic, retried `cloudflared` binary download with progress bar
+- Continuous non-blocking tunnel stdout drain + automatic tunnel retry
+- Native Colab tqdm progress bars + clean QR code card
+- Supports Colab tunnel mode and `--local` / `--demo` / `--ai-auto-run` flags
 """
 
 from __future__ import annotations
@@ -41,32 +41,68 @@ def _make_pbar(total: int, desc: str, unit: str = "it", unit_scale: bool = False
 
 
 def cleanup_stale_processes(port: int) -> None:
-    """Terminate leftover `server.py` or `cloudflared` instances occupying `port` from prior runs."""
+    """Terminate leftover `server.py`, port-holding processes, or `cloudflared` instances on `port`."""
     try:
         import psutil
     except ImportError:
         return
 
     my_pid = os.getpid()
-    killed: list[int] = []
+    to_kill: dict[int, psutil.Process] = {}
+
+    # 1) Match processes currently listening on target port
+    try:
+        for conn in psutil.net_connections(kind="inet"):
+            if conn.laddr and conn.laddr.port == port and conn.pid and conn.pid != my_pid:
+                try:
+                    to_kill[conn.pid] = psutil.Process(conn.pid)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # 2) Match stale server.py or cloudflared processes by cmdline / cwd
     for proc in psutil.process_iter(["pid", "name", "cmdline"]):
         try:
             pid = proc.info["pid"]
-            if pid == my_pid:
+            if pid == my_pid or pid in to_kill:
                 continue
             cmdline = " ".join(proc.info.get("cmdline") or [])
             name = (proc.info.get("name") or "").lower()
-            is_stale_server = "server.py" in cmdline and str(BASE_DIR.name) in cmdline
+            is_stale_server = "server.py" in cmdline and (
+                str(BASE_DIR.name) in cmdline or str(BASE_DIR) in cmdline
+            )
+            if not is_stale_server and "server.py" in cmdline:
+                try:
+                    if Path(proc.cwd()).resolve() == BASE_DIR:
+                        is_stale_server = True
+                except Exception:
+                    pass
             is_stale_tunnel = "cloudflared" in name and f"127.0.0.1:{port}" in cmdline
             if is_stale_server or is_stale_tunnel:
-                proc.terminate()
-                killed.append(pid)
+                to_kill[pid] = proc
         except Exception:
             continue
 
-    if killed:
-        print(f"[清理] 已停止残留进程 (PID: {', '.join(map(str, killed))})...", flush=True)
-        time.sleep(0.8)
+    if not to_kill:
+        return
+
+    killed_pids: list[int] = []
+    for pid, proc in to_kill.items():
+        try:
+            proc.terminate()
+            killed_pids.append(pid)
+        except Exception:
+            continue
+
+    if killed_pids:
+        print(f"[清理] 已停止残留进程 (PID: {', '.join(map(str, killed_pids))})...", flush=True)
+        _, alive = psutil.wait_procs(list(to_kill.values()), timeout=2.5)
+        for proc in alive:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
 
 def _cloudflared_download_url() -> str:
@@ -76,7 +112,7 @@ def _cloudflared_download_url() -> str:
     return "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
 
 
-def ensure_cloudflared(retries: int = 3) -> Path:
+def ensure_cloudflared(retries: int = 3, timeout_sec: int = 30) -> Path:
     if CLOUDFLARED_BIN.exists() and CLOUDFLARED_BIN.stat().st_size > 5_000_000:
         pbar = _make_pbar(1, "cloudflared 已就绪")
         if pbar:
@@ -91,18 +127,22 @@ def ensure_cloudflared(retries: int = 3) -> Path:
     for attempt in range(1, retries + 1):
         pbar = None
         try:
-            def _reporthook(block_num: int, block_size: int, total_size: int) -> None:
-                nonlocal pbar
-                if pbar is None:
-                    desc = "下载 cloudflared" if attempt == 1 else f"重试下载 cloudflared ({attempt}/{retries})"
-                    pbar = _make_pbar(max(total_size, 1), desc, unit="B", unit_scale=True)
-                if pbar is not None:
-                    downloaded = min(block_num * block_size, total_size) if total_size > 0 else block_num * block_size
-                    delta = max(0, downloaded - pbar.n)
-                    if delta:
-                        pbar.update(delta)
+            req = urllib.request.Request(url, headers={"User-Agent": "Qwen-Image-2.1-Studio/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                total_size = int(resp.headers.get("Content-Length") or 0)
+                desc = "下载 cloudflared" if attempt == 1 else f"重试下载 cloudflared ({attempt}/{retries})"
+                pbar = _make_pbar(max(total_size, 1), desc, unit="B", unit_scale=True)
+                with open(part_path, "wb") as f:
+                    while True:
+                        chunk = resp.read(262_144)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        if pbar is not None:
+                            if total_size > 0 and pbar.n + len(chunk) > pbar.total:
+                                pbar.total = pbar.n + len(chunk)
+                            pbar.update(len(chunk))
 
-            urllib.request.urlretrieve(url, str(part_path), reporthook=_reporthook)
             if part_path.exists() and part_path.stat().st_size > 5_000_000:
                 part_path.replace(CLOUDFLARED_BIN)
                 CLOUDFLARED_BIN.chmod(CLOUDFLARED_BIN.stat().st_mode | 0o111)
@@ -215,7 +255,7 @@ def wait_server_ready(server_proc: subprocess.Popen[bytes], port: int, timeout_s
     return ready
 
 
-def wait_tunnel_url(tunnel_proc: subprocess.Popen[str], timeout_sec: int = 45) -> Optional[str]:
+def wait_tunnel_url(tunnel_proc: subprocess.Popen[str], timeout_sec: int = 35) -> Optional[str]:
     url_pattern = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
     found: list[str] = []
     recent_lines: deque[str] = deque(maxlen=25)
@@ -255,9 +295,54 @@ def wait_tunnel_url(tunnel_proc: subprocess.Popen[str], timeout_sec: int = 45) -
     return found[0] if found else None
 
 
+def start_tunnel_with_retry(
+    cf_bin: Path,
+    port: int,
+    retries: int = 2,
+    timeout_sec: int = 35,
+) -> tuple[Optional[subprocess.Popen[str]], Optional[str]]:
+    """Start `cloudflared` quick tunnel with automatic retry if trycloudflare stalls."""
+    for attempt in range(1, retries + 1):
+        if attempt > 1:
+            print(f"[隧道] 第 {attempt}/{retries} 次重试建立 Cloudflare 公网隧道...", flush=True)
+        proc = subprocess.Popen(
+            [str(cf_bin), "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{port}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        url = wait_tunnel_url(proc, timeout_sec=timeout_sec)
+        if url:
+            return proc, url
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        time.sleep(1.2)
+    return None, None
+
+
+def _print_startup_summary(port: int, use_tunnel: bool) -> None:
+    model_id = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen-Image-2.1-Turbo")
+    quant_mode = os.environ.get("QWEN_QUANT_MODE", "int8-torchao")
+    offload = os.environ.get("QWEN_OFFLOAD", "auto")
+    gpu_prof = os.environ.get("QWEN_GPU_PROFILE", "auto")
+    demo = os.environ.get("DEMO_MODE", "0").strip().lower() in {"1", "true", "yes"}
+    ai_auto = os.environ.get("QWEN_AI_AUTO_RUN", "0").strip().lower() in {"1", "true", "yes"}
+    print("\n--- Qwen-Image-2.1 Studio 启动配置 ---", flush=True)
+    print(f"  模型仓库   : {model_id}", flush=True)
+    print(f"  量化策略   : {quant_mode} | 显存调度: {offload} | GPU预设: {gpu_prof}", flush=True)
+    print(f"  AI自动运行 : {'开启 (含安全护栏)' if ai_auto else '关闭 (可在界面按需开启)'}", flush=True)
+    print(f"  运行模式   : {'DEMO 演示' if demo else 'GPU 推理'} | 端口: {port} | 公网隧道: {'开启' if use_tunnel else '关闭'}", flush=True)
+    print("--------------------------------------\n", flush=True)
+
+
 def display_qr_and_url(public_url: str, is_local: bool = False) -> None:
     print("\n==========================================", flush=True)
-    print("Qwen-Image-2.1 INT8 WebUI (代码由 AI 生成 · 参考 wy51ai/easycolab)", flush=True)
+    print("Qwen-Image-2.1 Studio 已就绪 (参考 wy51ai/easycolab)", flush=True)
     print(f"访问地址: {public_url}", flush=True)
     print("==========================================\n", flush=True)
     if is_local:
@@ -270,16 +355,19 @@ def display_qr_and_url(public_url: str, is_local: bool = False) -> None:
         qr = qrcode.QRCode(box_size=6, border=2)
         qr.add_data(public_url)
         qr.make(fit=True)
-        img = qr.make_image(fill_color="black", back_color="white")
+        img = qr.make_image(fill_color="#18181b", back_color="white")
         buf = io.BytesIO()
         img.save(buf, format="PNG")
 
         display(
             HTML(
-                f'<div style="padding:14px;background:#121826;color:#eef2ff;border-radius:12px;font-family:sans-serif">'
-                f'<h3 style="margin:0 0 8px">Qwen-Image-2.1 INT8 手机端已就绪</h3>'
-                f'<p style="margin:0 0 10px">点击或手机扫码打开：<a href="{public_url}" target="_blank" style="color:#22d3ee;font-weight:bold">{public_url}</a></p>'
-                f'<p style="margin:0;font-size:12px;color:#94a3b8">说明：代码由 AI 生成，参考 wy51ai/easycolab。在手机网页右上角点击「关闭」可自动释放服务。</p>'
+                f'<div style="padding:16px 18px;background:#ffffff;color:#18181b;border:1px solid #e4e4e7;'
+                f'border-radius:14px;font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:560px;'
+                f'box-shadow:0 2px 10px rgba(15,23,42,0.06)">'
+                f'<div style="font-size:15px;font-weight:700;margin-bottom:6px">Qwen-Image-2.1 Studio 已就绪</div>'
+                f'<div style="margin-bottom:10px;font-size:13px;color:#52525b">点击或手机扫码打开：'
+                f'<a href="{public_url}" target="_blank" style="color:#2563eb;font-weight:600;text-decoration:none">{public_url}</a></div>'
+                f'<div style="font-size:12px;color:#71717a">提示：网页右上角点击「关闭」可安全卸载模型并释放 Colab 资源。</div>'
                 f"</div>"
             )
         )
@@ -293,6 +381,7 @@ def launch_in_colab(
     local_only: bool = False,
     demo_mode: Optional[bool] = None,
     no_preload: bool = False,
+    ai_auto_run: Optional[bool] = None,
 ) -> None:
     env = os.environ.copy()
     env["PORT"] = str(port)
@@ -302,24 +391,21 @@ def launch_in_colab(
     if no_preload:
         env["QWEN_PRELOAD_MODEL"] = "0"
         os.environ["QWEN_PRELOAD_MODEL"] = "0"
+    if ai_auto_run is not None:
+        val = "1" if ai_auto_run else "0"
+        env["QWEN_AI_AUTO_RUN"] = val
+        os.environ["QWEN_AI_AUTO_RUN"] = val
 
     use_tunnel = not local_only and os.name != "nt" and os.environ.get("NO_TUNNEL", "0") != "1"
 
+    _print_startup_summary(port=port, use_tunnel=use_tunnel)
     cleanup_stale_processes(port)
     setup_swap_with_progress()
     preload_model_with_progress()
 
-    tunnel_proc: Optional[subprocess.Popen[str]] = None
+    cf_bin: Optional[Path] = None
     if use_tunnel:
         cf_bin = ensure_cloudflared()
-        tunnel_proc = subprocess.Popen(
-            [str(cf_bin), "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{port}"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        env["CLOUDFLARED_PID"] = str(tunnel_proc.pid)
 
     log_file = open(SERVER_LOG_PATH, "wb")
     server_proc = subprocess.Popen(
@@ -330,17 +416,20 @@ def launch_in_colab(
         stderr=subprocess.STDOUT,
     )
 
+    tunnel_proc: Optional[subprocess.Popen[str]] = None
     try:
         if not wait_server_ready(server_proc, port=port, timeout_sec=45):
             print("FastAPI 服务未能正常启动，请检查上方日志。", flush=True)
             return
 
-        if tunnel_proc is not None:
-            public_url = wait_tunnel_url(tunnel_proc, timeout_sec=45)
+        if use_tunnel and cf_bin is not None:
+            tunnel_proc, public_url = start_tunnel_with_retry(cf_bin, port=port, retries=2, timeout_sec=35)
             if public_url:
+                if tunnel_proc is not None:
+                    os.environ["CLOUDFLARED_PID"] = str(tunnel_proc.pid)
                 display_qr_and_url(public_url, is_local=False)
             else:
-                print(f"未能在 45 秒内获取 Cloudflare 公网地址，本地服务运行于 http://127.0.0.1:{port}", flush=True)
+                print(f"未能获取 Cloudflare 公网地址，本地服务运行于 http://127.0.0.1:{port}", flush=True)
         else:
             display_qr_and_url(f"http://127.0.0.1:{port}", is_local=True)
 
@@ -360,11 +449,12 @@ def launch_in_colab(
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Launch Qwen-Image-2.1 INT8 Mobile WebUI")
+    parser = argparse.ArgumentParser(description="Launch Qwen-Image-2.1 Studio WebUI")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Web server port (default: 7860)")
     parser.add_argument("--local", action="store_true", help="Run locally without Cloudflare tunnel")
     parser.add_argument("--demo", action="store_true", help="Enable DEMO_MODE=1 without GPU")
     parser.add_argument("--no-preload", action="store_true", help="Skip Hugging Face model pre-download")
+    parser.add_argument("--ai-auto-run", action="store_true", help="Enable opt-in AI autonomous terminal execution")
     return parser.parse_args()
 
 
@@ -375,4 +465,5 @@ if __name__ == "__main__":
         local_only=args.local,
         demo_mode=True if args.demo else None,
         no_preload=args.no_preload,
+        ai_auto_run=True if args.ai_auto_run else None,
     )

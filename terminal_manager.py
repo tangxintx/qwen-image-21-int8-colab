@@ -22,6 +22,30 @@ from typing import Any, Optional
 
 ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
+DANGEROUS_CMD_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"(^|[;&|\s])rm\s+-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\s+(/($|\s)|/\*|\~|\$HOME)(\s|$)", re.IGNORECASE), "禁止自动递归强制删除根目录或家目录"),
+    (re.compile(r"(^|[;&|\s])rm\s+-[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*\s+(/($|\s)|/\*|\~|\$HOME)(\s|$)", re.IGNORECASE), "禁止自动递归强制删除根目录或家目录"),
+    (re.compile(r"(^|[;&|\s])(mkfs(\.\w+)?|fdisk|parted|wipefs)\b", re.IGNORECASE), "禁止自动执行磁盘格式化/分区命令"),
+    (re.compile(r"(^|[;&|\s])dd\s+.*\bof=/dev/(sd|nvme|vd|hd|loop|mmc)", re.IGNORECASE), "禁止自动向块设备写入数据"),
+    (re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"), "检测到 Fork Bomb 恶意命令"),
+    (re.compile(r"(^|[;&|\s])(shutdown|reboot|poweroff|halt|init\s+[06])\b", re.IGNORECASE), "禁止自动关机或重启系统"),
+    (re.compile(r"(^|[;&|\s])chmod\s+-R\s+777\s+/($|\s)", re.IGNORECASE), "禁止自动递归修改根目录权限"),
+    (re.compile(r">\s*/dev/(sd|nvme|vd|hd)", re.IGNORECASE), "禁止重定向覆盖磁盘设备"),
+    (re.compile(r"(^|[;&|\s])(del|erase|rmdir|rd)\s+/[sqf]+\s+[a-zA-Z]:\\", re.IGNORECASE), "禁止自动批量强制删除系统盘目录"),
+    (re.compile(r"\bcurl\b.*\|\s*(sh|bash)\b|\bwget\b.*\|\s*(sh|bash)\b", re.IGNORECASE), "从网络直接管道执行未知脚本需手动确认"),
+]
+
+
+def is_dangerous_command(command: str) -> tuple[bool, Optional[str]]:
+    """Return `(True, reason)` if `command` matches high-risk destructive patterns."""
+    cmd = (command or "").strip()
+    if not cmd:
+        return False, None
+    for pat, reason in DANGEROUS_CMD_PATTERNS:
+        if pat.search(cmd):
+            return True, reason
+    return False, None
+
 
 def strip_ansi(text: str) -> str:
     return ANSI_ESCAPE_RE.sub("", text)
@@ -143,11 +167,20 @@ class TerminalManager:
 
         env = os.environ.copy()
         env.setdefault("PYTHONIOENCODING", "utf-8")
+        env.setdefault("PYTHONUTF8", "1")
         env.setdefault("TERM", "dumb")
 
+        def _decode_chunk(raw: bytes, utf8_dec: Any, gbk_dec: Any) -> str:
+            if os.name != "nt":
+                return utf8_dec.decode(raw, final=False)
+            try:
+                return raw.decode("utf-8")
+            except UnicodeDecodeError:
+                return gbk_dec.decode(raw, final=False)
+
         def _worker() -> None:
-            encoding = "gbk" if os.name == "nt" else "utf-8"
-            decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+            utf8_dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            gbk_dec = codecs.getincrementaldecoder("gbk")(errors="replace")
             try:
                 popen_kwargs: dict[str, Any] = {
                     "shell": True,
@@ -165,11 +198,11 @@ class TerminalManager:
                 while True:
                     chunk = proc.stdout.read(1024)
                     if not chunk:
-                        tail = decoder.decode(b"", final=True)
+                        tail = utf8_dec.decode(b"", final=True) + (gbk_dec.decode(b"", final=True) if os.name == "nt" else "")
                         if tail:
                             self._append_task_output(task, strip_ansi(tail))
                         break
-                    text = strip_ansi(decoder.decode(chunk, final=False))
+                    text = strip_ansi(_decode_chunk(chunk, utf8_dec, gbk_dec))
                     self._append_task_output(task, text)
                 proc.wait()
                 task.exit_code = proc.returncode

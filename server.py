@@ -58,10 +58,20 @@ from lora_manager import (
     normalize_lora_state_dict,
 )
 from swap_manager import enable_linux_swap, get_swap_status
-from terminal_manager import LogRingBuffer, TerminalManager
+from terminal_manager import LogRingBuffer, TerminalManager, is_dangerous_command
 
 SERVER_START_TIME = time.time()
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+
+def mask_secret(value: str) -> str:
+    """Return a masked preview of an API key/token without leaking the secret."""
+    clean = (value or "").strip()
+    if not clean:
+        return ""
+    if len(clean) <= 8:
+        return "*" * len(clean)
+    return f"{clean[:4]}***{clean[-4:]}"
 
 
 def trim_host_memory() -> None:
@@ -178,6 +188,7 @@ PORT = int(os.environ.get("PORT", "7860"))
 DEFAULT_AI_ENDPOINT = os.environ.get("QWEN_AI_ENDPOINT", "https://api.pie-xian.com/v1/chat/completions")
 DEFAULT_AI_API_KEY = os.environ.get("QWEN_AI_API_KEY", "")
 DEFAULT_AI_MODEL = os.environ.get("QWEN_AI_MODEL", "qwen3.8-27b")
+DEFAULT_AI_AUTO_RUN = os.environ.get("QWEN_AI_AUTO_RUN", "0").strip().lower() in {"1", "true", "yes"}
 AI_CONFIG_PATH = BASE_DIR / ".ai_config.json"
 
 MODEL_PRESETS = {
@@ -543,6 +554,8 @@ class GalleryItem:
     size_bytes: int = 0
     hires_scale: float = 1.0
     ref_count: int = 0
+    source_filename: Optional[str] = None
+    source_url: Optional[str] = None
 
 
 class GalleryManager:
@@ -581,13 +594,38 @@ class GalleryManager:
         )
         tmp_path.replace(self.index_path)
 
-    def add_image(self, image: Image.Image, meta: dict[str, Any]) -> dict[str, Any]:
+    def add_image(
+        self,
+        image: Image.Image,
+        meta: dict[str, Any],
+        source_image: Optional[Image.Image] = None,
+    ) -> dict[str, Any]:
         item_id = meta.get("id") or uuid.uuid4().hex[:12]
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"qwen_{meta['mode']}_{timestamp}_{item_id}.png"
         file_path = self.output_dir / filename
         image.save(file_path, format="PNG", optimize=True)
         size_bytes = file_path.stat().st_size
+
+        source_filename: Optional[str] = None
+        source_url: Optional[str] = None
+        if source_image is not None:
+            try:
+                src_dir = self.output_dir / ".sources"
+                src_dir.mkdir(parents=True, exist_ok=True)
+                src_rgb = source_image.convert("RGB")
+                max_edge = 1280
+                if max(src_rgb.size) > max_edge:
+                    sc = max_edge / max(src_rgb.size)
+                    src_rgb = src_rgb.resize(
+                        (max(64, int(round(src_rgb.width * sc))), max(64, int(round(src_rgb.height * sc)))),
+                        Image.Resampling.LANCZOS,
+                    )
+                source_filename = f"src_{timestamp}_{item_id}.jpg"
+                src_rgb.save(src_dir / source_filename, format="JPEG", quality=88, optimize=True)
+                source_url = f"/outputs/.sources/{source_filename}"
+            except Exception as exc:
+                logger.warning("Failed to save comparison source preview: %s", exc)
 
         item = GalleryItem(
             id=item_id,
@@ -609,6 +647,8 @@ class GalleryManager:
             size_bytes=size_bytes,
             hires_scale=meta.get("hires_scale", 1.0),
             ref_count=meta.get("ref_count", 0),
+            source_filename=source_filename,
+            source_url=source_url,
         )
         record = asdict(item)
         with self._lock:
@@ -663,6 +703,14 @@ class GalleryManager:
                             file_path.unlink()
                         except OSError:
                             pass
+                    src_name = item.get("source_filename")
+                    if src_name:
+                        src_path = self.output_dir / ".sources" / src_name
+                        if src_path.exists():
+                            try:
+                                src_path.unlink()
+                            except OSError:
+                                pass
                     removed += 1
                 else:
                     remaining.append(item)
@@ -706,7 +754,7 @@ class JobState:
             "progress": round(self.progress, 4),
             "message": self.message,
             "notice": self.notice,
-            "results": self.results,
+            "results": list(self.results),
             "error": self.error,
             "elapsed_sec": round((self.finished_at or time.time()) - self.created_at, 2),
         }
@@ -728,6 +776,7 @@ class QwenImage21Engine:
         self.ai_api_key: str = DEFAULT_AI_API_KEY
         self.ai_model: str = DEFAULT_AI_MODEL
         self.ai_vision_enabled: bool = False
+        self.ai_auto_run: bool = DEFAULT_AI_AUTO_RUN
         self._user_modified_model: bool = False
         self._load_ai_config()
         self.demo_mode: bool = DEMO_MODE
@@ -747,14 +796,16 @@ class QwenImage21Engine:
             try:
                 data = json.loads(AI_CONFIG_PATH.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
-                    if data.get("ai_endpoint"):
+                    if data.get("ai_endpoint") and not os.environ.get("QWEN_AI_ENDPOINT", "").strip():
                         self.ai_endpoint = str(data["ai_endpoint"]).strip()
-                    if data.get("ai_api_key"):
+                    if data.get("ai_api_key") and not os.environ.get("QWEN_AI_API_KEY", "").strip():
                         self.ai_api_key = str(data["ai_api_key"]).strip()
-                    if data.get("ai_model"):
+                    if data.get("ai_model") and not os.environ.get("QWEN_AI_MODEL", "").strip():
                         self.ai_model = str(data["ai_model"]).strip()
                     if "ai_vision_enabled" in data:
                         self.ai_vision_enabled = bool(data["ai_vision_enabled"])
+                    if "ai_auto_run" in data and "QWEN_AI_AUTO_RUN" not in os.environ:
+                        self.ai_auto_run = bool(data["ai_auto_run"])
                     if "inpaint_fast_crop" in data:
                         self.inpaint_fast_crop = bool(data["inpaint_fast_crop"])
             except Exception as exc:
@@ -769,6 +820,7 @@ class QwenImage21Engine:
                         "ai_api_key": self.ai_api_key,
                         "ai_model": self.ai_model,
                         "ai_vision_enabled": self.ai_vision_enabled,
+                        "ai_auto_run": self.ai_auto_run,
                         "inpaint_fast_crop": self.inpaint_fast_crop,
                     },
                     ensure_ascii=False,
@@ -1387,20 +1439,26 @@ class QwenImage21Engine:
         offload_mode: Optional[str] = None,
         vae_tiling_mode: Optional[str] = None,
         hf_token: Optional[str] = None,
+        clear_hf_token: bool = False,
         cpu_offload: Optional[bool] = None,
         vae_tiling: Optional[bool] = None,
         inpaint_fast_crop: Optional[bool] = None,
         ai_endpoint: Optional[str] = None,
         ai_api_key: Optional[str] = None,
+        clear_ai_api_key: bool = False,
         ai_model: Optional[str] = None,
         ai_vision_enabled: Optional[bool] = None,
+        ai_auto_run: Optional[bool] = None,
     ) -> None:
         needs_reload = False
         prefs_changed = False
         if ai_endpoint is not None and ai_endpoint.strip():
             self.ai_endpoint = ai_endpoint.strip()
             prefs_changed = True
-        if ai_api_key is not None and ai_api_key.strip():
+        if clear_ai_api_key:
+            self.ai_api_key = ""
+            prefs_changed = True
+        elif ai_api_key is not None and ai_api_key.strip():
             self.ai_api_key = ai_api_key.strip()
             prefs_changed = True
         if ai_model is not None and ai_model.strip():
@@ -1409,18 +1467,25 @@ class QwenImage21Engine:
         if ai_vision_enabled is not None:
             self.ai_vision_enabled = bool(ai_vision_enabled)
             prefs_changed = True
+        if ai_auto_run is not None:
+            self.ai_auto_run = bool(ai_auto_run)
+            prefs_changed = True
         if inpaint_fast_crop is not None:
             self.inpaint_fast_crop = bool(inpaint_fast_crop)
             prefs_changed = True
         if prefs_changed:
             self._save_ai_config()
 
-        if hf_token is not None and hf_token.strip():
+        if clear_hf_token:
+            self.hf_token = ""
+            os.environ.pop("HF_TOKEN", None)
+            os.environ.pop("HUGGING_FACE_HUB_TOKEN", None)
+        elif hf_token is not None and hf_token.strip():
             self.hf_token = hf_token.strip()
             os.environ["HF_TOKEN"] = self.hf_token
         if model_id:
-            self._user_modified_model = True
             if model_id != self.model_id:
+                self._user_modified_model = True
                 self.model_id = model_id
                 needs_reload = True
         if quant_mode and quant_mode != self.quant_mode:
@@ -1800,11 +1865,13 @@ class QwenImage21Engine:
             result_img: Image.Image = out.images[0].convert("RGB")
 
             # Guarantee exact size & RGB mode match before blend/composite (prevents PIL "images do not match")
+            # Note: when `fast_crop_box` is active, defer denoise blending & feathered compositing
+            # to `stitch_inpaint_crop_patch()` below to avoid double-blending and double-blurring.
             if ref_image is not None:
                 ref_rgb = ref_image.convert("RGB")
                 if result_img.size != ref_rgb.size:
                     result_img = result_img.resize(ref_rgb.size, Image.Resampling.LANCZOS)
-                if mode == "inpaint" and prepared_mask is not None:
+                if mode == "inpaint" and prepared_mask is not None and fast_crop_box is None:
                     if prepared_mask.size != ref_rgb.size:
                         prepared_mask = prepared_mask.resize(ref_rgb.size, Image.Resampling.BILINEAR)
                     feather = prepared_mask.convert("L")
@@ -1890,13 +1957,16 @@ class ConfigUpdateRequest(BaseModel):
     offload_mode: Optional[str] = None
     vae_tiling_mode: Optional[str] = None
     hf_token: Optional[str] = None
+    clear_hf_token: bool = False
     cpu_offload: Optional[bool] = None
     vae_tiling: Optional[bool] = None
     inpaint_fast_crop: Optional[bool] = None
     ai_endpoint: Optional[str] = None
     ai_api_key: Optional[str] = None
+    clear_ai_api_key: bool = False
     ai_model: Optional[str] = None
     ai_vision_enabled: Optional[bool] = None
+    ai_auto_run: Optional[bool] = None
 
 
 class AIChatRequest(BaseModel):
@@ -1909,6 +1979,8 @@ class AIChatRequest(BaseModel):
 
 class TerminalRunRequest(BaseModel):
     command: str = Field(..., min_length=1, max_length=4000)
+    source: Literal["user", "ai"] = "user"
+    allow_dangerous: bool = False
 
 
 class BatchDeleteRequest(BaseModel):
@@ -2066,10 +2138,11 @@ def collect_system_stats() -> dict[str, Any]:
         "models": collect_models_inventory(),
         "ai": {
             "endpoint": engine.ai_endpoint,
-            "api_key": engine.ai_api_key,
+            "api_key_masked": mask_secret(engine.ai_api_key),
             "model": engine.ai_model,
             "has_api_key": bool(engine.ai_api_key),
             "vision_enabled": engine.ai_vision_enabled,
+            "auto_run": engine.ai_auto_run,
         },
         "engine": {
             "model_id": engine.model_id,
@@ -2175,6 +2248,7 @@ def _run_generation_job(job_id: str, req: GenerateRequest) -> None:
                     "hires_scale": req.hires_scale if req.mode == "hires" else 1.0,
                     "ref_count": (1 + len(extra_refs)) if (req.mode in {"i2i", "inpaint"} and init_img is not None) else (1 if init_img is not None else 0),
                 },
+                source_image=init_img if req.mode in {"i2i", "hires", "inpaint"} else None,
             )
             job.results.append(record)
 
@@ -2229,13 +2303,16 @@ def api_update_config(req: ConfigUpdateRequest) -> dict[str, Any]:
         offload_mode=req.offload_mode,
         vae_tiling_mode=req.vae_tiling_mode,
         hf_token=req.hf_token,
+        clear_hf_token=req.clear_hf_token,
         cpu_offload=req.cpu_offload,
         vae_tiling=req.vae_tiling,
         inpaint_fast_crop=req.inpaint_fast_crop,
         ai_endpoint=req.ai_endpoint,
         ai_api_key=req.ai_api_key,
+        clear_ai_api_key=req.clear_ai_api_key,
         ai_model=req.ai_model,
         ai_vision_enabled=req.ai_vision_enabled,
+        ai_auto_run=req.ai_auto_run,
     )
     return {"ok": True, "stats": collect_system_stats()}
 
@@ -2247,11 +2324,23 @@ def api_terminal_cwd() -> dict[str, Any]:
 
 @app.post("/api/terminal/run")
 def api_terminal_run(req: TerminalRunRequest) -> dict[str, Any]:
+    if req.source == "ai" and not req.allow_dangerous:
+        dangerous, reason = is_dangerous_command(req.command)
+        if dangerous:
+            return {
+                "cmd_id": None,
+                "cwd": terminal.cwd,
+                "running": False,
+                "blocked": True,
+                "reason": reason or "高危命令已被安全护栏拦截，请手动确认后执行",
+            }
     task = terminal.run_command(req.command)
     return {
         "cmd_id": task.cmd_id,
         "cwd": terminal.cwd,
         "running": task.running,
+        "blocked": False,
+        "reason": None,
     }
 
 
@@ -2272,8 +2361,8 @@ def api_terminal_kill(cmd_id: str) -> dict[str, Any]:
 @app.get("/api/logs")
 def api_server_logs(limit: int = Query(default=150, ge=10, le=500)) -> dict[str, Any]:
     lines = log_buffer.get_lines(limit=limit)
-    log_file = Path("/tmp/qwen_server.log")
-    if os.name != "nt" and log_file.exists():
+    log_file = Path("/tmp/qwen_server.log") if os.name != "nt" else (BASE_DIR / "qwen_server.log")
+    if log_file.exists():
         try:
             raw_lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
             if raw_lines:
@@ -2318,12 +2407,18 @@ def _build_ai_system_prompt(scene: str, context: dict[str, Any]) -> str:
     eng = stats["engine"]
     gpu = stats["gpu"]
     loras = [f"{x['name']} ({x['size_mb']}MB, {'有效' if x.get('valid', True) else '损坏'})" for x in stats["models"]["downloaded_loras"]]
+    auto_run_note = (
+        "- AI 自动运行代码模式：已开启（你在 ```json``` 中给出的 `terminal_commands` 将被前端自动在终端顺序执行，并把标准输出与退出码回传给你继续判断；请只提供简短、非交互、安全的诊断或修复命令，任务完成时不要再附带 `terminal_commands` 避免死循环）\n"
+        if engine.ai_auto_run
+        else "- AI 自动运行代码模式：未开启（你给出的 `terminal_commands` 将展示为按钮，由用户手动点击运行）\n"
+    )
     base_info = (
         f"当前系统环境：\n"
         f"- GPU: {gpu.get('name')} (VRAM {gpu.get('vram_used_gb')}/{gpu.get('vram_total_gb')} GB, 档位 {gpu.get('profile_name')})\n"
         f"- 当前模型: {eng.get('model_id')} | 量化: {eng.get('quant_mode')} | 显存调度: {eng.get('effective_offload')} | 已加载: {eng.get('loaded')}\n"
         f"- 可用 LoRA 列表: {', '.join(loras) if loras else '无'}\n"
         f"- 终端当前目录: {terminal.cwd}\n"
+        f"{auto_run_note}"
         f"- 支持的仓库预设: Qwen/Qwen-Image-2.1-Turbo (推荐8步), Qwen/Qwen-Image-2.1 (推荐40步), addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit, abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8 (Q8满血, 推荐8步), abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4 (Q4轻量, 推荐8步)\n"
         f"- 支持的量化模式: fp8-int8, fp8-all, int8-torchao, int8-bnb, gguf-q8-full, gguf-q4, none\n"
         f"- 支持的显存调度: auto, smart_stage_offload, none, model_cpu_offload, sequential_cpu_offload\n"
