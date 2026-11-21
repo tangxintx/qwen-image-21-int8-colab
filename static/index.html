@@ -534,28 +534,7 @@
                   <div class="lora-warn hidden" id="loraWarnText"></div>
                 </div>
 
-                <details class="sub-details">
-                  <summary>直链下载 LoRA (Hugging Face / Civitai)</summary>
-                  <div class="details-stack">
-                    <div class="seed-row">
-                      <input type="text" id="loraPanelUrlInput" placeholder="粘贴模型页面或权重直链 https://..." autocomplete="off" />
-                      <button class="btn-chip primary" id="loraPanelDownloadBtn" type="button">
-                        <svg class="icon"><use href="#ic-download" /></svg>
-                        <span>下载</span>
-                      </button>
-                    </div>
-                    <input type="password" id="loraPanelTokenInput" placeholder="API Token（可选，私有 HF / Civitai 模型需要）" autocomplete="off" />
-                    <div class="progress-wrap compact hidden" id="loraPanelDlProgressWrap">
-                      <div class="progress-info">
-                        <span id="loraPanelDlMsg">准备下载...</span>
-                        <span id="loraPanelDlPct">0%</span>
-                      </div>
-                      <div class="progress-bar-bg">
-                        <div class="progress-bar-fill" id="loraPanelDlFill"></div>
-                      </div>
-                    </div>
-                  </div>
-                </details>
+                <div class="card-sub" id="loraDownloadTerminalHint">请到“终端”中下载LORA 模型。</div>
 
                 <div class="two-col-selects">
                   <div class="form-group">
@@ -890,6 +869,13 @@
               <button class="tag-chip" data-cmd="ls -lh outputs" type="button">作品目录</button>
             </div>
 
+            <div class="quick-tags hidden" id="termLogsToolbar">
+              <label class="toggle-inline" title="仅显示 ERROR / Traceback / 异常报错日志">
+                <input type="checkbox" id="termErrorsOnlyToggle" />
+                <span>仅显示报错内容</span>
+              </label>
+            </div>
+
             <pre class="terminal-screen" id="terminalScreen">Web 终端就绪
 </pre>
 
@@ -994,6 +980,26 @@
                 </div>
                 <input type="checkbox" id="inpaintFastCropToggle" />
               </label>
+
+              <div class="action-row" id="modelMaintenanceRow">
+                <button class="btn-ops" id="reloadModelBtn" type="button" title="重新加载现有模型">
+                  <svg class="icon"><use href="#ic-refresh" /></svg>
+                  <span>重新加载模型</span>
+                </button>
+                <button class="btn-ops warn" id="reinstallModelBtn" type="button" title="删除已安装的所有模型，并重新安装">
+                  <svg class="icon"><use href="#ic-trash" /></svg>
+                  <span>重装模型</span>
+                </button>
+              </div>
+              <div class="progress-wrap compact hidden" id="modelOpProgressWrap">
+                <div class="progress-info">
+                  <span id="modelOpProgressMsg">处理中...</span>
+                  <span id="modelOpProgressPct">0%</span>
+                </div>
+                <div class="progress-bar-bg">
+                  <div class="progress-bar-fill" id="modelOpProgressFill"></div>
+                </div>
+              </div>
 
               <details class="sub-details" id="engineAdvancedDetails">
                 <summary>高级引擎与量化参数微调</summary>

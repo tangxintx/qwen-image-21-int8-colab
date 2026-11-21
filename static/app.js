@@ -2351,6 +2351,7 @@
   // -------------------------------------------------------------------------
   const termState = {
     mode: "shell",
+    errorsOnly: false,
     activeCmdId: null,
     logsTimer: null,
     offset: 0,
@@ -2391,10 +2392,12 @@
   async function fetchServerLogs(forceBottom = false) {
     if (termState.mode !== "logs") return;
     try {
-      const data = await apiFetch("/api/logs?limit=200");
+      const url = `/api/logs?limit=200${termState.errorsOnly ? "&errors_only=true" : ""}`;
+      const data = await apiFetch(url);
       const scr = $("terminalScreen");
       const wasNearBottom = scr.scrollHeight - scr.scrollTop - scr.clientHeight < 64;
-      scr.textContent = (data.lines || []).join("\n") || "暂无日志输出...";
+      const emptyMsg = termState.errorsOnly ? "暂无报错日志记录" : "暂无日志输出...";
+      scr.textContent = (data.lines || []).join("\n") || emptyMsg;
       if (forceBottom || wasNearBottom) scr.scrollTop = scr.scrollHeight;
     } catch (_) {}
   }
@@ -2405,6 +2408,7 @@
     $("termModeLogsBtn").classList.toggle("active", mode === "logs");
     $("terminalInputBar").classList.toggle("hidden", mode !== "shell");
     $("termQuickCmds").classList.toggle("hidden", mode !== "shell");
+    $("termLogsToolbar").classList.toggle("hidden", mode !== "logs");
     clearInterval(termState.logsTimer);
 
     if (mode === "logs") {
@@ -2485,6 +2489,10 @@
 
   $("termModeShellBtn").addEventListener("click", () => setTerminalViewMode("shell"));
   $("termModeLogsBtn").addEventListener("click", () => setTerminalViewMode("logs"));
+  $("termErrorsOnlyToggle").addEventListener("change", (e) => {
+    termState.errorsOnly = e.target.checked;
+    fetchServerLogs(true);
+  });
   $("termClearBtn").addEventListener("click", () => {
     if (termState.mode === "shell") {
       termState.shellBuffer = "";
@@ -2650,6 +2658,61 @@
       saveEngineConfig(Number(card.dataset.steps || 8));
     });
   });
+
+  async function runModelMaintenanceOp(endpoint, defaultLabel, confirmText = "") {
+    if (confirmText && !window.confirm(confirmText)) return;
+    const reloadBtn = $("reloadModelBtn");
+    const reinstallBtn = $("reinstallModelBtn");
+    const wrap = $("modelOpProgressWrap");
+    const msgEl = $("modelOpProgressMsg");
+    const pctEl = $("modelOpProgressPct");
+    const fillEl = $("modelOpProgressFill");
+    reloadBtn.disabled = true;
+    reinstallBtn.disabled = true;
+    wrap.classList.remove("hidden");
+    msgEl.textContent = defaultLabel;
+    pctEl.textContent = "2%";
+    fillEl.style.width = "2%";
+
+    try {
+      const startRes = await apiFetch(endpoint, { method: "POST" }, true);
+      const taskId = startRes.task_id;
+      while (true) {
+        const op = await apiFetch(`/api/model/op/${taskId}`);
+        const pct = Math.max(2, Math.min(100, Math.round((Number(op.progress) || 0) * 100)));
+        msgEl.textContent = op.message || defaultLabel;
+        pctEl.textContent = `${pct}%`;
+        fillEl.style.width = `${pct}%`;
+        if (op.status === "completed") {
+          showToast(op.message || "模型操作完成", 4500);
+          await refreshStats();
+          break;
+        }
+        if (op.status === "error") {
+          throw new Error(op.error || op.message || "模型操作失败");
+        }
+        await new Promise((r) => setTimeout(r, 800));
+      }
+    } catch (err) {
+      msgEl.textContent = `操作失败: ${err.message}`;
+      showToast(`操作失败: ${err.message}`, 5500);
+    } finally {
+      reloadBtn.disabled = false;
+      reinstallBtn.disabled = false;
+      setTimeout(() => wrap.classList.add("hidden"), 1500);
+    }
+  }
+
+  $("reloadModelBtn").addEventListener("click", () =>
+    runModelMaintenanceOp("/api/model/reload", "正在重新加载现有模型...")
+  );
+  $("reinstallModelBtn").addEventListener("click", () =>
+    runModelMaintenanceOp(
+      "/api/model/reinstall",
+      "正在删除所有模型并重新安装...",
+      "确定要删除已安装的所有模型，并重新下载安装当前模型吗？"
+    )
+  );
 
   $("saveConfigBtn").addEventListener("click", () => saveEngineConfig());
   $("saveAiConfigBtn").addEventListener("click", saveAiConfigOnly);
@@ -2834,15 +2897,6 @@
     $("loraCtrlPreviewWrap").classList.add("hidden");
     $("loraCtrlClearBtn").classList.add("hidden");
   });
-  $("loraPanelDownloadBtn").addEventListener("click", () =>
-    startLoraDownload($("loraPanelUrlInput").value, $("loraPanelTokenInput").value, {
-      wrap: $("loraPanelDlProgressWrap"),
-      fill: $("loraPanelDlFill"),
-      msg: $("loraPanelDlMsg"),
-      pct: $("loraPanelDlPct"),
-      btn: $("loraPanelDownloadBtn"),
-    })
-  );
 
   function openLoraModal() { $("loraDownloadModal").classList.remove("hidden"); }
   function closeLoraModal() { $("loraDownloadModal").classList.add("hidden"); }

@@ -774,6 +774,82 @@ class JobState:
         }
 
 
+@dataclass
+class ModelOpState:
+    task_id: str
+    action: Literal["reload", "reinstall"]
+    status: Literal["queued", "loading_model", "running", "completed", "error"]
+    progress: float = 0.0
+    message: str = "准备中..."
+    error: Optional[str] = None
+    created_at: float = field(default_factory=time.time)
+    finished_at: Optional[float] = None
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "action": self.action,
+            "status": self.status,
+            "progress": round(self.progress, 4),
+            "message": self.message,
+            "error": self.error,
+            "elapsed_sec": round((self.finished_at or time.time()) - self.created_at, 2),
+        }
+
+
+def _pipe_has_gguf_params(pipe_obj: Any) -> bool:
+    """Return True if any module on `pipe_obj` holds Diffusers `GGUFParameter` weights."""
+    for comp_name in ("transformer", "unet", "text_encoder", "text_encoder_2", "vae"):
+        comp = getattr(pipe_obj, comp_name, None)
+        if comp is None or not hasattr(comp, "parameters"):
+            continue
+        try:
+            for p in comp.parameters():
+                if type(p).__name__ == "GGUFParameter" or hasattr(p, "quant_type"):
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def _enable_sequential_offload_safe(
+    pipe_obj: Any,
+    is_gguf: bool,
+    fallback_device: str,
+    seq_device: str,
+    reason: str,
+) -> str:
+    """
+    Enable sequential CPU offload safely; GGUFParameter tensors break under accelerate's
+    meta-device re-wrapping (`KeyError: None`), so GGUF pipelines fall back to
+    `enable_model_cpu_offload()` cleanly.
+    """
+    if is_gguf:
+        logger.warning(
+            "%s; GGUF weights are incompatible with accelerate sequential_cpu_offload "
+            "(triggers GGUFParameter KeyError: None), using model_cpu_offload instead.",
+            reason,
+        )
+        pipe_obj.enable_model_cpu_offload()
+        return fallback_device
+    try:
+        pipe_obj.enable_sequential_cpu_offload()
+        return seq_device
+    except KeyError as seq_exc:
+        logger.warning(
+            "sequential_cpu_offload failed (%r); falling back to model_cpu_offload.",
+            seq_exc,
+        )
+        if hasattr(pipe_obj, "remove_all_hooks"):
+            try:
+                pipe_obj.remove_all_hooks()
+            except Exception:
+                pass
+        pipe_obj.enable_model_cpu_offload()
+        return fallback_device
+
+
 class QwenImage21Engine:
     """Manages Qwen-Image-2.1 INT8 pipeline lifecycle across 5 Colab GPU tiers."""
 
@@ -1364,30 +1440,41 @@ class QwenImage21Engine:
                 if (eff["attention_slicing"] or needs_tight_vram) and hasattr(pipe, "enable_attention_slicing"):
                     pipe.enable_attention_slicing("auto")
 
+                is_gguf_pipe = (gguf_variant is not None) or _pipe_has_gguf_params(pipe)
                 if eff["offload_mode"] == "sequential_cpu_offload":
-                    pipe.enable_sequential_cpu_offload()
-                    self.device = "cuda (sequential_offload)"
+                    self.device = _enable_sequential_offload_safe(
+                        pipe,
+                        is_gguf_pipe,
+                        "cuda (model_offload)",
+                        "cuda (sequential_offload)",
+                        "offload_mode=sequential_cpu_offload",
+                    )
                 elif eff["offload_mode"] == "smart_stage_offload":
                     if needs_tight_vram:
                         logger.info(
-                            "Smart stage offload detected tight VRAM (DiT=%.2f GB / VRAM=%.2f GB); activating sequential layer offload to prevent OOM.",
+                            "Smart stage offload detected tight VRAM (DiT=%.2f GB / VRAM=%.2f GB); selecting safe offload.",
                             transformer_bytes / (1024**3),
                             total_vram_bytes / (1024**3),
                         )
-                        pipe.enable_sequential_cpu_offload()
-                        self.device = "cuda (smart_stage_offload · sequential)"
+                        self.device = _enable_sequential_offload_safe(
+                            pipe,
+                            is_gguf_pipe,
+                            "cuda (smart_stage_offload)",
+                            "cuda (smart_stage_offload · sequential)",
+                            f"Smart stage offload tight VRAM (DiT={transformer_bytes / (1024**3):.2f} GB / VRAM={total_vram_bytes / (1024**3):.2f} GB)",
+                        )
                     else:
                         pipe.enable_model_cpu_offload()
                         self.device = "cuda (smart_stage_offload)"
                 elif eff["offload_mode"] == "model_cpu_offload":
                     if transformer_bytes > int(total_vram_bytes * 0.78):
-                        logger.warning(
-                            "Transformer (%.2f GB) exceeds 78%% of VRAM (%.2f GB); upgrading model_cpu_offload to sequential_cpu_offload.",
-                            transformer_bytes / (1024**3),
-                            total_vram_bytes / (1024**3),
+                        self.device = _enable_sequential_offload_safe(
+                            pipe,
+                            is_gguf_pipe,
+                            "cuda (model_offload)",
+                            "cuda (sequential_offload)",
+                            f"Transformer ({transformer_bytes / (1024**3):.2f} GB) exceeds 78% of VRAM ({total_vram_bytes / (1024**3):.2f} GB)",
                         )
-                        pipe.enable_sequential_cpu_offload()
-                        self.device = "cuda (sequential_offload)"
                     else:
                         pipe.enable_model_cpu_offload()
                         self.device = "cuda (model_offload)"
@@ -1409,6 +1496,11 @@ class QwenImage21Engine:
                     job.progress = 0.0
                     job.message = f"[{profile.display_name}] 模型已驻留，开始推理..."
                 logger.info("Pipeline loaded successfully on %s", self.device)
+            except Exception:
+                trim_host_memory()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                raise
             finally:
                 self.loading = False
 
@@ -1919,9 +2011,14 @@ class QwenImage21Engine:
                 except Exception as oom_exc:
                     err_low = str(oom_exc).lower()
                     is_oom = ("out of memory" in err_low or "cuda error: out of memory" in err_low)
-                    if is_oom and not job.cancel_event.is_set() and "sequential" not in self.device:
-                        logger.warning("CUDA OOM detected (%s); switching pipeline to sequential_cpu_offload and retrying once.", oom_exc)
-                        job.notice = "检测到显存不足，已自动切换至逐层显存调度模式并重试..."
+                    is_gguf_pipe = (eff_now.get("gguf_variant") is not None) or _pipe_has_gguf_params(self.pipe)
+                    can_retry_oom = (
+                        is_oom
+                        and not job.cancel_event.is_set()
+                        and "sequential" not in self.device
+                        and (not is_gguf_pipe or ("offload" not in self.device and hasattr(self.pipe, "enable_model_cpu_offload")))
+                    )
+                    if can_retry_oom:
                         if hasattr(self.pipe, "vae"):
                             if hasattr(self.pipe.vae, "enable_tiling"):
                                 self.pipe.vae.enable_tiling()
@@ -1932,9 +2029,25 @@ class QwenImage21Engine:
                         trim_host_memory()
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
-                        if hasattr(self.pipe, "enable_sequential_cpu_offload"):
-                            self.pipe.enable_sequential_cpu_offload()
-                            self.device = "cuda (auto_sequential_fallback)"
+                        if is_gguf_pipe:
+                            logger.warning(
+                                "CUDA OOM detected on GGUF pipeline (%s); switching pipeline to model_cpu_offload and retrying once.",
+                                oom_exc,
+                            )
+                            job.notice = "检测到显存不足，已自动切换至模型 CPU 卸载模式并重试..."
+                            self.pipe.enable_model_cpu_offload()
+                            self.device = "cuda (auto_model_offload_fallback)"
+                        else:
+                            logger.warning("CUDA OOM detected (%s); switching pipeline to sequential_cpu_offload and retrying once.", oom_exc)
+                            job.notice = "检测到显存不足，已自动切换至逐层显存调度模式并重试..."
+                            if hasattr(self.pipe, "enable_sequential_cpu_offload"):
+                                self.device = _enable_sequential_offload_safe(
+                                    self.pipe,
+                                    is_gguf=False,
+                                    fallback_device="cuda (auto_model_offload_fallback)",
+                                    seq_device="cuda (auto_sequential_fallback)",
+                                    reason="CUDA OOM fallback",
+                                )
                         out = _run_pipe_with_rgba_fallback()
                     else:
                         raise
@@ -1997,6 +2110,9 @@ lora_downloads = LoraDownloadManager(LORAS_DIR)
 comfy_launcher = ComfyUILauncher(LORAS_DIR)
 jobs_lock = threading.Lock()
 jobs: dict[str, JobState] = {}
+model_ops_lock = threading.Lock()
+model_ops: dict[str, ModelOpState] = {}
+_active_model_op_id: Optional[str] = None
 _hf_cache_stat_lock = threading.Lock()
 _hf_cache_stat_cache: tuple[float, int] = (0.0, 0)
 
@@ -2486,18 +2602,67 @@ def api_terminal_kill(cmd_id: str) -> dict[str, Any]:
     return {"ok": killed}
 
 
+_LOG_RECORD_START_RE = re.compile(
+    r"^(?:\d{2,4}[-/:\s,\d.]*\[(?:INFO|DEBUG|WARNING|WARN|ERROR|CRITICAL)\]|(?:INFO|DEBUG|WARNING|WARN|ERROR|CRITICAL):)"
+)
+_ERROR_LINE_RE = re.compile(
+    r"(?:\[(?:ERROR|CRITICAL)\]|^(?:ERROR|CRITICAL|FATAL):|Traceback \(most recent call last\):|"
+    r"During handling of the above exception|The above exception was the direct cause of the following exception|"
+    r"(?i:cuda out of memory|cuda error)|OutOfMemoryError|500 Internal Server Error|502 Bad Gateway)"
+)
+_EXCEPTION_END_RE = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Exit|Interrupt)\b(?::.*)?$"
+)
+
+
+def _filter_error_log_lines(raw_lines: list[str]) -> list[str]:
+    """Extract only error log records and complete multi-line Python tracebacks."""
+    flat_lines: list[str] = []
+    for item in raw_lines:
+        flat_lines.extend(str(item).splitlines())
+
+    filtered: list[str] = []
+    in_traceback = False
+    for line in flat_lines:
+        stripped = line.strip()
+        if _LOG_RECORD_START_RE.match(line):
+            in_traceback = False
+
+        if in_traceback:
+            if not stripped:
+                in_traceback = False
+                continue
+            filtered.append(line)
+            if not line[0].isspace() and _EXCEPTION_END_RE.match(stripped):
+                in_traceback = False
+            continue
+
+        if "Traceback (most recent call last):" in line:
+            in_traceback = True
+            filtered.append(line)
+            continue
+
+        if _ERROR_LINE_RE.search(line) or (not _LOG_RECORD_START_RE.match(line) and stripped and _EXCEPTION_END_RE.match(stripped)):
+            filtered.append(line)
+    return filtered
+
+
 @app.get("/api/logs")
-def api_server_logs(limit: int = Query(default=150, ge=10, le=500)) -> dict[str, Any]:
-    lines = log_buffer.get_lines(limit=limit)
+def api_server_logs(
+    limit: int = Query(default=150, ge=10, le=500),
+    errors_only: bool = Query(default=False),
+) -> dict[str, Any]:
+    raw_lines = log_buffer.get_lines(limit=400 if errors_only else limit)
     log_file = Path("/tmp/qwen_server.log") if os.name != "nt" else (BASE_DIR / "qwen_server.log")
     if log_file.exists():
         try:
-            raw_lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
-            if raw_lines:
-                lines = raw_lines[-limit:]
+            file_lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
+            if file_lines:
+                raw_lines = file_lines if errors_only else file_lines[-limit:]
         except OSError:
             pass
-    return {"lines": lines, "ts": time.time()}
+    lines = _filter_error_log_lines(raw_lines)[-limit:] if errors_only else raw_lines[-limit:]
+    return {"lines": lines, "errors_only": errors_only, "ts": time.time()}
 
 
 @app.get("/api/loras")
@@ -2933,17 +3098,117 @@ def api_free_vram(unload_model: bool = Query(default=False)) -> dict[str, Any]:
     return {"ok": True, "stats": collect_system_stats()}
 
 
-@app.post("/api/system/clear-hf-cache")
-def api_clear_hf_cache() -> dict[str, Any]:
+def _clear_all_hf_models_cache() -> None:
+    """Delete all downloaded Hugging Face model caches and invalidate cached stats."""
     hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
-    hub_dir = hf_home / "hub"
+    hub_dir = Path(os.environ.get("HF_HUB_CACHE", str(hf_home / "hub")))
     if hub_dir.exists():
         shutil.rmtree(hub_dir, ignore_errors=True)
     with _hf_cache_stat_lock:
         globals()["_hf_cache_stat_cache"] = (0.0, 0)
     with _hf_inventory_lock:
         globals()["_hf_inventory_cache"] = (0.0, [])
+
+
+@app.post("/api/system/clear-hf-cache")
+def api_clear_hf_cache() -> dict[str, Any]:
+    _clear_all_hf_models_cache()
     return {"ok": True, "stats": collect_system_stats()}
+
+
+def _start_model_op(action: Literal["reload", "reinstall"]) -> dict[str, Any]:
+    global _active_model_op_id
+    with model_ops_lock:
+        active_op = model_ops.get(_active_model_op_id) if _active_model_op_id else None
+        if (active_op is not None and active_op.status in {"queued", "loading_model", "running"}) or engine.loading:
+            raise HTTPException(status_code=409, detail="已有模型加载或重装任务正在进行中，请稍候")
+
+        init_msg = (
+            "准备删除已安装的所有模型并重新安装..."
+            if action == "reinstall"
+            else f"准备重新加载模型 {engine.model_id}..."
+        )
+        op = ModelOpState(
+            task_id=uuid.uuid4().hex[:10],
+            action=action,
+            status="running",
+            progress=0.02,
+            message=init_msg,
+        )
+        model_ops[op.task_id] = op
+        _active_model_op_id = op.task_id
+        if len(model_ops) > 30:
+            done_keys = [
+                k for k, v in sorted(model_ops.items(), key=lambda kv: kv[1].created_at)
+                if v.status in {"completed", "error"}
+            ]
+            for old_k in done_keys[:-20]:
+                model_ops.pop(old_k, None)
+
+    def _worker() -> None:
+        global _active_model_op_id
+        try:
+            if action == "reinstall":
+                op.message = "正在卸载当前模型..."
+                op.progress = 0.03
+                engine.unload()
+                op.message = "正在删除已安装的所有模型缓存..."
+                op.progress = 0.06
+                _clear_all_hf_models_cache()
+                engine._user_modified_model = True
+                op.message = f"正在重新下载并安装模型 {engine.model_id}..."
+                op.progress = 0.10
+                engine.ensure_loaded(op)
+                with _hf_cache_stat_lock:
+                    globals()["_hf_cache_stat_cache"] = (0.0, 0)
+                with _hf_inventory_lock:
+                    globals()["_hf_inventory_cache"] = (0.0, [])
+                op.status = "completed"
+                op.progress = 1.0
+                op.message = f"已删除所有模型并重新安装完成: {engine.model_id}"
+            else:
+                op.message = "正在卸载当前模型..."
+                op.progress = 0.05
+                engine.unload()
+                op.message = f"正在重新加载现有模型 {engine.model_id}..."
+                op.progress = 0.10
+                engine.ensure_loaded(op)
+                op.status = "completed"
+                op.progress = 1.0
+                op.message = f"已重新加载模型: {engine.model_id}"
+        except Exception as exc:
+            logger.exception("Model op %s (%s) failed", op.task_id, action)
+            err_msg = str(exc) if str(exc) and str(exc) != "None" else f"{type(exc).__name__}: {exc}"
+            op.status = "error"
+            op.error = err_msg
+            op.message = f"{'重装模型' if action == 'reinstall' else '重新加载模型'}失败: {err_msg}"
+        finally:
+            op.finished_at = time.time()
+            with model_ops_lock:
+                if _active_model_op_id == op.task_id:
+                    _active_model_op_id = None
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return {"ok": True, **op.to_dict()}
+
+
+@app.post("/api/model/reload")
+def api_model_reload() -> dict[str, Any]:
+    return _start_model_op("reload")
+
+
+@app.post("/api/model/reinstall")
+def api_model_reinstall() -> dict[str, Any]:
+    return _start_model_op("reinstall")
+
+
+@app.get("/api/model/op/{task_id}")
+def api_model_op_status(task_id: str) -> dict[str, Any]:
+    with model_ops_lock:
+        op = model_ops.get(task_id)
+        if op is None:
+            raise HTTPException(status_code=404, detail="Model operation task not found")
+        return op.to_dict()
 
 
 @app.post("/api/shutdown")
