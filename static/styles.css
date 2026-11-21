@@ -195,68 +195,72 @@ kbd {
 .top-bar-inner {
   max-width: 1240px;
   margin: 0 auto;
-  height: 56px;
-  padding: 0 16px;
+  height: 48px;
+  padding: 0 12px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 8px;
+}
+
+@media (min-width: 900px) {
+  .top-bar-inner {
+    height: 54px;
+    padding: 0 16px;
+    gap: 12px;
+  }
 }
 
 .brand {
   display: flex;
   align-items: center;
-  gap: 10px;
   cursor: pointer;
+  flex: 1;
   min-width: 0;
-}
-
-.brand-logo {
-  width: 32px;
-  height: 32px;
-  border-radius: 9px;
-  display: grid;
-  place-items: center;
-  font-weight: 700;
-  font-size: 13px;
-  letter-spacing: -0.02em;
-  background: var(--ink);
-  color: var(--ink-fg);
-  flex-shrink: 0;
+  overflow: hidden;
 }
 
 .brand-text {
   min-width: 0;
+  width: 100%;
 }
 
 .brand-title {
   font-weight: 650;
-  font-size: 14px;
+  font-size: 13.5px;
   letter-spacing: -0.01em;
   display: flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
+}
+
+.brand-name {
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 
 .brand-sub {
-  font-size: 11px;
+  font-size: 10.5px;
   color: var(--text-dim);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 220px;
+  max-width: 100%;
 }
 
 .status-pill {
   font-size: 10px;
   font-weight: 600;
-  padding: 2px 7px;
+  padding: 1px 6px;
   border-radius: 999px;
   background: var(--surface-2);
   color: var(--text-secondary);
   border: 1px solid var(--border);
   white-space: nowrap;
+  flex-shrink: 0;
 }
 
 /* Desktop Navigation */
@@ -296,7 +300,7 @@ kbd {
 .top-actions {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   flex-shrink: 0;
 }
 
@@ -307,9 +311,9 @@ kbd {
   align-items: center;
   justify-content: center;
   gap: 5px;
-  height: 34px;
-  border-radius: 9px;
-  font-size: 12.5px;
+  height: 30px;
+  border-radius: 8px;
+  font-size: 12px;
   font-weight: 550;
   cursor: pointer;
   border: 1px solid var(--border);
@@ -319,11 +323,11 @@ kbd {
 }
 
 .btn-ghost {
-  padding: 0 11px;
+  padding: 0 9px;
 }
 
 .btn-ghost-icon {
-  width: 34px;
+  width: 30px;
   padding: 0;
 }
 
@@ -335,7 +339,7 @@ kbd {
 }
 
 .btn-power {
-  padding: 0 11px;
+  padding: 0 9px;
   border-color: var(--danger-border);
   background: var(--danger-soft);
   color: var(--danger);
@@ -516,8 +520,26 @@ kbd {
 }
 
 /* =========================================================================
-   Mode Switcher (Inline Segmented Control)
+   Mode Switcher (Sticky Floating Segmented Control)
    ========================================================================= */
+.mode-tabs-sticky {
+  position: sticky;
+  top: calc(50px + var(--safe-top));
+  z-index: 36;
+  margin: -4px -2px 0;
+  padding: 4px 2px;
+  background: color-mix(in srgb, var(--bg) 86%, transparent);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-radius: 14px;
+}
+
+@media (min-width: 900px) {
+  .mode-tabs-sticky {
+    top: calc(58px + var(--safe-top));
+  }
+}
+
 .mode-tabs {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -526,15 +548,16 @@ kbd {
   background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: 12px;
+  box-shadow: var(--shadow-sm);
 }
 
 .mode-tab {
   border: none;
   background: transparent;
   color: var(--text-secondary);
-  padding: 8px 6px;
+  padding: 7px 6px;
   border-radius: 8px;
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 550;
   cursor: pointer;
   transition: background-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
@@ -549,6 +572,16 @@ kbd {
   color: var(--text);
   font-weight: 650;
   box-shadow: var(--shadow-sm);
+}
+
+.details-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.compact-stepper {
+  gap: 8px;
 }
 
 /* =========================================================================
@@ -1506,26 +1539,26 @@ input[type="range"] {
 }
 
 /* =========================================================================
-   Fixed Bottom-Right Floating "开始生成" FAB Dock
+   Compact Bottom-Right Floating "生成" FAB Dock
    ========================================================================= */
 .fab-stack {
   position: fixed;
-  right: 16px;
-  bottom: calc(74px + var(--safe-bottom));
+  right: 12px;
+  bottom: calc(64px + var(--safe-bottom));
   z-index: 48;
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-  gap: 8px;
+  gap: 6px;
   pointer-events: none;
-  max-width: calc(100vw - 32px);
+  max-width: calc(100vw - 24px);
 }
 
 @media (min-width: 900px) {
   .fab-stack {
-    right: 26px;
-    bottom: 24px;
-    max-width: 420px;
+    right: 20px;
+    bottom: 18px;
+    max-width: 360px;
   }
 }
 
@@ -1536,21 +1569,21 @@ input[type="range"] {
 .fab-action-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 
 .btn-fab-generate {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 8px;
-  height: 50px;
-  padding: 0 22px;
+  gap: 6px;
+  height: 38px;
+  padding: 0 15px;
   border-radius: 999px;
   border: none;
   background: var(--accent);
   color: #ffffff;
-  font-size: 15px;
+  font-size: 13px;
   font-weight: 650;
   letter-spacing: -0.01em;
   box-shadow: var(--shadow-fab);
@@ -1572,36 +1605,21 @@ input[type="range"] {
   cursor: wait;
 }
 
-.fab-kbd {
-  display: none;
-  font-size: 10.5px;
-  padding: 1px 5px;
-  border-radius: 5px;
-  border: 1px solid rgba(255, 255, 255, 0.28);
-  background: rgba(255, 255, 255, 0.14);
-  color: rgba(255, 255, 255, 0.92);
-}
-
-@media (min-width: 900px) {
-  .fab-kbd {
-    display: inline-block;
-  }
-}
-
 .fab-stop {
-  height: 50px;
+  height: 38px;
   border-radius: 999px;
-  padding: 0 16px;
+  padding: 0 12px;
+  font-size: 12.5px;
   background: var(--surface);
   box-shadow: var(--shadow-lg);
 }
 
 .fab-progress-card {
-  width: min(320px, calc(100vw - 32px));
+  width: min(240px, calc(100vw - 28px));
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 10px 13px;
+  border-radius: 10px;
+  padding: 7px 10px;
   box-shadow: var(--shadow-lg);
 }
 
@@ -2116,8 +2134,116 @@ input[type="range"] {
 }
 
 /* =========================================================================
-   Settings Preset Cards & Forms
+   Settings Secondary Sub-Menu, Appearance Theme & Preset Cards
    ========================================================================= */
+.subnav-bar {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+  padding: 4px;
+  border-radius: 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+
+.subnav-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  padding: 8px 6px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  font-weight: 550;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.subnav-btn:hover {
+  color: var(--text);
+}
+
+.subnav-btn.active {
+  background: var(--surface);
+  color: var(--text);
+  font-weight: 650;
+  box-shadow: var(--shadow-sm);
+}
+
+.settings-subpanel {
+  display: none;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.settings-subpanel.active {
+  display: flex;
+  animation: panelFade 0.16s ease both;
+}
+
+.theme-mode-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.theme-mode-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 11px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background-color 0.15s ease, color 0.15s ease;
+}
+
+.theme-mode-btn.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+.accent-palette {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.accent-swatch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 11px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  font-weight: 550;
+  cursor: pointer;
+}
+
+.accent-swatch.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-weight: 650;
+}
+
+.swatch-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  flex-shrink: 0;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.14);
+}
+
 .preset-card-grid {
   display: grid;
   grid-template-columns: 1fr;
@@ -2484,6 +2610,7 @@ input[type="range"] {
   user-select: none;
   touch-action: none;
   line-height: 0;
+  cursor: ew-resize;
 }
 
 .compare-img {
@@ -2506,7 +2633,7 @@ input[type="range"] {
 .compare-before-clip img {
   width: 100%;
   height: 100%;
-  object-fit: fill;
+  object-fit: contain;
 }
 
 .compare-divider {
@@ -2552,15 +2679,16 @@ input[type="range"] {
 .compare-label.left { left: 10px; }
 .compare-label.right { right: 10px; }
 
-.compare-range {
+input[type="range"].compare-range {
   position: absolute;
   inset: 0;
   width: 100%;
   height: 100%;
   margin: 0;
+  padding: 0;
   opacity: 0;
   cursor: ew-resize;
-  z-index: 3;
+  z-index: 4;
 }
 
 .lightbox-meta {
@@ -2840,18 +2968,22 @@ input[type="range"] {
    ========================================================================= */
 .toast {
   position: fixed;
-  top: calc(66px + var(--safe-top));
+  top: calc(58px + var(--safe-top));
   left: 50%;
   transform: translateX(-50%);
   z-index: 120;
   background: var(--ink);
   color: var(--ink-fg);
-  padding: 8px 16px;
-  border-radius: 999px;
-  font-size: 13px;
+  padding: 9px 14px;
+  border-radius: 12px;
+  font-size: 12.5px;
   font-weight: 550;
+  line-height: 1.45;
   box-shadow: var(--shadow-lg);
-  max-width: 90vw;
+  max-width: min(400px, 90vw);
+  max-height: 28vh;
+  overflow-y: auto;
+  word-break: break-word;
   text-align: center;
   animation: toastIn 0.2s ease both;
 }

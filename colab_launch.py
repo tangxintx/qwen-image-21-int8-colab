@@ -192,8 +192,8 @@ def preload_model_with_progress() -> None:
     if os.environ.get("QWEN_PRELOAD_MODEL", "1").strip().lower() not in {"1", "true", "yes"}:
         return
 
-    model_id = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen-Image-2.1-Turbo")
-    quant_mode = os.environ.get("QWEN_QUANT_MODE", "int8-torchao")
+    model_id = os.environ.get("QWEN_MODEL_ID", "abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8")
+    quant_mode = os.environ.get("QWEN_QUANT_MODE", "gguf-q8-full")
     hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     from hf_downloader import (
         GGUF_BASE_REPO,
@@ -326,8 +326,8 @@ def start_tunnel_with_retry(
 
 
 def _print_startup_summary(port: int, use_tunnel: bool) -> None:
-    model_id = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen-Image-2.1-Turbo")
-    quant_mode = os.environ.get("QWEN_QUANT_MODE", "int8-torchao")
+    model_id = os.environ.get("QWEN_MODEL_ID", "abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8")
+    quant_mode = os.environ.get("QWEN_QUANT_MODE", "gguf-q8-full")
     offload = os.environ.get("QWEN_OFFLOAD", "auto")
     gpu_prof = os.environ.get("QWEN_GPU_PROFILE", "auto")
     demo = os.environ.get("DEMO_MODE", "0").strip().lower() in {"1", "true", "yes"}

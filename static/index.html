@@ -184,18 +184,21 @@
     <symbol id="ic-shield" viewBox="0 0 24 24">
       <path d="M12 3 4 7v5c0 5 3.4 8.7 8 9.9 4.6-1.2 8-4.9 8-9.9V7l-8-4z" />
     </symbol>
+    <symbol id="ic-cloud" viewBox="0 0 24 24">
+      <path d="M17.5 19H7a5 5 0 0 1-.5-9.97A6.5 6.5 0 0 1 19 10.5a4.5 4.5 0 0 1-1.5 8.5z" />
+      <path d="M12 12v6M9.5 14.5 12 12l2.5 2.5" />
+    </symbol>
   </svg>
 
   <div class="app-shell">
-    <!-- Clean Top Header -->
+    <!-- Streamlined Top Header -->
     <header class="top-bar">
       <div class="top-bar-inner">
         <div class="brand" id="brandStatusTrigger" title="查看系统监控">
-          <span class="brand-logo">Q2</span>
           <div class="brand-text">
             <div class="brand-title">
-              <span>Qwen Image 2.1</span>
-              <span class="status-pill" id="headerQuantBadge">INT8</span>
+              <span class="brand-name">Qwen Image 2.1</span>
+              <span class="status-pill" id="headerQuantBadge">GGUF Q8</span>
             </div>
             <div class="brand-sub" id="engineStatusText">连接中...</div>
           </div>
@@ -211,8 +214,9 @@
         </nav>
 
         <div class="top-actions">
-          <button class="btn-ghost-icon" id="themeToggleBtn" title="切换浅色 / 暗色主题" type="button">
-            <svg class="icon" id="themeToggleIcon"><use href="#ic-moon" /></svg>
+          <button class="btn-chip accent-soft hidden" id="headerGenStatusBtn" title="返回创作台查看生成进度" type="button">
+            <svg class="icon icon-spin"><use href="#ic-loader" /></svg>
+            <span id="headerGenStatusText">生成中</span>
           </button>
           <button class="btn-ghost" id="headerAiBtn" title="打开 AI 智能助手" type="button">
             <svg class="icon"><use href="#ic-sparkles" /></svg>
@@ -238,12 +242,14 @@
         <div class="studio-layout">
           <!-- Left Column: Controls -->
           <div class="studio-controls">
-            <!-- 4 Mode Switcher (Natural inline segmented bar) -->
-            <div class="mode-tabs" role="tablist">
-              <button class="mode-tab active" data-mode="t2i" type="button">文生图</button>
-              <button class="mode-tab" data-mode="i2i" type="button">图生图</button>
-              <button class="mode-tab" data-mode="hires" type="button">高清修复</button>
-              <button class="mode-tab" data-mode="inpaint" type="button">局部重绘</button>
+            <!-- 4 Mode Switcher (Fixed Sticky Floating Bar) -->
+            <div class="mode-tabs-sticky">
+              <div class="mode-tabs" role="tablist">
+                <button class="mode-tab active" data-mode="t2i" type="button">文生图</button>
+                <button class="mode-tab" data-mode="i2i" type="button">图生图</button>
+                <button class="mode-tab" data-mode="hires" type="button">高清修复</button>
+                <button class="mode-tab" data-mode="inpaint" type="button">局部重绘</button>
+              </div>
             </div>
 
             <!-- Reference Image / Mask Card (i2i, hires, inpaint) -->
@@ -345,27 +351,28 @@
 
               <textarea
                 id="promptInput"
-                rows="4"
-                placeholder="描述你想生成的画面细节、光影与构图...（图生图可用 @0 指代主图，@1/@1,2 指代次图；支持 Ctrl+V 贴图，Ctrl+Enter 直接生成）"
+                rows="3"
+                placeholder="描述你想生成的画面细节...（图生图可用 @0 主图、@1 次图；Ctrl+V 贴图，Ctrl+Enter 生成）"
               ></textarea>
 
               <div class="quick-tags hidden" id="refMentionBar"></div>
 
-              <div class="quick-tags" id="quickTags">
-                <button class="tag-chip" data-tag="自然柔和光影, 电影胶片质感, 细腻纹理, 高清摄影" type="button">电影胶片</button>
-                <button class="tag-chip" data-tag="极简现代编辑摄影, 柔和漫射光, 高级留白构图" type="button">极简摄影</button>
-                <button class="tag-chip" data-tag="精致中文海报排版, 居中清晰字体, 平面设计美感" type="button">中文海报</button>
-                <button class="tag-chip" data-tag="写实人像特写, 85mm镜头浅景深, 真实皮肤质感" type="button">写实人像</button>
-                <button class="tag-chip" data-tag="日系清透插画, 水彩笔触, 细腻光斑与通透空气感" type="button">清透插画</button>
-              </div>
-
               <details class="sub-details">
-                <summary>反向提示词（可选）</summary>
-                <textarea
-                  id="negativePromptInput"
-                  rows="2"
-                  placeholder="不希望在画面中出现的元素..."
-                ></textarea>
+                <summary>风格快捷词 & 反向提示词（可选）</summary>
+                <div class="details-stack">
+                  <div class="quick-tags" id="quickTags">
+                    <button class="tag-chip" data-tag="自然柔和光影, 电影胶片质感, 细腻纹理, 高清摄影" type="button">电影胶片</button>
+                    <button class="tag-chip" data-tag="极简现代编辑摄影, 柔和漫射光, 高级留白构图" type="button">极简摄影</button>
+                    <button class="tag-chip" data-tag="精致中文海报排版, 居中清晰字体, 平面设计美感" type="button">中文海报</button>
+                    <button class="tag-chip" data-tag="写实人像特写, 85mm镜头浅景深, 真实皮肤质感" type="button">写实人像</button>
+                    <button class="tag-chip" data-tag="日系清透插画, 水彩笔触, 细腻光斑与通透空气感" type="button">清透插画</button>
+                  </div>
+                  <textarea
+                    id="negativePromptInput"
+                    rows="2"
+                    placeholder="反向提示词：不希望在画面中出现的元素..."
+                  ></textarea>
+                </div>
               </details>
             </div>
 
@@ -373,15 +380,13 @@
             <div class="card">
               <div class="card-header">
                 <span class="card-title">画幅与分辨率</span>
-                <span class="res-badge" id="currentResBadge">1024 × 1024</span>
-              </div>
-
-              <div class="tier-row">
-                <span class="field-label">清晰度档位</span>
-                <div class="segmented-sm" id="tierSelector">
-                  <button class="seg-btn active" data-tier="1k" type="button">1K</button>
-                  <button class="seg-btn" data-tier="1.5k" type="button">1.5K</button>
-                  <button class="seg-btn" data-tier="2k" type="button">2K</button>
+                <div class="card-actions">
+                  <div class="segmented-sm" id="tierSelector">
+                    <button class="seg-btn active" data-tier="1k" type="button">1K</button>
+                    <button class="seg-btn" data-tier="1.5k" type="button">1.5K</button>
+                    <button class="seg-btn" data-tier="2k" type="button">2K</button>
+                  </div>
+                  <span class="res-badge" id="currentResBadge">1024 × 1024</span>
                 </div>
               </div>
 
@@ -397,19 +402,22 @@
                 <button class="ratio-chip" data-ratio="custom" type="button">自定义</button>
               </div>
 
-              <div class="manual-res-row">
-                <div class="num-field">
-                  <label for="widthInput">宽度 (W)</label>
-                  <input type="number" id="widthInput" min="256" max="3072" step="16" value="1024" />
+              <details class="sub-details" id="manualResDetails">
+                <summary>自定义像素宽高 (W × H)</summary>
+                <div class="manual-res-row">
+                  <div class="num-field">
+                    <label for="widthInput">宽度 (W)</label>
+                    <input type="number" id="widthInput" min="256" max="3072" step="16" value="1024" />
+                  </div>
+                  <button class="btn-swap" id="swapDimBtn" title="互换宽高" type="button">
+                    <svg class="icon"><use href="#ic-swap" /></svg>
+                  </button>
+                  <div class="num-field">
+                    <label for="heightInput">高度 (H)</label>
+                    <input type="number" id="heightInput" min="256" max="3072" step="16" value="1024" />
+                  </div>
                 </div>
-                <button class="btn-swap" id="swapDimBtn" title="互换宽高" type="button">
-                  <svg class="icon"><use href="#ic-swap" /></svg>
-                </button>
-                <div class="num-field">
-                  <label for="heightInput">高度 (H)</label>
-                  <input type="number" id="heightInput" min="256" max="3072" step="16" value="1024" />
-                </div>
-              </div>
+              </details>
             </div>
 
             <!-- Sampling & Generation Parameters Card -->
@@ -425,15 +433,9 @@
                   <span class="param-val" id="stepsVal">8</span>
                 </div>
                 <input type="range" id="stepsSlider" min="1" max="60" step="1" value="8" />
-                <div class="preset-pills">
-                  <button class="mini-pill" data-steps="8" type="button">8 步 · Turbo</button>
-                  <button class="mini-pill" data-steps="20" type="button">20 步</button>
-                  <button class="mini-pill" data-steps="28" type="button">28 步</button>
-                  <button class="mini-pill" data-steps="40" type="button">40 步 · 精绘</button>
-                </div>
               </div>
 
-              <div class="param-block" id="denoiseBlock">
+              <div class="param-block hidden" id="denoiseBlock">
                 <div class="param-top">
                   <span>重绘幅度 (Denoise)</span>
                   <span class="param-val" id="denoiseVal">0.75</span>
@@ -441,37 +443,42 @@
                 <input type="range" id="denoiseSlider" min="0.05" max="1.0" step="0.05" value="0.75" />
               </div>
 
-              <div class="two-col-params">
-                <div class="param-card-sub">
-                  <label class="field-label" for="seedInput">随机种子 (Seed)</label>
-                  <div class="seed-row">
-                    <input type="number" id="seedInput" value="-1" />
-                    <button class="btn-icon" id="randomSeedBtn" title="随机 (-1)" type="button">
-                      <svg class="icon"><use href="#ic-dice" /></svg>
-                    </button>
-                    <button class="btn-icon" id="lockLastSeedBtn" title="锁定上次种子" type="button">
-                      <svg class="icon"><use href="#ic-lock" /></svg>
-                    </button>
-                  </div>
-                </div>
-
-                <div class="param-card-sub">
-                  <label class="field-label">单次张数 (Batch)</label>
-                  <div class="stepper">
-                    <button class="step-btn" id="batchDecBtn" title="减少" type="button">
-                      <svg class="icon"><use href="#ic-minus" /></svg>
-                    </button>
-                    <span class="step-val" id="batchVal">1</span>
-                    <button class="step-btn" id="batchIncBtn" title="增加" type="button">
-                      <svg class="icon"><use href="#ic-plus" /></svg>
-                    </button>
-                  </div>
+              <div class="tier-row">
+                <span class="field-label">单次生成张数 (Batch)</span>
+                <div class="stepper compact-stepper">
+                  <button class="step-btn" id="batchDecBtn" title="减少" type="button">
+                    <svg class="icon"><use href="#ic-minus" /></svg>
+                  </button>
+                  <span class="step-val" id="batchVal">1</span>
+                  <button class="step-btn" id="batchIncBtn" title="增加" type="button">
+                    <svg class="icon"><use href="#ic-plus" /></svg>
+                  </button>
                 </div>
               </div>
 
-              <details class="sub-details">
-                <summary>高级微调 (CFG / 高清倍率 / 羽化)</summary>
+              <details class="sub-details" id="samplingAdvDetails">
+                <summary>高级参数 (步数预设 / Seed / CFG / 高清倍率 / 羽化)</summary>
                 <div class="adv-grid">
+                  <div class="preset-pills">
+                    <button class="mini-pill" data-steps="8" type="button">8 步 · Turbo</button>
+                    <button class="mini-pill" data-steps="20" type="button">20 步</button>
+                    <button class="mini-pill" data-steps="28" type="button">28 步</button>
+                    <button class="mini-pill" data-steps="40" type="button">40 步 · 精绘</button>
+                  </div>
+
+                  <div class="param-card-sub">
+                    <label class="field-label" for="seedInput">随机种子 (Seed)</label>
+                    <div class="seed-row">
+                      <input type="number" id="seedInput" value="-1" />
+                      <button class="btn-icon" id="randomSeedBtn" title="随机 (-1)" type="button">
+                        <svg class="icon"><use href="#ic-dice" /></svg>
+                      </button>
+                      <button class="btn-icon" id="lockLastSeedBtn" title="锁定上次种子" type="button">
+                        <svg class="icon"><use href="#ic-lock" /></svg>
+                      </button>
+                    </div>
+                  </div>
+
                   <div class="param-block">
                     <div class="param-top">
                       <span>True CFG</span>
@@ -527,26 +534,28 @@
                   <div class="lora-warn hidden" id="loraWarnText"></div>
                 </div>
 
-                <div class="form-group">
-                  <label for="loraPanelUrlInput">直链下载 (支持 Hugging Face / Civitai)</label>
-                  <div class="seed-row">
-                    <input type="text" id="loraPanelUrlInput" placeholder="粘贴模型页面或权重直链 https://..." autocomplete="off" />
-                    <button class="btn-chip primary" id="loraPanelDownloadBtn" type="button">
-                      <svg class="icon"><use href="#ic-download" /></svg>
-                      <span>下载</span>
-                    </button>
-                  </div>
-                  <input type="password" id="loraPanelTokenInput" placeholder="API Token（可选，私有 HF / Civitai 模型需要）" autocomplete="off" />
-                  <div class="progress-wrap compact hidden" id="loraPanelDlProgressWrap">
-                    <div class="progress-info">
-                      <span id="loraPanelDlMsg">准备下载...</span>
-                      <span id="loraPanelDlPct">0%</span>
+                <details class="sub-details">
+                  <summary>直链下载 LoRA (Hugging Face / Civitai)</summary>
+                  <div class="details-stack">
+                    <div class="seed-row">
+                      <input type="text" id="loraPanelUrlInput" placeholder="粘贴模型页面或权重直链 https://..." autocomplete="off" />
+                      <button class="btn-chip primary" id="loraPanelDownloadBtn" type="button">
+                        <svg class="icon"><use href="#ic-download" /></svg>
+                        <span>下载</span>
+                      </button>
                     </div>
-                    <div class="progress-bar-bg">
-                      <div class="progress-bar-fill" id="loraPanelDlFill"></div>
+                    <input type="password" id="loraPanelTokenInput" placeholder="API Token（可选，私有 HF / Civitai 模型需要）" autocomplete="off" />
+                    <div class="progress-wrap compact hidden" id="loraPanelDlProgressWrap">
+                      <div class="progress-info">
+                        <span id="loraPanelDlMsg">准备下载...</span>
+                        <span id="loraPanelDlPct">0%</span>
+                      </div>
+                      <div class="progress-bar-bg">
+                        <div class="progress-bar-fill" id="loraPanelDlFill"></div>
+                      </div>
                     </div>
                   </div>
-                </div>
+                </details>
 
                 <div class="two-col-selects">
                   <div class="form-group">
@@ -614,11 +623,11 @@
                   <svg class="icon icon-xl"><use href="#ic-image" /></svg>
                 </div>
                 <div class="stage-empty-title">准备就绪，开始你的创作</div>
-                <div class="stage-empty-desc">在左侧输入画面描述，点击右下角「开始生成」或按下 <kbd>Ctrl</kbd>+<kbd>Enter</kbd></div>
+                <div class="stage-empty-desc">在左侧输入画面描述，点击右下角「生成」或按下 <kbd>Ctrl</kbd>+<kbd>Enter</kbd></div>
                 <div class="stage-tips">
-                  <span class="stage-tip-pill">拖拽或 Ctrl+V 直接粘贴参考图</span>
-                  <span class="stage-tip-pill">支持 @0 主图 / @1 次图多图融合</span>
-                  <span class="stage-tip-pill">作品详情支持前后对比滑块</span>
+                  <span class="stage-tip-pill">拖拽或 Ctrl+V 粘贴参考图</span>
+                  <span class="stage-tip-pill">支持 @0 主图 / @1 次图融合</span>
+                  <span class="stage-tip-pill">支持前后对比滑块</span>
                 </div>
               </div>
 
@@ -645,6 +654,10 @@
                   <svg class="icon"><use href="#ic-refresh" /></svg>
                   <span>刷新</span>
                 </button>
+                <button class="btn-chip accent-soft" id="gallerySaveGdriveBtn" type="button" title="一键保存到已挂载的 Google 云盘">
+                  <svg class="icon"><use href="#ic-cloud" /></svg>
+                  <span>保存到云盘</span>
+                </button>
                 <button class="btn-chip" id="galleryExportBtn" type="button">
                   <svg class="icon"><use href="#ic-archive" /></svg>
                   <span>导出 ZIP</span>
@@ -652,6 +665,10 @@
                 <button class="btn-chip" id="gallerySelectToggleBtn" type="button">
                   <svg class="icon"><use href="#ic-check-square" /></svg>
                   <span>批量管理</span>
+                </button>
+                <button class="btn-chip hidden" id="galleryCompareBtn" type="button">
+                  <svg class="icon"><use href="#ic-compare" /></svg>
+                  <span>双图对比</span>
                 </button>
                 <button class="btn-chip danger hidden" id="galleryBatchDeleteBtn" type="button">
                   <svg class="icon"><use href="#ic-trash" /></svg>
@@ -667,6 +684,8 @@
               <button class="filter-chip" data-filter="hires" type="button">高清修复</button>
               <button class="filter-chip" data-filter="inpaint" type="button">局部重绘</button>
             </div>
+
+            <div class="card-sub hidden" id="galleryGdriveHint"></div>
 
             <div class="progress-wrap compact hidden" id="galleryExportProgressWrap">
               <div class="progress-info">
@@ -760,14 +779,16 @@
               <strong id="uptimeText">00:00:00</strong>
             </div>
 
-            <div class="gpu-profile-box" id="gpuProfileBox">
-              <div class="gpu-profile-head">
-                <span class="status-pill" id="gpuProfileBadge">GPU 适配</span>
-                <strong id="gpuProfileTitle">检测中...</strong>
+            <details class="sub-details">
+              <summary>GPU 适配详情 (<span id="gpuProfileTitle">检测中...</span>)</summary>
+              <div class="gpu-profile-box" id="gpuProfileBox">
+                <div class="gpu-profile-head">
+                  <span class="status-pill" id="gpuProfileBadge">GPU 适配</span>
+                </div>
+                <div class="gpu-profile-meta" id="gpuProfileMeta">--</div>
+                <div class="gpu-profile-notes" id="gpuProfileNotes">--</div>
               </div>
-              <div class="gpu-profile-meta" id="gpuProfileMeta">--</div>
-              <div class="gpu-profile-notes" id="gpuProfileNotes">--</div>
-            </div>
+            </details>
           </div>
 
           <div class="monitor-side">
@@ -823,15 +844,15 @@
                 <div class="model-list" id="monitorLoadedModels"></div>
               </div>
 
-              <div class="models-subsection">
-                <div class="field-label">本地 HF 缓存底模</div>
+              <details class="sub-details">
+                <summary>本地 HF 缓存底模</summary>
                 <div class="model-list" id="monitorDownloadedHf"></div>
-              </div>
+              </details>
 
-              <div class="models-subsection">
-                <div class="field-label">本地 LoRA 权重</div>
+              <details class="sub-details">
+                <summary>本地 LoRA 权重</summary>
                 <div class="model-list" id="monitorDownloadedLoras"></div>
-              </div>
+              </details>
             </div>
           </div>
         </div>
@@ -899,157 +920,226 @@
 
       <!-- ==================== TAB 5: SETTINGS ==================== -->
       <section class="tab-panel" id="tab-settings">
-        <div class="page-wrap settings-grid">
-          <!-- Model & Presets Card -->
-          <div class="card">
-            <div class="card-header">
-              <span class="card-title">推荐方案一键切换</span>
-              <span class="card-sub">点击卡片即刻生效</span>
-            </div>
-
-            <div class="preset-card-grid" id="editionQuickBtns">
-              <button class="preset-card" data-model="Qwen/Qwen-Image-2.1-Turbo" data-quant="fp8-int8" data-offload="smart_stage_offload" data-steps="8" type="button">
-                <div class="preset-card-top">
-                  <strong>L4 黄金极速版</strong>
-                  <span class="preset-tag">L4 推荐</span>
-                </div>
-                <div class="preset-card-desc">Turbo 8步 · FP8 DiT + INT8 编码 + BF16 VAE</div>
-              </button>
-
-              <button class="preset-card" data-model="Qwen/Qwen-Image-2.1" data-quant="fp8-int8" data-offload="smart_stage_offload" data-steps="40" type="button">
-                <div class="preset-card-top">
-                  <strong>L4 40步精绘版</strong>
-                  <span class="preset-tag">高画质</span>
-                </div>
-                <div class="preset-card-desc">Qwen-2.1 基础版 · FP8+INT8 智能分阶段</div>
-              </button>
-
-              <button class="preset-card" data-model="abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8" data-quant="gguf-q8-full" data-offload="auto" data-steps="8" type="button">
-                <div class="preset-card-top">
-                  <strong>GGUF Q8 满血版</strong>
-                  <span class="preset-tag">Uncensored</span>
-                </div>
-                <div class="preset-card-desc">Q8_0 DiT + 全精度 BF16 编码器 + BF16 VAE</div>
-              </button>
-
-              <button class="preset-card" data-model="abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4" data-quant="gguf-q4" data-offload="auto" data-steps="8" type="button">
-                <div class="preset-card-top">
-                  <strong>GGUF Q4 轻量版</strong>
-                  <span class="preset-tag">省显存</span>
-                </div>
-                <div class="preset-card-desc">Q4_K_M DiT + Qwen3-VL Q4_K_M + BF16 VAE</div>
-              </button>
-
-              <button class="preset-card" data-model="Qwen/Qwen-Image-2.1-Turbo" data-quant="int8-torchao" data-offload="auto" data-steps="8" type="button">
-                <div class="preset-card-top">
-                  <strong>Turbo INT8 通用版</strong>
-                  <span class="preset-tag">T4 / L4</span>
-                </div>
-                <div class="preset-card-desc">TorchAO 全 8-bit 量化，8步极速交互</div>
-              </button>
-
-              <button class="preset-card" data-model="Qwen/Qwen-Image-2.1" data-quant="none" data-offload="auto" data-steps="40" type="button">
-                <div class="preset-card-top">
-                  <strong>原生 BF16 旗舰版</strong>
-                  <span class="preset-tag">A100 / H100</span>
-                </div>
-                <div class="preset-card-desc">无量化全精度 40 步，适合 80G/96G 显卡</div>
-              </button>
-            </div>
-
-            <div class="divider"></div>
-
-            <div class="form-group">
-              <label for="modelSelect">模型仓库</label>
-              <select id="modelSelect">
-                <option value="Qwen/Qwen-Image-2.1-Turbo">Qwen/Qwen-Image-2.1-Turbo (8步极速)</option>
-                <option value="Qwen/Qwen-Image-2.1">Qwen/Qwen-Image-2.1 (基础版 · 40步精绘)</option>
-                <option value="abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8">abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8 (Q8 满血)</option>
-                <option value="abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4">abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4 (Q4 轻量)</option>
-                <option value="addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit">addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit (预量化 8bit)</option>
-              </select>
-            </div>
-
-            <div class="two-col-selects">
-              <div class="form-group">
-                <label for="gpuProfileSelect">GPU 硬件预设</label>
-                <select id="gpuProfileSelect">
-                  <option value="auto">自动识别 GPU (推荐)</option>
-                  <option value="g4_rtx_pro_6000">G4 · RTX PRO 6000 (96GB)</option>
-                  <option value="h100_sxm">H100 · Hopper SXM (80GB)</option>
-                  <option value="a100_sxm">A100 · Ampere SXM (80GB)</option>
-                  <option value="l4_ada">L4 · Ada Lovelace (24GB)</option>
-                  <option value="t4_turing">T4 · Turing (16GB)</option>
-                </select>
-              </div>
-
-              <div class="form-group">
-                <label for="quantSelect">量化精度</label>
-                <select id="quantSelect">
-                  <option value="fp8-int8">FP8 DiT + INT8 编码 + BF16 VAE</option>
-                  <option value="fp8-all">全 FP8 + BF16 VAE</option>
-                  <option value="int8-torchao">TorchAO 全 INT8 + BF16 VAE</option>
-                  <option value="int8-bnb">BitsAndBytes 8-bit</option>
-                  <option value="gguf-q8-full">GGUF Q8_0 + BF16 编码</option>
-                  <option value="gguf-q4">GGUF Q4_K_M 轻量</option>
-                  <option value="none">原生 BF16/FP16 不量化</option>
-                </select>
-              </div>
-            </div>
-
-            <div class="two-col-selects">
-              <div class="form-group">
-                <label for="dtypeSelect">计算精度 (Dtype)</label>
-                <select id="dtypeSelect">
-                  <option value="auto">按显卡自动</option>
-                  <option value="bfloat16">BFloat16</option>
-                  <option value="float16">Float16</option>
-                </select>
-              </div>
-
-              <div class="form-group">
-                <label for="offloadSelect">显存调度策略</label>
-                <select id="offloadSelect">
-                  <option value="auto">按显卡自动</option>
-                  <option value="smart_stage_offload">智能分阶段调度 (L4推荐)</option>
-                  <option value="none">全显存驻留 (80G+)</option>
-                  <option value="model_cpu_offload">Model CPU Offload (T4)</option>
-                  <option value="sequential_cpu_offload">Sequential Offload (极限省显存)</option>
-                </select>
-              </div>
-            </div>
-
-            <div class="two-col-selects">
-              <div class="form-group">
-                <label for="vaeTilingSelect">VAE 分块解码</label>
-                <select id="vaeTilingSelect">
-                  <option value="auto">按显卡自动</option>
-                  <option value="on">开启</option>
-                  <option value="off">关闭</option>
-                </select>
-              </div>
-              <div class="form-group">
-                <label for="hfTokenInput">Hugging Face Token</label>
-                <input type="password" id="hfTokenInput" placeholder="hf_...（可选）" autocomplete="off" />
-              </div>
-            </div>
-
-            <label class="switch-row">
-              <div>
-                <div class="switch-title">局部重绘区域加速</div>
-                <div class="switch-desc">自动裁剪涂抹周边区域推理，生成后精准羽化回贴原图</div>
-              </div>
-              <input type="checkbox" id="inpaintFastCropToggle" />
-            </label>
-
-            <button class="btn-primary full" id="saveConfigBtn" type="button">
-              <svg class="icon"><use href="#ic-save" /></svg>
-              <span>保存引擎配置</span>
-            </button>
+        <div class="page-wrap">
+          <!-- Secondary Sub-Menu for Settings -->
+          <div class="subnav-bar" id="settingsSubNav" role="tablist">
+            <button class="subnav-btn active" data-snav="engine" type="button">模型与推理</button>
+            <button class="subnav-btn" data-snav="appearance" type="button">外观主题</button>
+            <button class="subnav-btn" data-snav="ai" type="button">AI 助手</button>
+            <button class="subnav-btn" data-snav="comfy" type="button">ComfyUI</button>
           </div>
 
-          <!-- Right Settings Column: AI Config & ComfyUI -->
-          <div class="settings-side">
+          <!-- Sub-panel 1: Model & Engine -->
+          <div class="settings-subpanel active" id="settings-panel-engine">
+            <div class="card">
+              <div class="card-header">
+                <span class="card-title">推荐方案一键切换</span>
+                <span class="card-sub">默认 Quantized Q8 · 点击即刻生效</span>
+              </div>
+
+              <div class="preset-card-grid" id="editionQuickBtns">
+                <button class="preset-card" data-model="abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8" data-quant="gguf-q8-full" data-offload="auto" data-steps="8" type="button">
+                  <div class="preset-card-top">
+                    <strong>Quantized Q8 满血版</strong>
+                    <span class="preset-tag">默认推荐</span>
+                  </div>
+                  <div class="preset-card-desc">Q8_0 DiT + BF16 编码 + BF16 VAE（L4 智能逐层防爆显存）</div>
+                </button>
+
+                <button class="preset-card" data-model="abenzerps/Qwen-Image-2.1-Turbo-Quantized:q4" data-quant="gguf-q4" data-offload="auto" data-steps="8" type="button">
+                  <div class="preset-card-top">
+                    <strong>Quantized Q4 轻量版</strong>
+                    <span class="preset-tag">省显存</span>
+                  </div>
+                  <div class="preset-card-desc">Q4_K_M DiT + Qwen3-VL Q4_K_M + BF16 VAE</div>
+                </button>
+
+                <button class="preset-card" data-model="Qwen/Qwen-Image-2.1-Turbo" data-quant="fp8-int8" data-offload="smart_stage_offload" data-steps="8" type="button">
+                  <div class="preset-card-top">
+                    <strong>Turbo FP8 + INT8</strong>
+                    <span class="preset-tag">L4 极速</span>
+                  </div>
+                  <div class="preset-card-desc">Turbo 8步 · FP8 DiT + INT8 编码 + BF16 VAE</div>
+                </button>
+
+                <button class="preset-card" data-model="Qwen/Qwen-Image-2.1" data-quant="fp8-int8" data-offload="smart_stage_offload" data-steps="40" type="button">
+                  <div class="preset-card-top">
+                    <strong>Qwen-2.1 40步精绘版</strong>
+                    <span class="preset-tag">高画质</span>
+                  </div>
+                  <div class="preset-card-desc">Qwen-2.1 基础版 · FP8+INT8 智能调度</div>
+                </button>
+
+                <button class="preset-card" data-model="Qwen/Qwen-Image-2.1-Turbo" data-quant="int8-torchao" data-offload="auto" data-steps="8" type="button">
+                  <div class="preset-card-top">
+                    <strong>Turbo INT8 通用版</strong>
+                    <span class="preset-tag">T4 / L4</span>
+                  </div>
+                  <div class="preset-card-desc">TorchAO 全 8-bit 量化，8步极速交互</div>
+                </button>
+
+                <button class="preset-card" data-model="Qwen/Qwen-Image-2.1" data-quant="none" data-offload="auto" data-steps="40" type="button">
+                  <div class="preset-card-top">
+                    <strong>原生 BF16 旗舰版</strong>
+                    <span class="preset-tag">A100 / H100</span>
+                  </div>
+                  <div class="preset-card-desc">无量化全精度 40 步，适合 80G/96G 显卡</div>
+                </button>
+              </div>
+
+              <label class="switch-row">
+                <div>
+                  <div class="switch-title">局部重绘区域加速</div>
+                  <div class="switch-desc">自动裁剪涂抹周边区域推理，生成后精准羽化回贴原图</div>
+                </div>
+                <input type="checkbox" id="inpaintFastCropToggle" />
+              </label>
+
+              <details class="sub-details" id="engineAdvancedDetails">
+                <summary>高级引擎与量化参数微调</summary>
+                <div class="details-stack">
+                  <div class="form-group">
+                    <label for="modelSelect">模型仓库</label>
+                    <select id="modelSelect">
+                      <option value="abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8">abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8 (默认 Q8 满血)</option>
+                      <option value="abenzerps/Qwen-Image-2.1-Turbo-Quantized:q4">abenzerps/Qwen-Image-2.1-Turbo-Quantized:q4 (Q4 轻量)</option>
+                      <option value="abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8">abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8 (Q8 别名)</option>
+                      <option value="abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4">abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4 (Q4 别名)</option>
+                      <option value="Qwen/Qwen-Image-2.1-Turbo">Qwen/Qwen-Image-2.1-Turbo (8步极速)</option>
+                      <option value="Qwen/Qwen-Image-2.1">Qwen/Qwen-Image-2.1 (基础版 · 40步精绘)</option>
+                      <option value="addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit">addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit (预量化 8bit)</option>
+                    </select>
+                  </div>
+
+                  <div class="two-col-selects">
+                    <div class="form-group">
+                      <label for="gpuProfileSelect">GPU 硬件预设</label>
+                      <select id="gpuProfileSelect">
+                        <option value="auto">自动识别 GPU (推荐)</option>
+                        <option value="g4_rtx_pro_6000">G4 · RTX PRO 6000 (96GB)</option>
+                        <option value="h100_sxm">H100 · Hopper SXM (80GB)</option>
+                        <option value="a100_sxm">A100 · Ampere SXM (80GB)</option>
+                        <option value="l4_ada">L4 · Ada Lovelace (24GB)</option>
+                        <option value="t4_turing">T4 · Turing (16GB)</option>
+                      </select>
+                    </div>
+
+                    <div class="form-group">
+                      <label for="quantSelect">量化精度</label>
+                      <select id="quantSelect">
+                        <option value="gguf-q8-full">GGUF Q8_0 + BF16 编码</option>
+                        <option value="gguf-q4">GGUF Q4_K_M 轻量</option>
+                        <option value="fp8-int8">FP8 DiT + INT8 编码 + BF16 VAE</option>
+                        <option value="fp8-all">全 FP8 + BF16 VAE</option>
+                        <option value="int8-torchao">TorchAO 全 INT8 + BF16 VAE</option>
+                        <option value="int8-bnb">BitsAndBytes 8-bit</option>
+                        <option value="none">原生 BF16/FP16 不量化</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div class="two-col-selects">
+                    <div class="form-group">
+                      <label for="dtypeSelect">计算精度 (Dtype)</label>
+                      <select id="dtypeSelect">
+                        <option value="auto">按显卡自动</option>
+                        <option value="bfloat16">BFloat16</option>
+                        <option value="float16">Float16</option>
+                      </select>
+                    </div>
+
+                    <div class="form-group">
+                      <label for="offloadSelect">显存调度策略</label>
+                      <select id="offloadSelect">
+                        <option value="auto">按显卡自动</option>
+                        <option value="smart_stage_offload">智能分阶段逐层调度 (L4推荐)</option>
+                        <option value="none">全显存驻留 (80G+)</option>
+                        <option value="model_cpu_offload">Model CPU Offload (T4)</option>
+                        <option value="sequential_cpu_offload">Sequential Offload (极限省显存)</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div class="two-col-selects">
+                    <div class="form-group">
+                      <label for="vaeTilingSelect">VAE 分块解码</label>
+                      <select id="vaeTilingSelect">
+                        <option value="auto">按显卡自动</option>
+                        <option value="on">开启</option>
+                        <option value="off">关闭</option>
+                      </select>
+                    </div>
+                    <div class="form-group">
+                      <label for="hfTokenInput">Hugging Face Token</label>
+                      <input type="password" id="hfTokenInput" placeholder="hf_...（可选）" autocomplete="off" />
+                    </div>
+                  </div>
+
+                  <button class="btn-primary full" id="saveConfigBtn" type="button">
+                    <svg class="icon"><use href="#ic-save" /></svg>
+                    <span>保存引擎配置</span>
+                  </button>
+                </div>
+              </details>
+            </div>
+          </div>
+
+          <!-- Sub-panel 2: Appearance & Theme Color -->
+          <div class="settings-subpanel" id="settings-panel-appearance">
+            <div class="card">
+              <div class="card-header">
+                <span class="card-title">外观与主题颜色</span>
+                <span class="card-sub">自动保存本地偏好</span>
+              </div>
+
+              <div class="form-group">
+                <label>界面明暗模式</label>
+                <div class="theme-mode-grid" id="themeModeSelector">
+                  <button class="theme-mode-btn active" data-theme-choice="light" type="button">
+                    <svg class="icon"><use href="#ic-sun" /></svg>
+                    <span>浅色柔和</span>
+                  </button>
+                  <button class="theme-mode-btn" data-theme-choice="dark" type="button">
+                    <svg class="icon"><use href="#ic-moon" /></svg>
+                    <span>深色护眼</span>
+                  </button>
+                </div>
+              </div>
+
+              <div class="form-group">
+                <label>主题强调色</label>
+                <div class="accent-palette" id="accentColorSelector">
+                  <button class="accent-swatch active" data-accent="blue" type="button" title="经典蓝">
+                    <span class="swatch-dot" style="background:#2563eb"></span>
+                    <span>经典蓝</span>
+                  </button>
+                  <button class="accent-swatch" data-accent="emerald" type="button" title="翡翠绿">
+                    <span class="swatch-dot" style="background:#059669"></span>
+                    <span>翡翠绿</span>
+                  </button>
+                  <button class="accent-swatch" data-accent="violet" type="button" title="星辰紫">
+                    <span class="swatch-dot" style="background:#7c3aed"></span>
+                    <span>星辰紫</span>
+                  </button>
+                  <button class="accent-swatch" data-accent="amber" type="button" title="暖琥珀">
+                    <span class="swatch-dot" style="background:#d97706"></span>
+                    <span>暖琥珀</span>
+                  </button>
+                  <button class="accent-swatch" data-accent="rose" type="button" title="玫瑰红">
+                    <span class="swatch-dot" style="background:#e11d48"></span>
+                    <span>玫瑰红</span>
+                  </button>
+                  <button class="accent-swatch" data-accent="graphite" type="button" title="极简墨">
+                    <span class="swatch-dot" style="background:#3f3f46"></span>
+                    <span>极简墨</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Sub-panel 3: AI Assistant Config -->
+          <div class="settings-subpanel" id="settings-panel-ai">
             <div class="card" id="aiConfigCard">
               <div class="card-header">
                 <span class="card-title">AI 助手配置</span>
@@ -1102,8 +1192,10 @@
                 </button>
               </div>
             </div>
+          </div>
 
-            <!-- On-demand ComfyUI Launcher Card -->
+          <!-- Sub-panel 4: ComfyUI On-Demand Launcher -->
+          <div class="settings-subpanel" id="settings-panel-comfy">
             <div class="card" id="comfyLauncherCard">
               <div class="card-header">
                 <span class="card-title">ComfyUI 按需启动器</span>
@@ -1112,8 +1204,8 @@
               <div class="form-group">
                 <label for="comfyGgufSelect">GGUF 模型与插件部署档位</label>
                 <select id="comfyGgufSelect">
-                  <option value="q4">Q4 轻量版 (Q4_K_M DiT + Qwen3-VL Q4_K_M + BF16 VAE)</option>
                   <option value="q8">Q8 满血版 (Q8_0 DiT + BF16 编码 + BF16 VAE)</option>
+                  <option value="q4">Q4 轻量版 (Q4_K_M DiT + Qwen3-VL Q4_K_M + BF16 VAE)</option>
                   <option value="both">同时部署 Q8 + Q4 全套文件与工作流</option>
                   <option value="none">仅安装 ComfyUI + ComfyUI-GGUF 插件</option>
                 </select>
@@ -1147,7 +1239,7 @@
       </section>
     </main>
 
-    <!-- Fixed Bottom-Right Floating Action Dock ("开始生成" 固定悬浮右下角) -->
+    <!-- Compact Bottom-Right Floating Action Dock (Only visible on Studio tab) -->
     <div class="fab-stack" id="generateFabDock">
       <div class="notice-banner hidden" id="genNoticeBanner"></div>
       <div class="error-banner hidden" id="genErrorBanner">
@@ -1179,10 +1271,9 @@
           <svg class="icon"><use href="#ic-stop" /></svg>
           <span>停止</span>
         </button>
-        <button class="btn-fab-generate" id="generateBtn" type="button" title="开始生成 (Ctrl+Enter)">
+        <button class="btn-fab-generate" id="generateBtn" type="button" title="生成 (Ctrl+Enter)">
           <svg class="icon"><use href="#ic-play" /></svg>
-          <span>开始生成</span>
-          <kbd class="fab-kbd">Ctrl+↵</kbd>
+          <span>生成</span>
         </button>
       </div>
     </div>
@@ -1212,7 +1303,7 @@
     </nav>
   </div>
 
-  <!-- Lightbox Modal (With Before/After Comparison Slider & Copy Params) -->
+  <!-- Lightbox Modal (With Before/After Comparison Slider & Google Drive Backup) -->
   <div class="modal hidden" id="lightboxModal">
     <div class="modal-backdrop" id="lightboxBackdrop"></div>
     <div class="modal-sheet lightbox-sheet">
@@ -1223,7 +1314,7 @@
             <button class="seg-btn active" data-lbview="result" type="button">成品</button>
             <button class="seg-btn" data-lbview="compare" type="button">
               <svg class="icon"><use href="#ic-compare" /></svg>
-              <span>前后对比</span>
+              <span>对比</span>
             </button>
           </div>
           <button class="btn-close" id="lightboxCloseBtn" title="关闭 (Esc)" type="button">
@@ -1249,8 +1340,8 @@
               <svg class="icon"><use href="#ic-compare" /></svg>
             </div>
           </div>
-          <span class="compare-label left">原图</span>
-          <span class="compare-label right">生成图</span>
+          <span class="compare-label left" id="compareLeftLabel">原图</span>
+          <span class="compare-label right" id="compareRightLabel">生成图</span>
           <input type="range" class="compare-range" id="compareRangeInput" min="0" max="100" value="50" aria-label="前后对比滑块" />
         </div>
       </div>
@@ -1262,17 +1353,21 @@
           <svg class="icon"><use href="#ic-download" /></svg>
           <span>下载原图</span>
         </a>
+        <button class="btn-chip accent-soft" id="lbSaveGdriveBtn" type="button">
+          <svg class="icon"><use href="#ic-cloud" /></svg>
+          <span>存到云盘</span>
+        </button>
+        <button class="btn-chip" id="lbReuseParamsBtn" type="button">
+          <svg class="icon"><use href="#ic-repeat" /></svg>
+          <span>复用参数</span>
+        </button>
         <button class="btn-chip" id="lbCopyPromptBtn" type="button">
           <svg class="icon"><use href="#ic-copy" /></svg>
           <span>复制提示词</span>
         </button>
         <button class="btn-chip" id="lbCopyAllParamsBtn" type="button">
           <svg class="icon"><use href="#ic-copy" /></svg>
-          <span>复制全套参数</span>
-        </button>
-        <button class="btn-chip" id="lbReuseParamsBtn" type="button">
-          <svg class="icon"><use href="#ic-repeat" /></svg>
-          <span>复用参数</span>
+          <span>复制参数</span>
         </button>
         <button class="btn-chip" id="lbToI2IBtn" type="button">主图 (@0)</button>
         <button class="btn-chip" id="lbAddExtraRefBtn" type="button">添为次图</button>

@@ -50,9 +50,36 @@
   const SUPPORTED_RATIOS = [1, 16 / 9, 9 / 16, 4 / 3, 3 / 4, 3 / 2, 2 / 3];
   const STORAGE_KEYS = {
     theme: "qwen_studio_theme_v2",
+    accent: "qwen_studio_accent_v2",
     prefs: "qwen_studio_prefs_v2",
     history: "qwen_prompt_history_v2",
     favorites: "qwen_prompt_favorites_v2",
+  };
+  const ACCENT_THEMES = {
+    blue: {
+      light: { accent: "#2563eb", hover: "#1d4ed8", soft: "#eff6ff", border: "#bfdbfe", text: "#1d4ed8", shadow: "0 6px 18px rgba(37, 99, 235, 0.25)" },
+      dark: { accent: "#3b82f6", hover: "#2563eb", soft: "rgba(59, 130, 246, 0.14)", border: "rgba(59, 130, 246, 0.34)", text: "#93c5fd", shadow: "0 6px 18px rgba(37, 99, 235, 0.34)" },
+    },
+    emerald: {
+      light: { accent: "#059669", hover: "#047857", soft: "#ecfdf5", border: "#a7f3d0", text: "#047857", shadow: "0 6px 18px rgba(5, 150, 105, 0.25)" },
+      dark: { accent: "#10b981", hover: "#059669", soft: "rgba(16, 185, 129, 0.14)", border: "rgba(16, 185, 129, 0.34)", text: "#6ee7b7", shadow: "0 6px 18px rgba(16, 185, 129, 0.34)" },
+    },
+    violet: {
+      light: { accent: "#7c3aed", hover: "#6d28d9", soft: "#f5f3ff", border: "#ddd6fe", text: "#6d28d9", shadow: "0 6px 18px rgba(124, 58, 237, 0.25)" },
+      dark: { accent: "#8b5cf6", hover: "#7c3aed", soft: "rgba(139, 92, 246, 0.15)", border: "rgba(139, 92, 246, 0.36)", text: "#c4b5fd", shadow: "0 6px 18px rgba(139, 92, 246, 0.34)" },
+    },
+    amber: {
+      light: { accent: "#d97706", hover: "#b45309", soft: "#fffbeb", border: "#fde68a", text: "#b45309", shadow: "0 6px 18px rgba(217, 119, 6, 0.25)" },
+      dark: { accent: "#f59e0b", hover: "#d97706", soft: "rgba(245, 158, 11, 0.15)", border: "rgba(245, 158, 11, 0.36)", text: "#fcd34d", shadow: "0 6px 18px rgba(245, 158, 11, 0.34)" },
+    },
+    rose: {
+      light: { accent: "#e11d48", hover: "#be123c", soft: "#fff1f2", border: "#fecdd3", text: "#be123c", shadow: "0 6px 18px rgba(225, 29, 72, 0.25)" },
+      dark: { accent: "#f43f5e", hover: "#e11d48", soft: "rgba(244, 63, 94, 0.15)", border: "rgba(244, 63, 94, 0.36)", text: "#fda4af", shadow: "0 6px 18px rgba(244, 63, 94, 0.34)" },
+    },
+    graphite: {
+      light: { accent: "#3f3f46", hover: "#27272a", soft: "#f4f4f5", border: "#d4d4d8", text: "#27272a", shadow: "0 6px 18px rgba(39, 39, 42, 0.22)" },
+      dark: { accent: "#71717a", hover: "#52525b", soft: "rgba(161, 161, 170, 0.16)", border: "rgba(161, 161, 170, 0.35)", text: "#e4e4e7", shadow: "0 6px 18px rgba(0, 0, 0, 0.35)" },
+    },
   };
   const MAX_AUTO_RUN_ROUNDS = 5;
 
@@ -99,9 +126,10 @@
     notifiedJobId: null,
     promptDrawerTab: "history",
     aiAutoRun: false,
+    accentColor: "blue",
   };
 
-  // Offscreen exact-resolution mask canvas
+  // Offscreen exact-resolution (capped) mask canvas
   const maskDataCanvas = document.createElement("canvas");
   const maskDataCtx = maskDataCanvas.getContext("2d");
 
@@ -199,6 +227,36 @@
     }
   }
 
+  function apiPostJsonWithUploadProgress(url, payload, onUploadProgress = null) {
+    return new Promise((resolve, reject) => {
+      const bodyStr = JSON.stringify(payload);
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", url, true);
+      xhr.setRequestHeader("Content-Type", "application/json");
+      if (onUploadProgress && xhr.upload) {
+        xhr.upload.onprogress = (ev) => {
+          if (ev.lengthComputable && ev.total > 0) {
+            onUploadProgress(Math.min(1, ev.loaded / ev.total));
+          }
+        };
+      }
+      xhr.onload = () => {
+        let parsed = null;
+        try {
+          parsed = JSON.parse(xhr.responseText || "{}");
+        } catch (_) {}
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(parsed || {});
+        } else {
+          const detail = parsed?.detail || parsed?.message || `HTTP ${xhr.status}`;
+          reject(new Error(detail));
+        }
+      };
+      xhr.onerror = () => reject(new Error("网络连接失败，请检查服务是否在线"));
+      xhr.send(bodyStr);
+    });
+  }
+
   function loadImageObj(src) {
     return new Promise((resolve, reject) => {
       const img = new Image();
@@ -217,26 +275,101 @@
     });
   }
 
+  async function compressImageDataUrl(dataUrl, maxEdge = 1600, quality = 0.90) {
+    const img = await loadImageObj(dataUrl);
+    const maxDim = Math.max(img.width, img.height, 1);
+    const scale = Math.min(1, maxEdge / maxDim);
+    const w = Math.max(64, Math.round(img.width * scale));
+    const h = Math.max(64, Math.round(img.height * scale));
+
+    // Skip re-encoding if already small and compact
+    if (scale === 1 && dataUrl.length <= 450_000) {
+      return { dataUrl, img };
+    }
+
+    const cvs = document.createElement("canvas");
+    cvs.width = w;
+    cvs.height = h;
+    const ctx = cvs.getContext("2d");
+    ctx.drawImage(img, 0, 0, w, h);
+
+    // Check sampled alpha to preserve PNG only when genuine transparency exists
+    let hasAlpha = false;
+    try {
+      const sample = ctx.getImageData(0, 0, w, h).data;
+      const step = Math.max(4, Math.floor(sample.length / 4096) * 4);
+      for (let i = 3; i < sample.length; i += step) {
+        if (sample[i] < 250) {
+          hasAlpha = true;
+          break;
+        }
+      }
+    } catch (_) {}
+
+    const compressed = hasAlpha ? cvs.toDataURL("image/png") : cvs.toDataURL("image/jpeg", quality);
+    const finalUrl = (scale === 1 && compressed.length > dataUrl.length) ? dataUrl : compressed;
+    const finalImg = finalUrl === dataUrl ? img : await loadImageObj(finalUrl);
+    return { dataUrl: finalUrl, img: finalImg };
+  }
+
   // -------------------------------------------------------------------------
-  // Theme Toggle (Default: Soft Light Studio)
+  // Theme & Accent Color Settings (Moved from Header into Settings Tab)
   // -------------------------------------------------------------------------
+  function applyAccentColor(accentKey) {
+    const key = ACCENT_THEMES[accentKey] ? accentKey : "blue";
+    state.accentColor = key;
+    const mode = document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light";
+    const pal = ACCENT_THEMES[key][mode];
+    const root = document.documentElement.style;
+    root.setProperty("--accent", pal.accent);
+    root.setProperty("--accent-hover", pal.hover);
+    root.setProperty("--accent-soft", pal.soft);
+    root.setProperty("--accent-border", pal.border);
+    root.setProperty("--accent-text", pal.text);
+    root.setProperty("--shadow-fab", pal.shadow);
+
+    document.querySelectorAll("#accentColorSelector .accent-swatch").forEach((b) => {
+      b.classList.toggle("active", b.dataset.accent === key);
+    });
+    try {
+      localStorage.setItem(STORAGE_KEYS.accent, key);
+    } catch (_) {}
+  }
+
   function applyTheme(theme) {
     const t = theme === "dark" ? "dark" : "light";
     document.documentElement.setAttribute("data-theme", t);
     const meta = $("themeColorMeta");
     if (meta) meta.setAttribute("content", t === "dark" ? "#111214" : "#f5f5f7");
-    const icon = $("themeToggleIcon");
-    if (icon) {
-      icon.innerHTML = `<use href="${t === "dark" ? "#ic-sun" : "#ic-moon"}" />`;
-    }
+    document.querySelectorAll("#themeModeSelector .theme-mode-btn").forEach((b) => {
+      b.classList.toggle("active", b.dataset.themeChoice === t);
+    });
+    applyAccentColor(state.accentColor || "blue");
     try {
       localStorage.setItem(STORAGE_KEYS.theme, t);
     } catch (_) {}
   }
 
-  $("themeToggleBtn").addEventListener("click", () => {
-    const cur = document.documentElement.getAttribute("data-theme") || "light";
-    applyTheme(cur === "dark" ? "light" : "dark");
+  document.querySelectorAll("#themeModeSelector .theme-mode-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      applyTheme(btn.dataset.themeChoice);
+    });
+  });
+
+  document.querySelectorAll("#accentColorSelector .accent-swatch").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      applyAccentColor(btn.dataset.accent);
+    });
+  });
+
+  document.querySelectorAll("#settingsSubNav .subnav-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const target = btn.dataset.snav;
+      document.querySelectorAll("#settingsSubNav .subnav-btn").forEach((b) => b.classList.toggle("active", b === btn));
+      document.querySelectorAll(".settings-subpanel").forEach((p) => {
+        p.classList.toggle("active", p.id === `settings-panel-${target}`);
+      });
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -433,8 +566,11 @@
   // Navigation & Tabs (Desktop Top Nav + Mobile Bottom Nav Synced)
   // -------------------------------------------------------------------------
   function updateFabVisibility() {
-    const showFab = state.activeTab === "studio" || state.generating;
-    $("generateFabDock").classList.toggle("hidden", !showFab);
+    const isStudio = state.activeTab === "studio";
+    $("generateFabDock").classList.toggle("hidden", !isStudio);
+    if ($("headerGenStatusBtn")) {
+      $("headerGenStatusBtn").classList.toggle("hidden", isStudio || !state.generating);
+    }
   }
 
   function switchTab(tabName) {
@@ -456,6 +592,9 @@
     btn.addEventListener("click", () => switchTab(btn.dataset.tab));
   });
   $("brandStatusTrigger").addEventListener("click", () => switchTab("monitor"));
+  if ($("headerGenStatusBtn")) {
+    $("headerGenStatusBtn").addEventListener("click", () => switchTab("studio"));
+  }
   $("headerAiBtn").addEventListener("click", () => {
     openAiModal(state.activeTab === "terminal" ? "terminal" : "studio");
   });
@@ -494,7 +633,7 @@
       else if (mode === "inpaint") denoiseSlider.value = "0.85";
       $("denoiseVal").textContent = Number(denoiseSlider.value).toFixed(2);
     }
-    $("denoiseBlock").style.opacity = mode === "t2i" ? "0.52" : "1";
+    $("denoiseBlock").classList.toggle("hidden", mode === "t2i");
 
     refreshImageStage();
     if (!skipDenoiseReset) scheduleSaveStudioPrefs();
@@ -561,6 +700,9 @@
     btn.addEventListener("click", () => {
       state.ratio = btn.dataset.ratio;
       updateRatioChipUI();
+      if (state.ratio === "custom" && $("manualResDetails")) {
+        $("manualResDetails").open = true;
+      }
       syncPresetResolution();
     });
   });
@@ -782,10 +924,10 @@
       showToast("局部重绘最多支持 10 张图片");
       return;
     }
-    const img = await loadImageObj(dataUrl);
+    const { dataUrl: optUrl, img } = await compressImageDataUrl(dataUrl, 1920, 0.91);
     state.inpaintItems.push({
       id: `${Date.now()}_${Math.random().toString(16).slice(2, 7)}`,
-      b64: dataUrl,
+      b64: optUrl,
       width: img.width,
       height: img.height,
       maskB64: null,
@@ -793,7 +935,7 @@
       hasMask: false,
     });
     if (state.inpaintItems.length === 1) {
-      state.initImageB64 = dataUrl;
+      state.initImageB64 = optUrl;
       state.initImageObj = img;
       state.ratio = "original";
       updateRatioChipUI();
@@ -810,8 +952,8 @@
       await addInpaintImageFromDataUrl(dataUrl);
       return;
     }
-    const img = await loadImageObj(dataUrl);
-    state.initImageB64 = dataUrl;
+    const { dataUrl: optUrl, img } = await compressImageDataUrl(dataUrl, 1920, 0.91);
+    state.initImageB64 = optUrl;
     state.initImageObj = img;
     state.undoStack = [];
     resetMaskCanvas();
@@ -829,8 +971,8 @@
       showToast("最多支持 9 张次图 (@1~@9)");
       return state.extraRefImages.length;
     }
-    const img = await loadImageObj(dataUrl);
-    state.extraRefImages.push({ b64: dataUrl, width: img.width, height: img.height });
+    const { dataUrl: optUrl, img } = await compressImageDataUrl(dataUrl, 1400, 0.88);
+    state.extraRefImages.push({ b64: optUrl, width: img.width, height: img.height });
     renderExtraRefs();
     return state.extraRefImages.length;
   }
@@ -1011,15 +1153,18 @@
     bgCtx.clearRect(0, 0, dispW, dispH);
     bgCtx.drawImage(img, 0, 0, dispW, dispH);
 
-    maskDataCanvas.width = img.width;
-    maskDataCanvas.height = img.height;
+    const maskScale = Math.min(1, 1280 / Math.max(img.width, img.height, 1));
+    const mw = Math.max(64, Math.round(img.width * maskScale));
+    const mh = Math.max(64, Math.round(img.height * maskScale));
+    maskDataCanvas.width = mw;
+    maskDataCanvas.height = mh;
     maskDataCtx.fillStyle = "#000000";
-    maskDataCtx.fillRect(0, 0, img.width, img.height);
+    maskDataCtx.fillRect(0, 0, mw, mh);
     ovCtx.clearRect(0, 0, dispW, dispH);
 
     if (existingMaskB64) {
       loadImageObj(existingMaskB64).then((mImg) => {
-        maskDataCtx.drawImage(mImg, 0, 0, img.width, img.height);
+        maskDataCtx.drawImage(mImg, 0, 0, mw, mh);
         syncOverlayFromMaskData();
       }).catch(() => {});
     }
@@ -1262,16 +1407,25 @@
     state.generating = active;
     $("generateBtn").disabled = active;
     $("generateBtn").innerHTML = active
-      ? '<svg class="icon icon-spin"><use href="#ic-loader" /></svg><span>生成中...</span>'
-      : '<svg class="icon"><use href="#ic-play" /></svg><span>开始生成</span><kbd class="fab-kbd">Ctrl+↵</kbd>';
+      ? '<svg class="icon icon-spin"><use href="#ic-loader" /></svg><span>生成中</span>'
+      : '<svg class="icon"><use href="#ic-play" /></svg><span>生成</span>';
     $("cancelGenBtn").classList.toggle("hidden", !active);
     $("cancelGenBtn").disabled = false;
     $("cancelGenBtn").innerHTML = '<svg class="icon"><use href="#ic-stop" /></svg><span>停止</span>';
     $("progressWrap").classList.toggle("hidden", !active);
+    if ($("headerGenStatusText")) {
+      $("headerGenStatusText").textContent = active ? "生成中" : "";
+    }
     if (!active) {
       $("progressBarFill").style.width = "0%";
     }
     updateFabVisibility();
+  }
+
+  function formatShortToastError(msg) {
+    const raw = String(msg || "未知错误").trim();
+    if (/out of memory/i.test(raw)) return "生成失败: CUDA 显存不足，详情见诊断提示";
+    return raw.length > 72 ? `生成失败: ${raw.slice(0, 70)}...` : `生成失败: ${raw}`;
   }
 
   function showGenErrorBanner(errMsg) {
@@ -1298,10 +1452,18 @@
       ref_images_b64: (payload.ref_images_b64 || []).length,
     };
 
-    const resp = await apiFetch("/api/generate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+    const resp = await apiPostJsonWithUploadProgress("/api/generate", payload, (ratio) => {
+      const pct = Math.round(ratio * 100);
+      if (pct > 0 && pct < 100) {
+        $("progressMsg").textContent = "上传图片与参数...";
+        $("progressPct").textContent = `${pct}%`;
+        $("progressBarFill").classList.remove("indeterminate");
+        $("progressBarFill").style.width = `${pct}%`;
+      } else if (pct >= 100) {
+        $("progressMsg").textContent = "已提交，等待排队...";
+        $("progressPct").textContent = "准备中";
+        $("progressBarFill").classList.add("indeterminate");
+      }
     });
     state.activeJobId = resp.job_id;
     return await waitJobCompletion(resp.job_id, appendResults, accumulatedResults, totalElapsedAcc);
@@ -1315,6 +1477,9 @@
       const showIndeterminate = isQueued || (job.status === "loading_model" && pct <= 2);
       $("progressMsg").textContent = job.message || "生成中...";
       $("progressPct").textContent = showIndeterminate ? "准备中" : `${pct}%`;
+      if ($("headerGenStatusText")) {
+        $("headerGenStatusText").textContent = showIndeterminate ? "准备中" : `${pct}%`;
+      }
       $("progressBarFill").classList.toggle("indeterminate", showIndeterminate);
       if (!showIndeterminate) {
         $("progressBarFill").style.width = `${pct}%`;
@@ -1430,7 +1595,7 @@
       } catch (err) {
         setGeneratingUI(false);
         showGenErrorBanner(err.message);
-        showToast(`生成失败: ${err.message}`, 6000);
+        showToast(formatShortToastError(err.message), 4200);
       }
       return;
     }
@@ -1484,7 +1649,7 @@
     } catch (err) {
       setGeneratingUI(false);
       showGenErrorBanner(err.message);
-      showToast(`生成失败: ${err.message}`, 6000);
+      showToast(formatShortToastError(err.message), 4200);
     }
   }
 
@@ -1571,6 +1736,9 @@
     const grid = $("galleryGrid");
     grid.innerHTML = "";
     $("galleryEmptyState").classList.toggle("hidden", state.galleryItems.length > 0);
+    if ($("galleryCompareBtn")) {
+      $("galleryCompareBtn").classList.toggle("hidden", !state.gallerySelecting || state.selectedIds.size !== 2);
+    }
 
     state.galleryItems.forEach((item) => {
       const card = document.createElement("div");
@@ -1616,6 +1784,30 @@
     setTopBusy(true);
     loadGallery().finally(() => setTopBusy(false));
   });
+
+  async function saveGalleryToGdrive(ids = []) {
+    try {
+      const res = await apiFetch(
+        "/api/gallery/save-gdrive",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ids }),
+        },
+        true
+      );
+      showToast(res.message || `已保存 ${res.saved_count} 张作品到 Google 云盘`, 4000);
+    } catch (err) {
+      showToast(`保存到云盘失败: ${err.message}`, 4500);
+    }
+  }
+
+  if ($("gallerySaveGdriveBtn")) {
+    $("gallerySaveGdriveBtn").addEventListener("click", () => {
+      const ids = state.gallerySelecting && state.selectedIds.size ? Array.from(state.selectedIds) : [];
+      saveGalleryToGdrive(ids);
+    });
+  }
 
   $("galleryExportBtn").addEventListener("click", async () => {
     const ids = state.selectedIds.size ? `?ids=${Array.from(state.selectedIds).join(",")}` : "";
@@ -1687,6 +1879,17 @@
     renderGallery();
   });
 
+  if ($("galleryCompareBtn")) {
+    $("galleryCompareBtn").addEventListener("click", () => {
+      const ids = Array.from(state.selectedIds);
+      if (ids.length !== 2) return showToast("请先勾选 2 张图片进行对比");
+      const itemA = state.galleryItems.find((x) => x.id === ids[0]);
+      const itemB = state.galleryItems.find((x) => x.id === ids[1]);
+      if (!itemA || !itemB) return;
+      openPairCompareLightbox(itemA, itemB);
+    });
+  }
+
   $("galleryBatchDeleteBtn").addEventListener("click", async () => {
     const ids = Array.from(state.selectedIds);
     if (!ids.length) return showToast("请先勾选要删除的图片");
@@ -1706,17 +1909,18 @@
   });
 
   // -------------------------------------------------------------------------
-  // Lightbox Modal + Before/After Comparison Slider + Copy Prompt/Params
+  // Lightbox Modal + Before/After & Pair Comparison Slider + Google Drive
   // -------------------------------------------------------------------------
   function setComparePosition(pct) {
-    const clamped = Math.max(0, Math.min(100, Number(pct) || 50));
-    $("compareBeforeClip").style.clipPath = `inset(0 ${100 - clamped}% 0 0)`;
-    $("compareDivider").style.left = `${clamped}%`;
-    $("compareRangeInput").value = String(clamped);
+    const clamped = Math.max(0, Math.min(100, Number(pct)));
+    const safePct = Number.isFinite(clamped) ? clamped : 50;
+    $("compareBeforeClip").style.clipPath = `inset(0 ${100 - safePct}% 0 0)`;
+    $("compareDivider").style.left = `${safePct}%`;
+    $("compareRangeInput").value = String(Math.round(safePct));
   }
 
   function setLightboxView(viewMode) {
-    const canCompare = Boolean(state.lightboxItem && state.lightboxItem.source_url);
+    const canCompare = Boolean(state.lightboxItem && (state.lightboxItem.source_url || state.lightboxItem._pairCompare));
     const useCompare = viewMode === "compare" && canCompare;
     $("lbSingleView").classList.toggle("hidden", useCompare);
     $("lbCompareView").classList.toggle("hidden", !useCompare);
@@ -1735,6 +1939,8 @@
 
     const hasSource = Boolean(item.source_url);
     $("lbViewToggle").classList.toggle("hidden", !hasSource);
+    if ($("compareLeftLabel")) $("compareLeftLabel").textContent = "原图";
+    if ($("compareRightLabel")) $("compareRightLabel").textContent = "生成图";
     if (hasSource) {
       $("compareBeforeImg").src = item.source_url;
       $("compareAfterImg").src = item.url;
@@ -1751,6 +1957,25 @@
     $("lightboxModal").classList.remove("hidden");
   }
 
+  function openPairCompareLightbox(itemA, itemB) {
+    state.lightboxItem = { ...itemB, _pairCompare: true };
+    $("lightboxTitle").textContent = `双图对比 · ${itemA.width}×${itemA.height} vs ${itemB.width}×${itemB.height}`;
+    $("lightboxImg").src = itemB.url;
+    $("lbDownloadBtn").href = itemB.url;
+    $("lbDownloadBtn").download = itemB.filename;
+    $("lbViewToggle").classList.remove("hidden");
+    if ($("compareLeftLabel")) $("compareLeftLabel").textContent = `图 A (${MODE_LABELS[itemA.mode] || itemA.mode})`;
+    if ($("compareRightLabel")) $("compareRightLabel").textContent = `图 B (${MODE_LABELS[itemB.mode] || itemB.mode})`;
+    $("compareBeforeImg").src = itemA.url;
+    $("compareAfterImg").src = itemB.url;
+    setLightboxView("compare");
+    $("lightboxMeta").innerHTML = `
+      <div><strong>图 A:</strong> ${escapeHtml(itemA.prompt)} (Seed <code>${itemA.seed}</code>)</div>
+      <div style="margin-top:3px"><strong>图 B:</strong> ${escapeHtml(itemB.prompt)} (Seed <code>${itemB.seed}</code>)</div>
+    `;
+    $("lightboxModal").classList.remove("hidden");
+  }
+
   function closeLightbox() {
     $("lightboxModal").classList.add("hidden");
     state.lightboxItem = null;
@@ -1760,8 +1985,43 @@
     btn.addEventListener("click", () => setLightboxView(btn.dataset.lbview));
   });
   $("compareRangeInput").addEventListener("input", (e) => setComparePosition(e.target.value));
+  $("compareRangeInput").addEventListener("change", (e) => setComparePosition(e.target.value));
+
+  // Direct pointer/touch drag on comparison frame for reliable mobile & desktop scrubbing
+  (function bindCompareFrameDrag() {
+    const frame = $("compareFrame");
+    if (!frame) return;
+    let dragging = false;
+    const updateFromClientX = (clientX) => {
+      const rect = frame.getBoundingClientRect();
+      if (!rect.width) return;
+      const pct = ((clientX - rect.left) / rect.width) * 100;
+      setComparePosition(pct);
+    };
+    frame.addEventListener("pointerdown", (e) => {
+      dragging = true;
+      try { frame.setPointerCapture(e.pointerId); } catch (_) {}
+      updateFromClientX(e.clientX);
+    });
+    frame.addEventListener("pointermove", (e) => {
+      if (!dragging) return;
+      e.preventDefault();
+      updateFromClientX(e.clientX);
+    });
+    const stopDrag = () => { dragging = false; };
+    frame.addEventListener("pointerup", stopDrag);
+    frame.addEventListener("pointercancel", stopDrag);
+  })();
+
   $("lightboxCloseBtn").addEventListener("click", closeLightbox);
   $("lightboxBackdrop").addEventListener("click", closeLightbox);
+
+  if ($("lbSaveGdriveBtn")) {
+    $("lbSaveGdriveBtn").addEventListener("click", () => {
+      if (!state.lightboxItem) return;
+      saveGalleryToGdrive([state.lightboxItem.id]);
+    });
+  }
 
   $("lbCopyPromptBtn").addEventListener("click", () => {
     if (!state.lightboxItem) return;
@@ -2016,6 +2276,11 @@
       if (s.models) renderMonitorModels(s.models);
       if (s.ai && $("aiModelBadge")) {
         $("aiModelBadge").textContent = s.ai.model || "qwen3.8-27b";
+      }
+      if (s.gdrive && $("galleryGdriveHint")) {
+        $("galleryGdriveHint").textContent = s.gdrive.mounted
+          ? `Google 云盘已挂载：${s.gdrive.target_dir}（可勾选作品或点击「保存云盘」备份）`
+          : "未检测到 Google 云盘挂载（可在 Colab 启动器勾选 MOUNT_GDRIVE 后点击「保存云盘」备份）";
       }
     } catch (_) {
       $("engineStatusText").textContent = "连接已断开";
@@ -2553,7 +2818,8 @@
   $("loraCtrlFileInput").addEventListener("change", async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const dataUrl = await readFileAsDataUrl(file);
+    const rawUrl = await readFileAsDataUrl(file);
+    const dataUrl = await compressImageDataUrl(rawUrl, 1400, 0.88);
     state.loraControlB64 = dataUrl;
     $("loraCtrlPreviewImg").src = dataUrl;
     $("loraCtrlPlaceholder").classList.add("hidden");
@@ -3275,6 +3541,12 @@
   // Init
   // -------------------------------------------------------------------------
   async function init() {
+    const savedAccent = (() => {
+      try { return localStorage.getItem(STORAGE_KEYS.accent); } catch (_) { return null; }
+    })();
+    if (savedAccent && ACCENT_THEMES[savedAccent]) {
+      state.accentColor = savedAccent;
+    }
     const savedTheme = (() => {
       try { return localStorage.getItem(STORAGE_KEYS.theme); } catch (_) { return null; }
     })();

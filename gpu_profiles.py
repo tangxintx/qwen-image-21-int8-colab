@@ -98,7 +98,7 @@ GPU_PROFILES: dict[str, GPUProfile] = {
         allow_tf32=True,
         recommended_tier="1.5k",
         recommended_batch=2,
-        notes="24GB + 53GB 内存推荐 FP8 DiT + INT8 编码器 + BF16 VAE，智能分阶段卸载峰值约 11-13GB",
+        notes="24GB + 53GB 内存支持 GGUF Q8 / FP8 / INT8，自动启用智能分阶段逐层卸载与切片以防爆显存",
     ),
     "t4_turing": GPUProfile(
         key="t4_turing",

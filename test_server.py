@@ -191,6 +191,31 @@ def _run_http_tests() -> None:
     _assert_gguf_and_comfy_extensions()
     _assert_new_pm_features_and_fixes()
 
+    # Verify Google Drive endpoints via HTTP TestClient (unmounted -> 400, mounted -> copies files)
+    from pathlib import Path
+    old_gdrive_env = os.environ.pop("QWEN_GDRIVE_DIR", None)
+    try:
+        gd_off = client.get("/api/gdrive/status").json()
+        assert gd_off["mounted"] is False
+        assert client.post("/api/gallery/save-gdrive", json={"ids": []}).status_code == 400
+
+        gdrive_tmp = Path(tempfile.mkdtemp(prefix="qwen_test_gdrive_http_"))
+        os.environ["QWEN_GDRIVE_DIR"] = str(gdrive_tmp)
+        gd_on = client.get("/api/gdrive/status").json()
+        assert gd_on["mounted"] is True and gd_on["target_dir"] == str(gdrive_tmp)
+
+        save_res = client.post("/api/gallery/save-gdrive", json={"ids": []})
+        assert save_res.status_code == 200, save_res.text
+        save_data = save_res.json()
+        assert save_data["ok"] is True and save_data["saved_count"] >= 1
+        assert (gdrive_tmp / "gallery_metadata.json").exists()
+        assert len(list(gdrive_tmp.glob("*.png"))) == save_data["saved_count"]
+    finally:
+        if old_gdrive_env is not None:
+            os.environ["QWEN_GDRIVE_DIR"] = old_gdrive_env
+        else:
+            os.environ.pop("QWEN_GDRIVE_DIR", None)
+
 
 def _run_direct_inprocess_tests() -> None:
     """Run identical endpoint & engine checks without asyncio socketpair when blocked by sandbox."""
@@ -589,6 +614,29 @@ def _assert_new_pm_features_and_fixes() -> None:
     assert "FORCE_REINSTALL" in nb_src
     assert "AI_ENDPOINT" in nb_src
 
+    # 6) Default Quantized Q8 preset, Colab Google Drive mount options, & streamlined UI/CSS
+    assert server.DEFAULT_MODEL_ID == "abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8"
+    assert server.DEFAULT_QUANT_MODE == "gguf-q8-full"
+    assert 'EDITION = "Uncensored GGUF Q8' in nb_src
+    assert "MOUNT_GDRIVE" in nb_src
+    assert "GDRIVE_DIR" in nb_src
+    assert "GDRIVE_DIRECT_OUTPUT" in nb_src
+
+    index_html = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    styles_css = (server.STATIC_DIR / "styles.css").read_text(encoding="utf-8")
+    assert "brand-logo" not in index_html
+    assert "themeToggleBtn" not in index_html
+    for req_token in (
+        "mode-tabs-sticky",
+        "settingsSubNav",
+        "accentColorSelector",
+        "gallerySaveGdriveBtn",
+        "lbSaveGdriveBtn",
+        "galleryCompareBtn",
+    ):
+        assert req_token in index_html, f"Missing expected UI token: {req_token}"
+    assert 'input[type="range"].compare-range' in styles_css
+
 
 def _assert_profiles_and_modes(update_fn) -> None:
     assert server.resolve_multi_image_prompt("把 @1，2 放进 @0", 3) == "把 图2、图3 放进 图1"
@@ -611,6 +659,8 @@ def _assert_profiles_and_modes(update_fn) -> None:
     ]:
         eng = update_fn(
             {
+                "model_id": "Qwen/Qwen-Image-2.1-Turbo",
+                "quant_mode": "int8",
                 "gpu_profile_override": profile_key,
                 "dtype_mode": "auto",
                 "offload_mode": "auto",

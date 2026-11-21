@@ -180,8 +180,8 @@ OUTPUT_DIR = Path(os.environ.get("QWEN_OUTPUT_DIR", str(BASE_DIR / "outputs"))).
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 GALLERY_INDEX_PATH = OUTPUT_DIR / "gallery.json"
 
-DEFAULT_MODEL_ID = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen-Image-2.1-Turbo")
-DEFAULT_QUANT_MODE = os.environ.get("QWEN_QUANT_MODE", "int8-torchao")
+DEFAULT_MODEL_ID = os.environ.get("QWEN_MODEL_ID", "abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8")
+DEFAULT_QUANT_MODE = os.environ.get("QWEN_QUANT_MODE", "gguf-q8-full")
 DEMO_MODE = os.environ.get("DEMO_MODE", "0").strip().lower() in {"1", "true", "yes"}
 PORT = int(os.environ.get("PORT", "7860"))
 
@@ -192,6 +192,20 @@ DEFAULT_AI_AUTO_RUN = os.environ.get("QWEN_AI_AUTO_RUN", "0").strip().lower() in
 AI_CONFIG_PATH = BASE_DIR / ".ai_config.json"
 
 MODEL_PRESETS = {
+    "abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8": {
+        "label": "Qwen-Image-2.1-Turbo-Quantized Q8 满血版 (BF16 编码器 + BF16 VAE)",
+        "default_steps": 8,
+        "default_cfg": 1.0,
+        "quant_mode": "gguf-q8-full",
+        "description": "默认推荐：Q8_0 扩散权重 + 全精度 BF16 文本编码器与 BF16 VAE（L4 自动逐层调度防 OOM）",
+    },
+    "abenzerps/Qwen-Image-2.1-Turbo-Quantized:q4": {
+        "label": "Qwen-Image-2.1-Turbo-Quantized Q4 轻量版 (Qwen3-VL-8B Q4_K_M + BF16 VAE)",
+        "default_steps": 8,
+        "default_cfg": 1.0,
+        "quant_mode": "gguf-q4",
+        "description": "Q4_K_M 扩散权重 + Qwen3-VL-8B Q4_K_M 文本编码器，T4/L4 显存最省",
+    },
     "Qwen/Qwen-Image-2.1-Turbo": {
         "label": "Qwen-Image-2.1-Turbo (INT8 极速版)",
         "default_steps": 8,
@@ -851,7 +865,11 @@ class QwenImage21Engine:
                     snaps_dir = entry / "snapshots"
                     if snaps_dir.exists() and any(snaps_dir.iterdir()):
                         repo_id = entry.name[len("models--") :].replace("--", "/", 1)
-                        if repo_id == cur_base or repo_id == GGUF_REDIRECTED_REPO and cur_base == GGUF_BASE_REPO:
+                        if (
+                            repo_id == cur_base
+                            or (repo_id == GGUF_REDIRECTED_REPO and cur_base == GGUF_BASE_REPO)
+                            or (repo_id == GGUF_BASE_REPO and cur_base == GGUF_REDIRECTED_REPO)
+                        ):
                             return self.model_id
                         size_b = get_dir_size_bytes(entry)
                         ready_repos.append((repo_id in MODEL_PRESETS, size_b, repo_id))
@@ -1309,24 +1327,70 @@ class QwenImage21Engine:
                         else:
                             raise
 
+                def _estimate_mod_bytes(mod: Any) -> int:
+                    if mod is None:
+                        return 0
+                    total_b = 0
+                    try:
+                        for p in mod.parameters():
+                            total_b += p.numel() * p.element_size()
+                        for b in mod.buffers():
+                            total_b += b.numel() * b.element_size()
+                    except Exception:
+                        pass
+                    return total_b
+
+                transformer_bytes = _estimate_mod_bytes(getattr(pipe, "transformer", None))
+                total_vram_bytes = 0
+                if torch.cuda.is_available():
+                    try:
+                        total_vram_bytes = int(torch.cuda.get_device_properties(0).total_memory)
+                    except Exception:
+                        total_vram_bytes = int(profile.vram_gb * (1024**3))
+                if total_vram_bytes <= 0:
+                    total_vram_bytes = int(profile.vram_gb * (1024**3))
+
+                needs_tight_vram = (
+                    (total_vram_bytes <= 26 * (1024**3) and (gguf_variant == "q8" or self.quant_mode != "gguf-q4"))
+                    or (transformer_bytes > int(total_vram_bytes * 0.62))
+                )
+
                 if hasattr(pipe, "vae"):
-                    if eff["vae_tiling"] and hasattr(pipe.vae, "enable_tiling"):
+                    if (eff["vae_tiling"] or needs_tight_vram) and hasattr(pipe.vae, "enable_tiling"):
                         pipe.vae.enable_tiling()
-                    if eff["vae_slicing"] and hasattr(pipe.vae, "enable_slicing"):
+                    if (eff["vae_slicing"] or needs_tight_vram) and hasattr(pipe.vae, "enable_slicing"):
                         pipe.vae.enable_slicing()
 
-                if eff["attention_slicing"] and hasattr(pipe, "enable_attention_slicing"):
+                if (eff["attention_slicing"] or needs_tight_vram) and hasattr(pipe, "enable_attention_slicing"):
                     pipe.enable_attention_slicing("auto")
 
                 if eff["offload_mode"] == "sequential_cpu_offload":
                     pipe.enable_sequential_cpu_offload()
                     self.device = "cuda (sequential_offload)"
                 elif eff["offload_mode"] == "smart_stage_offload":
-                    pipe.enable_model_cpu_offload()
-                    self.device = "cuda (smart_stage_offload)"
+                    if needs_tight_vram:
+                        logger.info(
+                            "Smart stage offload detected tight VRAM (DiT=%.2f GB / VRAM=%.2f GB); activating sequential layer offload to prevent OOM.",
+                            transformer_bytes / (1024**3),
+                            total_vram_bytes / (1024**3),
+                        )
+                        pipe.enable_sequential_cpu_offload()
+                        self.device = "cuda (smart_stage_offload · sequential)"
+                    else:
+                        pipe.enable_model_cpu_offload()
+                        self.device = "cuda (smart_stage_offload)"
                 elif eff["offload_mode"] == "model_cpu_offload":
-                    pipe.enable_model_cpu_offload()
-                    self.device = "cuda (model_offload)"
+                    if transformer_bytes > int(total_vram_bytes * 0.78):
+                        logger.warning(
+                            "Transformer (%.2f GB) exceeds 78%% of VRAM (%.2f GB); upgrading model_cpu_offload to sequential_cpu_offload.",
+                            transformer_bytes / (1024**3),
+                            total_vram_bytes / (1024**3),
+                        )
+                        pipe.enable_sequential_cpu_offload()
+                        self.device = "cuda (sequential_offload)"
+                    else:
+                        pipe.enable_model_cpu_offload()
+                        self.device = "cuda (model_offload)"
                 else:
                     pipe = pipe.to("cuda")
                     self.device = "cuda (full)"
@@ -1834,22 +1898,44 @@ class QwenImage21Engine:
                         if hasattr(blk, "register_forward_pre_hook"):
                             hook_handles.append(blk.register_forward_pre_hook(_abort_pre_hook))
 
-                if is_smart_stage and torch.cuda.is_available():
+                if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
+                def _run_pipe_with_rgba_fallback() -> Any:
+                    try:
+                        return self.pipe(**call_kwargs)
+                    except Exception as pipe_exc:
+                        if ref_image is not None and ref_image.mode == "RGBA" and not job.cancel_event.is_set():
+                            err_s = str(pipe_exc).lower()
+                            if any(k in err_s for k in ("channel", "rgba", "shape", "size", "mode", "rgb", "mismatch")):
+                                logger.warning("Pipeline rejected RGBA canvas (%s); falling back to RGB canvas.", pipe_exc)
+                                rgb_ref = ref_image.convert("RGB")
+                                call_kwargs["image"] = [rgb_ref, *prepared_extras] if prepared_extras else rgb_ref
+                                return self.pipe(**call_kwargs)
+                        raise
+
                 try:
-                    out = self.pipe(**call_kwargs)
-                except Exception as pipe_exc:
-                    # If pipeline rejects RGBA 4-channel transparent canvas, retry cleanly with RGB
-                    if ref_image is not None and ref_image.mode == "RGBA" and not job.cancel_event.is_set():
-                        err_s = str(pipe_exc).lower()
-                        if any(k in err_s for k in ("channel", "rgba", "shape", "size", "mode", "rgb", "mismatch")):
-                            logger.warning("Pipeline rejected RGBA canvas (%s); falling back to RGB canvas.", pipe_exc)
-                            rgb_ref = ref_image.convert("RGB")
-                            call_kwargs["image"] = [rgb_ref, *prepared_extras] if prepared_extras else rgb_ref
-                            out = self.pipe(**call_kwargs)
-                        else:
-                            raise
+                    out = _run_pipe_with_rgba_fallback()
+                except Exception as oom_exc:
+                    err_low = str(oom_exc).lower()
+                    is_oom = ("out of memory" in err_low or "cuda error: out of memory" in err_low)
+                    if is_oom and not job.cancel_event.is_set() and "sequential" not in self.device:
+                        logger.warning("CUDA OOM detected (%s); switching pipeline to sequential_cpu_offload and retrying once.", oom_exc)
+                        job.notice = "检测到显存不足，已自动切换至逐层显存调度模式并重试..."
+                        if hasattr(self.pipe, "vae"):
+                            if hasattr(self.pipe.vae, "enable_tiling"):
+                                self.pipe.vae.enable_tiling()
+                            if hasattr(self.pipe.vae, "enable_slicing"):
+                                self.pipe.vae.enable_slicing()
+                        if hasattr(self.pipe, "enable_attention_slicing"):
+                            self.pipe.enable_attention_slicing("auto")
+                        trim_host_memory()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        if hasattr(self.pipe, "enable_sequential_cpu_offload"):
+                            self.pipe.enable_sequential_cpu_offload()
+                            self.device = "cuda (auto_sequential_fallback)"
+                        out = _run_pipe_with_rgba_fallback()
                     else:
                         raise
             finally:
@@ -2005,7 +2091,32 @@ class ComfyLaunchRequest(BaseModel):
     gguf_variant: Literal["q8", "q4", "both", "none"] = "q4"
 
 
-def collect_models_inventory() -> dict[str, Any]:
+class SaveGDriveRequest(BaseModel):
+    ids: list[str] = Field(default_factory=list)
+
+
+_hf_inventory_lock = threading.Lock()
+_hf_inventory_cache: tuple[float, list[dict[str, Any]]] = (0.0, [])
+
+
+def get_gdrive_status() -> dict[str, Any]:
+    """Check whether Google Drive is mounted (via Colab or QWEN_GDRIVE_DIR)."""
+    env_dir = os.environ.get("QWEN_GDRIVE_DIR", "").strip()
+    target_dir = Path(env_dir) if env_dir else Path("/content/drive/MyDrive/qwen_image_21_outputs")
+    mounted = bool(env_dir) or Path("/content/drive/MyDrive").exists()
+    direct_output = False
+    try:
+        direct_output = mounted and (OUTPUT_DIR.resolve() == target_dir.resolve())
+    except OSError:
+        pass
+    return {
+        "mounted": mounted,
+        "target_dir": str(target_dir),
+        "direct_output": direct_output,
+    }
+
+
+def collect_models_inventory(force_refresh: bool = False) -> dict[str, Any]:
     """Collect currently loaded pipeline/LoRA and downloaded HF / LoRA models on disk."""
     hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
     hub_dir = Path(os.environ.get("HF_HUB_CACHE", str(hf_home / "hub")))
@@ -2014,29 +2125,45 @@ def collect_models_inventory() -> dict[str, Any]:
     cur_aliases = {cur_base_repo.lower()}
     if cur_base_repo.lower() == GGUF_BASE_REPO.lower():
         cur_aliases.add(GGUF_REDIRECTED_REPO.lower())
+    elif cur_base_repo.lower() == GGUF_REDIRECTED_REPO.lower():
+        cur_aliases.add(GGUF_BASE_REPO.lower())
+
+    now_ts = time.time()
+    with _hf_inventory_lock:
+        if force_refresh or (now_ts - _hf_inventory_cache[0] > 15.0):
+            raw_hf: list[dict[str, Any]] = []
+            if hub_dir.exists():
+                try:
+                    for entry in hub_dir.iterdir():
+                        if entry.is_dir() and entry.name.startswith("models--"):
+                            repo_id = entry.name[len("models--") :].replace("--", "/", 1)
+                            snaps_dir = entry / "snapshots"
+                            has_snapshot = snaps_dir.exists() and any(snaps_dir.iterdir())
+                            size_b = get_dir_size_bytes(entry)
+                            raw_hf.append(
+                                {
+                                    "repo_id": repo_id,
+                                    "size_gb": round(size_b / (1024**3), 2),
+                                    "size_mb": round(size_b / (1024**2), 1),
+                                    "ready": has_snapshot,
+                                }
+                            )
+                except OSError:
+                    pass
+            globals()["_hf_inventory_cache"] = (now_ts, raw_hf)
+        else:
+            raw_hf = _hf_inventory_cache[1]
 
     downloaded_hf: list[dict[str, Any]] = []
-    if hub_dir.exists():
-        try:
-            for entry in hub_dir.iterdir():
-                if entry.is_dir() and entry.name.startswith("models--"):
-                    repo_id = entry.name[len("models--") :].replace("--", "/", 1)
-                    snaps_dir = entry / "snapshots"
-                    has_snapshot = snaps_dir.exists() and any(snaps_dir.iterdir())
-                    size_b = get_dir_size_bytes(entry)
-                    is_cur = repo_id.lower() in cur_aliases
-                    downloaded_hf.append(
-                        {
-                            "repo_id": repo_id,
-                            "size_gb": round(size_b / (1024**3), 2),
-                            "size_mb": round(size_b / (1024**2), 1),
-                            "ready": has_snapshot,
-                            "is_current": is_cur,
-                            "is_loaded": engine.loaded and is_cur,
-                        }
-                    )
-        except OSError:
-            pass
+    for item in raw_hf:
+        is_cur = item["repo_id"].lower() in cur_aliases
+        downloaded_hf.append(
+            {
+                **item,
+                "is_current": is_cur,
+                "is_loaded": engine.loaded and is_cur,
+            }
+        )
     downloaded_hf.sort(key=lambda x: (not x["is_current"], -x["size_gb"], x["repo_id"]))
 
     active_lora_name = Path(engine._active_lora_path).name if engine._active_lora_path else None
@@ -2134,6 +2261,7 @@ def collect_system_stats() -> dict[str, Any]:
             "hf_cache_gb": round(hf_cache_bytes / (1024**3), 2),
             "output_dir": str(OUTPUT_DIR),
         },
+        "gdrive": get_gdrive_status(),
         "gpu": gpu_info,
         "models": collect_models_inventory(),
         "ai": {
@@ -2719,6 +2847,68 @@ def api_export_gallery(ids: Optional[str] = Query(default=None)) -> StreamingRes
     )
 
 
+@app.get("/api/gdrive/status")
+def api_gdrive_status() -> dict[str, Any]:
+    return get_gdrive_status()
+
+
+@app.post("/api/gallery/save-gdrive")
+def api_save_gallery_to_gdrive(req: Optional[SaveGDriveRequest] = None) -> dict[str, Any]:
+    """Copy selected (or all) gallery images and metadata to mounted Google Drive."""
+    status = get_gdrive_status()
+    if not status["mounted"]:
+        raise HTTPException(
+            status_code=400,
+            detail="尚未挂载 Google 云盘。请在 Colab 启动器第 2 步勾选 MOUNT_GDRIVE 后重新运行启动。",
+        )
+
+    target_dir = Path(status["target_dir"])
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    target_ids = set(req.ids) if (req and req.ids) else None
+    listing = gallery.list_items(limit=500)["items"]
+    if target_ids:
+        listing = [x for x in listing if x["id"] in target_ids]
+
+    if not listing:
+        raise HTTPException(status_code=400, detail="没有可保存的作品")
+
+    saved = 0
+    skipped = 0
+    for item in listing:
+        src_path = OUTPUT_DIR / item["filename"]
+        if not src_path.exists():
+            continue
+        dst_path = target_dir / item["filename"]
+        if src_path.resolve() == dst_path.resolve():
+            skipped += 1
+            continue
+        if dst_path.exists() and dst_path.stat().st_size == src_path.stat().st_size:
+            skipped += 1
+            continue
+        shutil.copy2(src_path, dst_path)
+        saved += 1
+
+    try:
+        meta_path = target_dir / "gallery_metadata.json"
+        meta_path.write_text(json.dumps(listing, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Failed to write Google Drive metadata.json: %s", exc)
+
+    return {
+        "ok": True,
+        "saved_count": saved,
+        "skipped_count": skipped,
+        "total_processed": saved + skipped,
+        "target_dir": str(target_dir),
+        "message": (
+            f"已保存 {saved} 张作品至 Google 云盘 ({target_dir})"
+            if saved > 0
+            else f"所选 {skipped} 张作品已在 Google 云盘中 ({target_dir})"
+        ),
+    }
+
+
 @app.post("/api/system/enable-swap")
 def api_enable_swap(req: Optional[SwapRequest] = None) -> dict[str, Any]:
     size_gb = req.size_gb if req else 8
@@ -2751,6 +2941,8 @@ def api_clear_hf_cache() -> dict[str, Any]:
         shutil.rmtree(hub_dir, ignore_errors=True)
     with _hf_cache_stat_lock:
         globals()["_hf_cache_stat_cache"] = (0.0, 0)
+    with _hf_inventory_lock:
+        globals()["_hf_inventory_cache"] = (0.0, [])
     return {"ok": True, "stats": collect_system_stats()}
 
 
