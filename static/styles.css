@@ -374,7 +374,7 @@ kbd {
   width: 100%;
   max-width: 1240px;
   margin: 0 auto;
-  padding: 16px 14px calc(130px + var(--safe-bottom));
+  padding: 16px 14px calc(196px + var(--safe-bottom));
 }
 
 .tab-panel {

@@ -930,7 +930,15 @@
                     <strong>Turbo FP8 + INT8</strong>
                     <span class="preset-tag">L4 默认极速</span>
                   </div>
-                  <div class="preset-card-desc">8步极速 · FP8 DiT + INT8 编码 + BF16 VAE（L4 全显存常驻）</div>
+                  <div class="preset-card-desc">8步极速 · FP8 DiT 常驻 + INT8 编码按需卸载（14GB+ 安全余量，支持区块编译）</div>
+                </button>
+
+                <button class="preset-card" data-model="Qwen/Qwen-Image-2.1-Turbo" data-quant="bf16-int8" data-offload="auto" data-steps="8" type="button">
+                  <div class="preset-card-top">
+                    <strong>Turbo 原生 BF16 + INT8 编码</strong>
+                    <span class="preset-tag">L4 免编译极速</span>
+                  </div>
+                  <div class="preset-card-desc">原生 BF16 DiT 零反量化开销 + INT8 编码器分阶段卸载（余量 7GB+）</div>
                 </button>
 
                 <button class="preset-card" data-model="addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit" data-quant="int8-torchao" data-offload="auto" data-steps="8" type="button">
@@ -938,15 +946,15 @@
                     <strong>预量化 8-bit 极速版</strong>
                     <span class="preset-tag">秒加载</span>
                   </div>
-                  <div class="preset-card-desc">预量化 TorchAO 8bit，L4 全驻留无需在线量化转换</div>
+                  <div class="preset-card-desc">预量化 TorchAO 8bit，DiT 常驻 + TE 按需卸载，无需在线量化转换</div>
                 </button>
 
                 <button class="preset-card" data-model="abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8" data-quant="gguf-q8-int8" data-offload="auto" data-steps="8" type="button">
                   <div class="preset-card-top">
                     <strong>GGUF Q8 + INT8 编码</strong>
-                    <span class="preset-tag">L4 常驻</span>
+                    <span class="preset-tag">L4 稳妥</span>
                   </div>
-                  <div class="preset-card-desc">Q8_0 DiT + TorchAO INT8 编码 + BF16 VAE（约 17.5GB 常驻）</div>
+                  <div class="preset-card-desc">Q8_0 DiT 常驻 + TorchAO INT8 编码按需卸载 + BF16 VAE</div>
                 </button>
 
                 <button class="preset-card" data-model="abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8" data-quant="gguf-q8-full" data-offload="auto" data-steps="8" type="button">
@@ -970,7 +978,7 @@
                     <strong>Qwen-2.1 40步精绘版</strong>
                     <span class="preset-tag">高画质</span>
                   </div>
-                  <div class="preset-card-desc">Qwen-2.1 基础版 · FP8+INT8 L4 全驻留</div>
+                  <div class="preset-card-desc">Qwen-2.1 基础版 · FP8+INT8 分阶段调度</div>
                 </button>
 
                 <button class="preset-card" data-model="Qwen/Qwen-Image-2.1" data-quant="none" data-offload="auto" data-steps="40" type="button">
@@ -992,8 +1000,16 @@
 
               <label class="switch-row">
                 <div>
-                  <div class="switch-title">实验性 torch.compile 编译加速（默认关闭）</div>
-                  <div class="switch-desc">仅对非 GGUF 模型尝试 fullgraph=False 编译；首次出图编译耗时较长，切换分辨率将重编译（diffusers#14821）</div>
+                  <div class="switch-title">打开网页自动加载已下载模型</div>
+                  <div class="switch-desc">进入页面时若当前选中模型已本地下载，自动在后台加载至显存，避免首次出图久等</div>
+                </div>
+                <input type="checkbox" id="autoLoadOnOpenToggle" checked />
+              </label>
+
+              <label class="switch-row">
+                <div>
+                  <div class="switch-title">实验性区块 torch.compile 编译加速（默认关闭）</div>
+                  <div class="switch-desc">仅编译重复 transformer_blocks（绕过 diffusers#14821 RoPE 图断裂，释放 FP8/INT8 Triton 融合速度）；首图预热较久</div>
                 </div>
                 <input type="checkbox" id="torchCompileToggle" />
               </label>
@@ -1024,13 +1040,13 @@
                   <div class="form-group">
                     <label for="modelSelect">模型仓库</label>
                     <select id="modelSelect">
-                      <option value="abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8">abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8 (默认 Q8 满血)</option>
+                      <option value="Qwen/Qwen-Image-2.1-Turbo">Qwen/Qwen-Image-2.1-Turbo (默认推荐 · 8步极速)</option>
+                      <option value="addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit">addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit (预量化 8bit)</option>
+                      <option value="Qwen/Qwen-Image-2.1">Qwen/Qwen-Image-2.1 (基础版 · 40步精绘)</option>
+                      <option value="abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8">abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8 (GGUF Q8)</option>
                       <option value="abenzerps/Qwen-Image-2.1-Turbo-Quantized:q4">abenzerps/Qwen-Image-2.1-Turbo-Quantized:q4 (Q4 轻量)</option>
                       <option value="abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8">abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8 (Q8 别名)</option>
                       <option value="abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4">abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4 (Q4 别名)</option>
-                      <option value="Qwen/Qwen-Image-2.1-Turbo">Qwen/Qwen-Image-2.1-Turbo (8步极速)</option>
-                      <option value="Qwen/Qwen-Image-2.1">Qwen/Qwen-Image-2.1 (基础版 · 40步精绘)</option>
-                      <option value="addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit">addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit (预量化 8bit)</option>
                     </select>
                   </div>
 
@@ -1051,10 +1067,11 @@
                       <label for="quantSelect">量化精度</label>
                       <select id="quantSelect">
                         <option value="fp8-int8">FP8 DiT + INT8 编码 + BF16 VAE (L4推荐)</option>
+                        <option value="bf16-int8">原生 BF16 DiT + INT8 编码 (L4 免编译极速)</option>
                         <option value="fp8-all">全 FP8 + BF16 VAE</option>
                         <option value="int8-torchao">TorchAO 全 INT8 + BF16 VAE</option>
                         <option value="int8-bnb">BitsAndBytes 8-bit</option>
-                        <option value="gguf-q8-int8">GGUF Q8_0 + TorchAO INT8 编码 (L4常驻)</option>
+                        <option value="gguf-q8-int8">GGUF Q8_0 + TorchAO INT8 编码 (L4稳妥)</option>
                         <option value="gguf-q8-full">GGUF Q8_0 + BF16 编码</option>
                         <option value="gguf-q4">GGUF Q4_K_M 轻量</option>
                         <option value="none">原生 BF16/FP16 不量化</option>
@@ -1076,7 +1093,7 @@
                       <label for="offloadSelect">显存调度策略</label>
                       <select id="offloadSelect">
                         <option value="auto">按显卡自动</option>
-                        <option value="smart_stage_offload">智能分阶段逐层调度 (L4推荐)</option>
+                        <option value="smart_stage_offload">智能分阶段调度 (L4默认 · DiT常驻/TE按需卸载)</option>
                         <option value="none">全显存驻留 (80G+)</option>
                         <option value="model_cpu_offload">Model CPU Offload (T4)</option>
                         <option value="sequential_cpu_offload">Sequential Offload (极限省显存)</option>

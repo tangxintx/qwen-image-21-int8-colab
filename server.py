@@ -110,11 +110,20 @@ def build_pipeline_quant_config(quant_mode: str, profile: GPUProfile) -> tuple[A
     cc_major, cc_minor = _parse_cc(profile.compute_cap)
     supports_fp8 = (cc_major > 8) or (cc_major == 8 and cc_minor >= 9)
 
-    if quant_mode in {"fp8-int8", "fp8-all", "int8-torchao"}:
+    if quant_mode in {"fp8-int8", "fp8-all", "int8-torchao", "bf16-int8"}:
         from diffusers import PipelineQuantizationConfig
         from diffusers import TorchAoConfig as DiffusersTorchAoConfig
         from torchao.quantization import Int8WeightOnlyConfig
         from transformers import TorchAoConfig as TransformersTorchAoConfig
+
+        if quant_mode == "bf16-int8":
+            cfg = PipelineQuantizationConfig(
+                quant_mapping={
+                    "text_encoder": TransformersTorchAoConfig(Int8WeightOnlyConfig()),
+                }
+            )
+            desc = f"DiT=原生{profile.dtype.upper()}(零反量化) + TextEncoder=INT8 + VAE={profile.dtype.upper()}"
+            return cfg, desc
 
         want_dit_fp8 = quant_mode in {"fp8-int8", "fp8-all"}
         want_te_fp8 = quant_mode == "fp8-all"
@@ -883,6 +892,7 @@ class JobState:
     progress: float = 0.0
     message: str = "等待中..."
     notice: Optional[str] = None
+    stage_timings: Optional[dict[str, Any]] = None
     results: list[dict[str, Any]] = field(default_factory=list)
     error: Optional[str] = None
     created_at: float = field(default_factory=time.time)
@@ -901,6 +911,7 @@ class JobState:
             "progress": round(self.progress, 4),
             "message": self.message,
             "notice": self.notice,
+            "stage_timings": dict(self.stage_timings) if self.stage_timings else None,
             "results": list(self.results),
             "error": self.error,
             "elapsed_sec": round((self.finished_at or time.time()) - self.created_at, 2),
@@ -910,7 +921,7 @@ class JobState:
 @dataclass
 class ModelOpState:
     task_id: str
-    action: Literal["reload", "reinstall"]
+    action: Literal["reload", "reinstall", "preload"]
     status: Literal["queued", "loading_model", "running", "completed", "error"]
     progress: float = 0.0
     message: str = "准备中..."
@@ -1024,6 +1035,7 @@ class QwenImage21Engine:
         self.vae_tiling_mode: str = os.environ.get("QWEN_VAE_TILING", "auto")
         self.hf_token: str = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
         self.inpaint_fast_crop: bool = False
+        self.auto_load_on_open: bool = os.environ.get("QWEN_AUTO_LOAD_ON_OPEN", "1").strip().lower() not in {"0", "false", "no"}
         self.torch_compile: bool = os.environ.get("QWEN_TORCH_COMPILE", "0").strip().lower() in {"1", "true", "yes"}
         self.ai_endpoint: str = DEFAULT_AI_ENDPOINT
         self.ai_api_key: str = DEFAULT_AI_API_KEY
@@ -1053,6 +1065,7 @@ class QwenImage21Engine:
         self._stage_swap_dit_for_te: bool = False
         self._te_offload_hook: Any = None
         self._oom_vae_tiling_forced: bool = False
+        self._prompt_cache_disabled_reason: Optional[str] = None
         self._prompt_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._prompt_cache_max: int = 16
         self._active_lora_path: Optional[str] = None
@@ -1075,6 +1088,8 @@ class QwenImage21Engine:
                         self.ai_auto_run = bool(data["ai_auto_run"])
                     if "inpaint_fast_crop" in data:
                         self.inpaint_fast_crop = bool(data["inpaint_fast_crop"])
+                    if "auto_load_on_open" in data and "QWEN_AUTO_LOAD_ON_OPEN" not in os.environ:
+                        self.auto_load_on_open = bool(data["auto_load_on_open"])
                     if "torch_compile" in data and "QWEN_TORCH_COMPILE" not in os.environ:
                         self.torch_compile = bool(data["torch_compile"])
             except Exception as exc:
@@ -1091,6 +1106,7 @@ class QwenImage21Engine:
                         "ai_vision_enabled": self.ai_vision_enabled,
                         "ai_auto_run": self.ai_auto_run,
                         "inpaint_fast_crop": self.inpaint_fast_crop,
+                        "auto_load_on_open": self.auto_load_on_open,
                         "torch_compile": self.torch_compile,
                     },
                     ensure_ascii=False,
@@ -1100,6 +1116,84 @@ class QwenImage21Engine:
             )
         except Exception as exc:
             logger.warning("Failed to persist AI config: %s", exc)
+
+    def is_selected_model_downloaded(self) -> bool:
+        """Purely local disk check (zero network calls) for whether the active model is cached cleanly."""
+        hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+        hub_dir = Path(os.environ.get("HF_HUB_CACHE", str(hf_home / "hub")))
+        if not hub_dir.exists():
+            return False
+
+        def _repo_has_complete_blobs(repo_dir: Path) -> bool:
+            blobs_dir = repo_dir / "blobs"
+            if blobs_dir.exists():
+                try:
+                    if any(blobs_dir.glob("*.incomplete")):
+                        return False
+                except OSError:
+                    return False
+            return True
+
+        def _iter_snapshots(repo_id: str) -> list[Path]:
+            repo_dir = hub_dir / ("models--" + repo_id.replace("/", "--"))
+            if not repo_dir.exists() or not _repo_has_complete_blobs(repo_dir):
+                return []
+            snaps_dir = repo_dir / "snapshots"
+            if not snaps_dir.exists():
+                return []
+            try:
+                return [d for d in snaps_dir.iterdir() if d.is_dir()]
+            except OSError:
+                return []
+
+        def _has_complete_diffusers_repo(repo_id: str, require_weights: bool = True) -> bool:
+            for snap in _iter_snapshots(repo_id):
+                if not (snap / "model_index.json").is_file():
+                    continue
+                if not require_weights:
+                    return True
+                try:
+                    for fp in snap.rglob("*"):
+                        if fp.is_file() and fp.suffix.lower() in {".safetensors", ".bin"}:
+                            return True
+                except OSError:
+                    continue
+            return False
+
+        gguf_var = resolve_gguf_variant(self.model_id, self.quant_mode)
+        base_repo, _ = strip_model_variant_suffix(self.model_id)
+        if gguf_var is None:
+            return _has_complete_diffusers_repo(base_repo, require_weights=True)
+
+        cfg_variant = GGUF_VARIANTS.get(gguf_var, {})
+        base_cfg_repo = cfg_variant.get("base_config_repo") or "Qwen/Qwen-Image-2.1-Turbo"
+        if not _has_complete_diffusers_repo(base_cfg_repo, require_weights=False):
+            return False
+
+        needle = "q8_0" if gguf_var == "q8" else "q4_k_m"
+        cand_repos = [
+            repo
+            for repo in (
+                base_repo,
+                GGUF_REDIRECTED_REPO,
+                GGUF_BASE_REPO,
+                cfg_variant.get("dit_diffusers_fallback_repo"),
+            )
+            if repo
+        ]
+        seen: set[str] = set()
+        for repo in cand_repos:
+            if repo in seen:
+                continue
+            seen.add(repo)
+            for snap in _iter_snapshots(repo):
+                try:
+                    for fp in snap.rglob("*.gguf"):
+                        if fp.is_file() and needle in fp.name.lower():
+                            return True
+                except OSError:
+                    continue
+        return False
 
     def _auto_select_downloaded_model(self) -> Optional[str]:
         """
@@ -1170,20 +1264,18 @@ class QwenImage21Engine:
         qm = (self.quant_mode or "").strip().lower()
         if self.offload_mode == "auto":
             if profile.vram_gb <= 16.5:
-                # 16GB T4: full BF16 / BF16-TE Q8 need sequential offload; 8-bit/Q4 use model_cpu_offload
-                if qm == "none" or (gguf_var == "q8" and qm != "gguf-q8-int8"):
+                # 16GB T4: full BF16 / BF16-DiT / BF16-TE Q8 need sequential offload; Q4 / GGUF-Q8+INT8 use model_cpu_offload
+                if qm in {"none", "bf16-int8"} or (gguf_var == "q8" and qm != "gguf-q8-int8"):
                     eff_offload = "sequential_cpu_offload"
                 elif gguf_var in {"q4", "q8"}:
                     eff_offload = "model_cpu_offload"
                 else:
                     eff_offload = profile.offload_mode
             elif profile.vram_gb <= 26.0:
-                # 24GB L4: 17.53GB BF16 TE (gguf-q8-full) or full BF16 (`none`) needs stage offload;
-                # 8-bit / Q4 / gguf-q8-int8 (~13–17.7 GB total) fit fully resident (`none`)!
-                if qm == "none" or (gguf_var == "q8" and qm != "gguf-q8-int8"):
-                    eff_offload = "smart_stage_offload"
-                else:
-                    eff_offload = "none"
+                # 24GB L4 (actual ~22.5 GiB): Q4 (~10.2 GB) fits fully resident (`none`);
+                # all other modes keep DiT + VAE resident and offload ONLY TE to CPU (`smart_stage_offload`)
+                # leaving 14GB+ headroom for activations & preventing multi-gen OOM fallback.
+                eff_offload = "none" if gguf_var == "q4" else "smart_stage_offload"
             else:
                 eff_offload = profile.offload_mode
         else:
@@ -1473,6 +1565,11 @@ class QwenImage21Engine:
             self.device = f"demo ({self.resolve_gpu_profile().key})"
             return
 
+        if self.loading and job is not None:
+            job.status = "loading_model"
+            job.progress = max(job.progress, 0.04)
+            job.message = f"正在等待模型 {self.model_id} 完成自动加载..."
+
         with self._load_lock:
             if self.loaded and self.pipe is not None:
                 return
@@ -1509,12 +1606,13 @@ class QwenImage21Engine:
                         if tot_b > 0:
                             job.progress = min(0.28, max(0.02, 0.02 + 0.26 * (cur_b / tot_b)))
 
-                # Apply hardware-specific TensorCore / TF32 settings
+                # Apply hardware-specific TensorCore / TF32 settings; keep cudnn.benchmark=False
+                # to prevent multi-second convolution autotuning stalls on 1st gen / resolution switches.
                 if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
                     torch.backends.cuda.matmul.allow_tf32 = eff["allow_tf32"]
                 if hasattr(torch.backends, "cudnn"):
                     torch.backends.cudnn.allow_tf32 = eff["allow_tf32"]
-                    torch.backends.cudnn.benchmark = True
+                    torch.backends.cudnn.benchmark = False
 
                 dtype = torch.bfloat16 if eff["dtype"] == "bfloat16" else torch.float16
                 logger.info(
@@ -1711,7 +1809,7 @@ class QwenImage21Engine:
                                 te_mod.to("cpu")
                         self._stage_offload_active = True
                         self._te_offload_hook = te_hook
-                        self._stage_swap_dit_for_te = (transformer_bytes + vae_bytes + te_bytes) > int(total_vram_bytes * 0.85)
+                        self._stage_swap_dit_for_te = (transformer_bytes + vae_bytes + te_bytes) > int(total_vram_bytes * 0.82)
                         self.device = "cuda (stage_offload: TE->CPU, DiT+VAE resident)"
                 elif eff["offload_mode"] == "model_cpu_offload":
                     _clear_pipeline_hooks(pipe)
@@ -1731,11 +1829,25 @@ class QwenImage21Engine:
                     pipe = pipe.to("cuda")
                     self.device = "cuda (full)"
 
-                # Optional experimental torch.compile (disabled by default due to diffusers#14821)
+                # Optional experimental regional torch.compile (targets repeating transformer blocks
+                # to bypass QwenImage21Rope .tolist()/nonzero() graph breaks in diffusers#14821)
                 if self.torch_compile and not is_gguf_pipe and "sequential" not in self.device and getattr(pipe, "transformer", None) is not None:
                     try:
-                        pipe.transformer = torch.compile(pipe.transformer, fullgraph=False)
-                        logger.info("Enabled experimental torch.compile(fullgraph=False) on transformer.")
+                        tf_mod = pipe.transformer
+                        if hasattr(tf_mod, "compile_repeated_blocks"):
+                            tf_mod.compile_repeated_blocks(fullgraph=False)
+                            logger.info("Enabled regional torch.compile via transformer.compile_repeated_blocks(fullgraph=False).")
+                        else:
+                            tf_blocks = getattr(tf_mod, "transformer_blocks", None)
+                            if tf_blocks is not None and hasattr(tf_blocks, "__len__") and hasattr(tf_blocks, "__setitem__") and len(tf_blocks) > 0:
+                                compiled_cnt = 0
+                                for blk_idx in range(len(tf_blocks)):
+                                    tf_blocks[blk_idx] = torch.compile(tf_blocks[blk_idx], fullgraph=False)
+                                    compiled_cnt += 1
+                                logger.info("Enabled regional torch.compile on %d transformer_blocks (fullgraph=False).", compiled_cnt)
+                            else:
+                                pipe.transformer = torch.compile(tf_mod, fullgraph=False)
+                                logger.info("Enabled whole-transformer torch.compile(fullgraph=False) fallback.")
                     except Exception as comp_exc:
                         logger.warning("torch.compile failed (%s); continuing in eager mode.", comp_exc)
 
@@ -1776,6 +1888,7 @@ class QwenImage21Engine:
                         has_cfg_sigmas = False
                 self._pipe_has_sample_sigmas = has_cfg_sigmas
 
+                self._prompt_cache_disabled_reason = None
                 self._prompt_cache.clear()
                 self.pipe = pipe
                 self.loaded = True
@@ -1791,6 +1904,54 @@ class QwenImage21Engine:
                 raise
             finally:
                 self.loading = False
+
+    def _maybe_release_vram(
+        self,
+        torch_mod: Any,
+        *,
+        force: bool = False,
+        collect_gc: bool = False,
+        min_free_gb: float = 4.0,
+        max_frag_gb: float = 1.0,
+    ) -> None:
+        """
+        Release cached CUDA blocks adaptively:
+        - Always collect + flush when `force=True` (errors, cancellations, OOM retry, unloads)
+        - Otherwise only flush when free VRAM drops below `min_free_gb` or allocator fragmentation
+          (`reserved - allocated`) exceeds `max_frag_gb`, avoiding redundant sync stalls on happy paths.
+        """
+        if collect_gc:
+            gc.collect()
+        if torch_mod is None:
+            torch_mod, has_cuda = self._detect_torch()
+        else:
+            try:
+                has_cuda = bool(torch_mod.cuda.is_available())
+            except Exception:
+                has_cuda = False
+        if not torch_mod or not has_cuda:
+            return
+        try:
+            if force:
+                torch_mod.cuda.empty_cache()
+                return
+            free_b, _ = torch_mod.cuda.mem_get_info(0)
+            frag_b = max(0, torch_mod.cuda.memory_reserved(0) - torch_mod.cuda.memory_allocated(0))
+            if free_b < int(min_free_gb * (1024**3)) or frag_b > int(max_frag_gb * (1024**3)):
+                gc.collect()
+                torch_mod.cuda.empty_cache()
+                logger.debug(
+                    "Adaptive CUDA cache flush (free=%.2f GB, frag=%.2f GB)",
+                    free_b / (1024**3),
+                    frag_b / (1024**3),
+                )
+        except Exception:
+            pass
+
+    def cleanup_after_error(self) -> None:
+        """Clear traceback-pinned GPU tensors immediately after failed or cancelled generations."""
+        torch_mod, _ = self._detect_torch()
+        self._maybe_release_vram(torch_mod, force=True, collect_gc=True)
 
     def _unload_active_lora(self) -> None:
         if self.pipe is not None and self._active_lora_path is not None:
@@ -1828,19 +1989,24 @@ class QwenImage21Engine:
         cond_images: Optional[list[Image.Image]],
         exec_device: Any,
         torch_mod: Any,
-    ) -> Optional[dict[str, Any]]:
+        job: Optional[JobState] = None,
+        batch_idx: int = 0,
+    ) -> tuple[Optional[dict[str, Any]], bool, float]:
         """
         Encode prompt + optional condition images once and LRU-cache CPU copies
         (including `prompt_embeds`, `prompt_embeds_mask`, `image_pad_mask` and negative equivalents)
         so seed/step/batch variations skip redundant 8B Qwen3-VL inference.
+        Returns `(embeds_bundle_or_None, cache_hit, elapsed_sec)`.
         """
+        if self._prompt_cache_disabled_reason:
+            return None, False, 0.0
         if self.pipe is None or not hasattr(self.pipe, "encode_prompt") or not self._pipe_supports_prompt_embeds:
-            return None
+            return None, False, 0.0
         imgs = cond_images or []
         if imgs and (not self._pipe_encode_has_image or not self._pipe_supports_image_pad_mask):
-            return None
+            return None, False, 0.0
         if do_true_cfg and (not self._pipe_supports_neg_prompt_embeds or (imgs and not self._pipe_supports_neg_image_pad_mask)):
-            return None
+            return None, False, 0.0
 
         neg_key = negative_prompt.strip() if do_true_cfg else ""
         img_hash = _hash_condition_images(imgs)
@@ -1849,10 +2015,18 @@ class QwenImage21Engine:
             ensure_ascii=False,
         )
 
+        t_enc0 = time.perf_counter()
         cached = self._prompt_cache.get(cache_key)
         if cached is not None:
             self._prompt_cache.move_to_end(cache_key)
-            return {k: (v.to(exec_device) if v is not None else None) for k, v in cached.items()}
+            if job:
+                job.message = f"第 {batch_idx + 1}/{job.batch_size} 张 · 命中提示词缓存，准备去噪..."
+            bundle_hit = {k: (v.to(exec_device) if v is not None else None) for k, v in cached.items()}
+            return bundle_hit, True, time.perf_counter() - t_enc0
+
+        if job:
+            stage_note = "分阶段" if (self._stage_offload_active and self._stage_swap_dit_for_te) else ""
+            job.message = f"第 {batch_idx + 1}/{job.batch_size} 张 · {stage_note}编码提示词 (Qwen3-VL)..."
 
         dit_mod = getattr(self.pipe, "transformer", None)
         swapped_dit = False
@@ -1889,16 +2063,30 @@ class QwenImage21Engine:
                 neg_pe = neg_pe_mask = neg_img_pad_mask = None
                 if do_true_cfg:
                     neg_pe, neg_pe_mask, neg_img_pad_mask = _call_encode(neg_key)
+        except TypeError as sig_exc:
+            self._prompt_cache_disabled_reason = str(sig_exc)
+            logger.warning("Prompt pre-encoding signature mismatch (%s); disabling cache for this pipeline.", sig_exc)
+            return None, False, time.perf_counter() - t_enc0
         finally:
+            te_offloaded = False
             if self._stage_offload_active:
                 self._offload_te_now(torch_mod)
+                te_offloaded = True
+            elif "model_offload" in self.device:
+                te_hook = getattr(getattr(self.pipe, "text_encoder", None), "_hf_hook", None)
+                if te_hook is not None and hasattr(te_hook, "offload"):
+                    try:
+                        te_hook.offload()
+                        te_offloaded = True
+                    except Exception:
+                        pass
+            if (te_offloaded or swapped_dit) and torch_mod.cuda.is_available():
+                torch_mod.cuda.empty_cache()
             if swapped_dit and dit_mod is not None:
-                if torch_mod.cuda.is_available():
-                    torch_mod.cuda.empty_cache()
                 dit_mod.to(exec_device)
 
         if img_pad_mask is None and imgs:
-            return None
+            return None, False, time.perf_counter() - t_enc0
 
         bundle = {
             "prompt_embeds": pe,
@@ -1917,7 +2105,7 @@ class QwenImage21Engine:
         while len(self._prompt_cache) > self._prompt_cache_max:
             self._prompt_cache.popitem(last=False)
 
-        return bundle
+        return bundle, False, time.perf_counter() - t_enc0
 
     def sync_lora(self, lora_enabled: bool, lora_name: Optional[str], lora_weight: float) -> None:
         """Hot-load, remap keys with strict=False, adjust weight, or cleanly unload LoRA."""
@@ -1983,6 +2171,7 @@ class QwenImage21Engine:
         self._stage_swap_dit_for_te = False
         self._te_offload_hook = None
         self._oom_vae_tiling_forced = False
+        self._prompt_cache_disabled_reason = None
         self._prompt_cache.clear()
         if self.pipe is not None:
             _clear_pipeline_hooks(self.pipe)
@@ -2014,6 +2203,7 @@ class QwenImage21Engine:
         cpu_offload: Optional[bool] = None,
         vae_tiling: Optional[bool] = None,
         inpaint_fast_crop: Optional[bool] = None,
+        auto_load_on_open: Optional[bool] = None,
         torch_compile: Optional[bool] = None,
         ai_endpoint: Optional[str] = None,
         ai_api_key: Optional[str] = None,
@@ -2043,6 +2233,9 @@ class QwenImage21Engine:
             prefs_changed = True
         if inpaint_fast_crop is not None:
             self.inpaint_fast_crop = bool(inpaint_fast_crop)
+            prefs_changed = True
+        if auto_load_on_open is not None:
+            self.auto_load_on_open = bool(auto_load_on_open)
             prefs_changed = True
 
         with self._load_lock:
@@ -2408,8 +2601,14 @@ class QwenImage21Engine:
         torch, _ = self._detect_torch()
         if job.cancel_event.is_set():
             raise InterruptedError("用户已取消生成")
+        if lora_enabled and lora_name and self._active_lora_path != str(_safe_child_path(LORAS_DIR, lora_name) or ""):
+            job.message = f"第 {batch_idx + 1}/{job.batch_size} 张 · 正在挂载 LoRA 权重..."
         self.sync_lora(lora_enabled=lora_enabled, lora_name=lora_name, lora_weight=lora_weight)
-        generator = torch.Generator(device="cuda" if torch.cuda.is_available() else "cpu").manual_seed(seed)
+
+        # Always use CPU generator: Diffusers creates latents reproducibly across
+        # full-CUDA, model_cpu_offload, sequential_cpu_offload, and OOM retry fallback.
+        def _make_generator() -> Any:
+            return torch.Generator(device="cpu").manual_seed(seed)
 
         target_w, target_h = width, height
         ref_image = init_image
@@ -2422,6 +2621,7 @@ class QwenImage21Engine:
             lora_control_image if (mode == "t2i" and using_lora_control) else None
         )
         if src_primary is not None:
+            job.message = f"第 {batch_idx + 1}/{job.batch_size} 张 · 正在预处理参考图与画布..."
             if fast_crop_box is not None:
                 area_scale = math.sqrt(max(512 * 512, min(width * height, 1024 * 1024)) / max(1, src_primary.width * src_primary.height))
                 req_base_w = align_dim(int(round(src_primary.width * area_scale)), 16)
@@ -2497,7 +2697,7 @@ class QwenImage21Engine:
             "height": target_h,
             "num_inference_steps": steps,
             "true_cfg_scale": true_cfg_scale,
-            "generator": generator,
+            "generator": _make_generator(),
             "callback_on_step_end": step_callback,
         }
         if do_true_cfg:
@@ -2524,6 +2724,7 @@ class QwenImage21Engine:
         # Prompt Encoding LRU Cache + True Stage Offload pre-encode helper
         exec_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         pipe_call_params = inspect.signature(self.pipe.__call__).parameters
+        encode_metrics: dict[str, Any] = {"cache_hit": False, "encode_sec": 0.0}
 
         def _clear_prompt_embed_kwargs() -> None:
             for k_rem in (
@@ -2539,14 +2740,18 @@ class QwenImage21Engine:
         def _attach_cached_embeds(imgs_for_encode: Optional[list[Image.Image]]) -> bool:
             _clear_prompt_embed_kwargs()
             try:
-                cached_embeds = self._get_or_encode_prompt(
+                cached_embeds, cache_hit, enc_dt = self._get_or_encode_prompt(
                     resolved_prompt=resolved_prompt,
                     negative_prompt=negative_prompt,
                     do_true_cfg=do_true_cfg,
                     cond_images=imgs_for_encode,
                     exec_device=exec_device,
                     torch_mod=torch,
+                    job=job,
+                    batch_idx=batch_idx,
                 )
+                encode_metrics["cache_hit"] = cache_hit
+                encode_metrics["encode_sec"] += enc_dt
             except InterruptedError:
                 raise
             except Exception as enc_exc:
@@ -2577,17 +2782,41 @@ class QwenImage21Engine:
                     call_kwargs["negative_image_pad_mask"] = cached_embeds["negative_image_pad_mask"]
             return True
 
-        # Register fast mid-step abort hooks + stage-boundary TE offload guard
+        # Register fast mid-step abort hooks + stage-boundary TE offload + live stage progress
         hook_handles: list[Any] = []
+        stage_state: dict[str, Any] = {
+            "denoise_started": False,
+            "t_denoise_start": 0.0,
+            "vae_started": False,
+            "t_vae_start": 0.0,
+        }
 
         def _abort_pre_hook(*_args: Any, **_kwargs: Any) -> None:
             if job.cancel_event.is_set():
                 raise InterruptedError("用户已取消生成")
 
-        def _stage_dit_pre_hook(*_args: Any, **_kwargs: Any) -> None:
+        def _dit_pre_hook(*_args: Any, **_kwargs: Any) -> None:
             if self._stage_offload_active:
                 self._offload_te_now(torch)
+            if not stage_state["denoise_started"]:
+                stage_state["denoise_started"] = True
+                stage_state["t_denoise_start"] = time.perf_counter()
+            next_step = min(max(steps, 1), job.current_step + 1)
+            job.message = f"第 {batch_idx + 1}/{job.batch_size} 张 · 正在推理 Step {next_step}/{max(steps, 1)}..."
 
+        def _vae_encode_pre_hook(*_args: Any, **_kwargs: Any) -> None:
+            if not stage_state["denoise_started"]:
+                job.message = f"第 {batch_idx + 1}/{job.batch_size} 张 · 正在 VAE 编码参考图..."
+
+        def _vae_decode_pre_hook(*_args: Any, **_kwargs: Any) -> None:
+            if stage_state["denoise_started"] and not stage_state["vae_started"]:
+                stage_state["vae_started"] = True
+                stage_state["t_vae_start"] = time.perf_counter()
+                job.message = f"第 {batch_idx + 1}/{job.batch_size} 张 · 正在 VAE 解码图像..."
+                job.progress = max(job.progress, min(0.99, (batch_idx + 0.96) / max(1, job.batch_size)))
+
+        had_error = False
+        out: Any = None
         try:
             if hasattr(self.pipe, "_interrupt"):
                 setattr(self.pipe, "_interrupt", False)
@@ -2596,8 +2825,18 @@ class QwenImage21Engine:
                 if comp is not None and hasattr(comp, "register_forward_pre_hook"):
                     hook_handles.append(comp.register_forward_pre_hook(_abort_pre_hook))
             transformer = getattr(self.pipe, "transformer", None)
-            if transformer is not None and hasattr(transformer, "register_forward_pre_hook") and self._stage_offload_active:
-                hook_handles.append(transformer.register_forward_pre_hook(_stage_dit_pre_hook))
+            if transformer is not None and hasattr(transformer, "register_forward_pre_hook"):
+                hook_handles.append(transformer.register_forward_pre_hook(_dit_pre_hook))
+            vae_mod = getattr(self.pipe, "vae", None)
+            if vae_mod is not None:
+                vae_enc = getattr(vae_mod, "encoder", None)
+                vae_dec = getattr(vae_mod, "decoder", None)
+                if vae_enc is not None and hasattr(vae_enc, "register_forward_pre_hook"):
+                    hook_handles.append(vae_enc.register_forward_pre_hook(_vae_encode_pre_hook))
+                if vae_dec is not None and hasattr(vae_dec, "register_forward_pre_hook"):
+                    hook_handles.append(vae_dec.register_forward_pre_hook(_vae_decode_pre_hook))
+                elif hasattr(vae_mod, "register_forward_pre_hook"):
+                    hook_handles.append(vae_mod.register_forward_pre_hook(_vae_decode_pre_hook))
             blocks = getattr(transformer, "transformer_blocks", None) if transformer is not None else None
             if blocks is not None:
                 for blk in blocks:
@@ -2606,20 +2845,24 @@ class QwenImage21Engine:
 
             def _run_pipe_with_rgba_fallback() -> Any:
                 _attach_cached_embeds(cond_images)
-                try:
-                    return self.pipe(**call_kwargs)
-                except Exception as pipe_exc:
-                    if ref_image is not None and ref_image.mode == "RGBA" and not job.cancel_event.is_set():
-                        err_s = str(pipe_exc).lower()
-                        if any(k in err_s for k in ("channel", "rgba", "shape", "size", "mode", "rgb", "mismatch")):
-                            logger.warning("Pipeline rejected RGBA canvas (%s); falling back to RGB canvas.", pipe_exc)
-                            rgb_ref = ref_image.convert("RGB")
-                            rgb_cond = [rgb_ref, *prepared_extras]
-                            call_kwargs["image"] = rgb_cond if prepared_extras else rgb_ref
-                            _attach_cached_embeds(rgb_cond)
-                            return self.pipe(**call_kwargs)
-                    raise
+                if not stage_state["denoise_started"]:
+                    job.message = f"第 {batch_idx + 1}/{job.batch_size} 张 · 准备去噪 (0/{steps})..."
+                with torch.inference_mode():
+                    try:
+                        return self.pipe(**call_kwargs)
+                    except Exception as pipe_exc:
+                        if ref_image is not None and ref_image.mode == "RGBA" and not job.cancel_event.is_set():
+                            err_s = str(pipe_exc).lower()
+                            if any(k in err_s for k in ("channel", "rgba", "shape", "size", "mode", "rgb", "mismatch")):
+                                logger.warning("Pipeline rejected RGBA canvas (%s); falling back to RGB canvas.", pipe_exc)
+                                rgb_ref = ref_image.convert("RGB")
+                                rgb_cond = [rgb_ref, *prepared_extras]
+                                call_kwargs["image"] = rgb_cond if prepared_extras else rgb_ref
+                                _attach_cached_embeds(rgb_cond)
+                                return self.pipe(**call_kwargs)
+                        raise
 
+            t_pipe_start = time.perf_counter()
             try:
                 out = _run_pipe_with_rgba_fallback()
             except Exception as oom_exc:
@@ -2642,14 +2885,20 @@ class QwenImage21Engine:
                     if profile_now.vram_gb <= 16.5 and hasattr(self.pipe, "enable_attention_slicing"):
                         self.pipe.enable_attention_slicing("auto")
 
-                    # Clear existing offload hooks BEFORE re-attaching fallback hooks
+                    # Clear existing offload hooks & any pending GPU tensors BEFORE re-attaching fallback hooks
+                    _clear_prompt_embed_kwargs()
+                    out = None
                     _clear_pipeline_hooks(self.pipe)
                     self._stage_offload_active = False
                     self._stage_swap_dit_for_te = False
                     self._te_offload_hook = None
+                    stage_state["denoise_started"] = False
+                    stage_state["t_denoise_start"] = 0.0
+                    stage_state["vae_started"] = False
+                    stage_state["t_vae_start"] = 0.0
                     trim_host_memory()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    self._maybe_release_vram(torch, force=True, collect_gc=True)
+                    call_kwargs["generator"] = _make_generator()
 
                     if is_gguf_pipe:
                         logger.warning(
@@ -2678,17 +2927,50 @@ class QwenImage21Engine:
                                 seq_device="cuda (auto_sequential_fallback)",
                                 reason="CUDA OOM fallback",
                             )
+                    t_pipe_start = time.perf_counter()
+                    encode_metrics["encode_sec"] = 0.0
                     out = _run_pipe_with_rgba_fallback()
                 else:
                     raise
+
+            t_pipe_end = time.perf_counter()
+            encode_sec = float(encode_metrics["encode_sec"])
+            if stage_state["denoise_started"] and stage_state["vae_started"]:
+                denoise_sec = max(0.0, stage_state["t_vae_start"] - stage_state["t_denoise_start"])
+                vae_sec = max(0.0, t_pipe_end - stage_state["t_vae_start"])
+            elif stage_state["denoise_started"]:
+                denoise_sec = max(0.0, t_pipe_end - stage_state["t_denoise_start"])
+                vae_sec = 0.0
+            else:
+                denoise_sec = max(0.0, t_pipe_end - t_pipe_start - encode_sec)
+                vae_sec = 0.0
+            job.stage_timings = {
+                "encode_sec": round(encode_sec, 2),
+                "denoise_sec": round(denoise_sec, 2),
+                "vae_sec": round(vae_sec, 2),
+                "prompt_cache_hit": bool(encode_metrics["cache_hit"]),
+            }
+            logger.info(
+                "Generation stage timings (job=%s) | encode=%.2fs (cache_hit=%s) | denoise=%.2fs | vae=%.2fs",
+                job.job_id,
+                encode_sec,
+                encode_metrics["cache_hit"],
+                denoise_sec,
+                vae_sec,
+            )
+            result_img: Image.Image = out.images[0].convert("RGB")
+        except Exception:
+            had_error = True
+            raise
         finally:
+            out = None
+            call_kwargs.clear()
             for h in hook_handles:
                 try:
                     h.remove()
                 except Exception:
                     pass
-
-        result_img: Image.Image = out.images[0].convert("RGB")
+            self._maybe_release_vram(torch, force=had_error, collect_gc=had_error)
 
         if ref_image is not None:
             ref_rgb = ref_image.convert("RGB")
@@ -2787,6 +3069,7 @@ class ConfigUpdateRequest(BaseModel):
     cpu_offload: Optional[bool] = None
     vae_tiling: Optional[bool] = None
     inpaint_fast_crop: Optional[bool] = None
+    auto_load_on_open: Optional[bool] = None
     torch_compile: Optional[bool] = None
     ai_endpoint: Optional[str] = None
     ai_api_key: Optional[str] = None
@@ -2984,6 +3267,12 @@ def collect_system_stats() -> dict[str, Any]:
     except Exception:
         pass
 
+    active_op_dict: Optional[dict[str, Any]] = None
+    with model_ops_lock:
+        active_op = model_ops.get(_active_model_op_id) if _active_model_op_id else None
+        if active_op is not None and active_op.status in {"queued", "loading_model", "running"}:
+            active_op_dict = active_op.to_dict()
+
     return {
         "ram": {
             "used_gb": round(vm.used / (1024**3), 2),
@@ -3023,6 +3312,9 @@ def collect_system_stats() -> dict[str, Any]:
             "offload_mode": engine.offload_mode,
             "vae_tiling_mode": engine.vae_tiling_mode,
             "inpaint_fast_crop": engine.inpaint_fast_crop,
+            "auto_load_on_open": engine.auto_load_on_open,
+            "selected_model_downloaded": engine.is_selected_model_downloaded(),
+            "active_model_op": active_op_dict,
             "torch_compile": engine.torch_compile,
             "effective_dtype": eff["dtype"],
             "effective_offload": eff["offload_mode"],
@@ -3046,6 +3338,7 @@ def _run_generation_job(job_id: str, req: GenerateRequest) -> None:
     with jobs_lock:
         job = jobs[job_id]
 
+    had_error = False
     try:
         init_img = decode_data_url_image(req.init_image_b64) if req.init_image_b64 else None
         extra_refs = [decode_data_url_image(b) for b in (req.ref_images_b64 or [])[:9] if b]
@@ -3128,15 +3421,20 @@ def _run_generation_job(job_id: str, req: GenerateRequest) -> None:
         job.finished_at = time.time()
 
     except InterruptedError:
+        had_error = True
         job.status = "cancelled"
         job.message = "生成已手动停止"
         job.finished_at = time.time()
     except Exception as exc:
+        had_error = True
         logger.exception("Generation job %s failed", job_id)
         job.status = "error"
         job.error = str(exc)
         job.message = f"生成失败: {exc}"
         job.finished_at = time.time()
+    finally:
+        if had_error:
+            engine.cleanup_after_error()
 
 
 # ---------------------------------------------------------------------------
@@ -3189,6 +3487,7 @@ def api_update_config(req: ConfigUpdateRequest) -> dict[str, Any]:
         cpu_offload=req.cpu_offload,
         vae_tiling=req.vae_tiling,
         inpaint_fast_crop=req.inpaint_fast_crop,
+        auto_load_on_open=req.auto_load_on_open,
         torch_compile=req.torch_compile,
         ai_endpoint=req.ai_endpoint,
         ai_api_key=req.ai_api_key,
@@ -3353,7 +3652,7 @@ def _build_ai_system_prompt(scene: str, context: dict[str, Any]) -> str:
         f"- 终端当前目录: {terminal.cwd}\n"
         f"{auto_run_note}"
         f"- 支持的仓库预设: Qwen/Qwen-Image-2.1-Turbo (推荐8步), Qwen/Qwen-Image-2.1 (推荐40步), addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit, abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8 (Q8满血, 推荐8步), abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4 (Q4轻量, 推荐8步)\n"
-        f"- 支持的量化模式: fp8-int8, fp8-all, int8-torchao, int8-bnb, gguf-q8-int8, gguf-q8-full, gguf-q4, none\n"
+        f"- 支持的量化模式: fp8-int8, bf16-int8, fp8-all, int8-torchao, int8-bnb, gguf-q8-int8, gguf-q8-full, gguf-q4, none\n"
         f"- 支持的显存调度: auto, smart_stage_offload, none, model_cpu_offload, sequential_cpu_offload\n"
         f"- 支持的生成比例: 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3\n"
     )
@@ -3766,18 +4065,30 @@ def api_clear_hf_cache() -> dict[str, Any]:
     return {"ok": True, "stats": collect_system_stats()}
 
 
-def _start_model_op(action: Literal["reload", "reinstall"]) -> dict[str, Any]:
+def _start_model_op(action: Literal["reload", "reinstall", "preload"]) -> dict[str, Any]:
     global _active_model_op_id
     with model_ops_lock:
         active_op = model_ops.get(_active_model_op_id) if _active_model_op_id else None
         if (active_op is not None and active_op.status in {"queued", "loading_model", "running"}) or engine.loading:
+            if action == "preload" and active_op is not None:
+                return {"ok": True, "reused": True, **active_op.to_dict()}
+            if action == "preload":
+                return {
+                    "ok": True,
+                    "reused": True,
+                    "task_id": None,
+                    "status": "loading_model",
+                    "message": f"模型 {engine.model_id} 正在加载中...",
+                }
             raise HTTPException(status_code=409, detail="已有模型加载或重装任务正在进行中，请稍候")
 
-        init_msg = (
-            "准备删除已安装的所有模型并重新安装..."
-            if action == "reinstall"
-            else f"准备重新加载模型 {engine.model_id}..."
-        )
+        if action == "reinstall":
+            init_msg = "准备删除已安装的所有模型并重新安装..."
+        elif action == "preload":
+            init_msg = f"检测到本地已缓存，自动加载模型 {engine.model_id}..."
+        else:
+            init_msg = f"准备重新加载模型 {engine.model_id}..."
+
         op = ModelOpState(
             task_id=uuid.uuid4().hex[:10],
             action=action,
@@ -3816,6 +4127,13 @@ def _start_model_op(action: Literal["reload", "reinstall"]) -> dict[str, Any]:
                 op.status = "completed"
                 op.progress = 1.0
                 op.message = f"已删除所有模型并重新安装完成: {engine.model_id}"
+            elif action == "preload":
+                op.message = f"正在自动加载本地已下载模型 {engine.model_id}..."
+                op.progress = 0.08
+                engine.ensure_loaded(op)
+                op.status = "completed"
+                op.progress = 1.0
+                op.message = f"模型已自动加载就绪: {engine.model_id}"
             else:
                 op.message = "正在卸载当前模型..."
                 op.progress = 0.05
@@ -3831,7 +4149,8 @@ def _start_model_op(action: Literal["reload", "reinstall"]) -> dict[str, Any]:
             err_msg = str(exc) if str(exc) and str(exc) != "None" else f"{type(exc).__name__}: {exc}"
             op.status = "error"
             op.error = err_msg
-            op.message = f"{'重装模型' if action == 'reinstall' else '重新加载模型'}失败: {err_msg}"
+            action_label = "重装模型" if action == "reinstall" else ("自动加载模型" if action == "preload" else "重新加载模型")
+            op.message = f"{action_label}失败: {err_msg}"
         finally:
             op.finished_at = time.time()
             with model_ops_lock:
@@ -3840,6 +4159,23 @@ def _start_model_op(action: Literal["reload", "reinstall"]) -> dict[str, Any]:
 
     threading.Thread(target=_worker, daemon=True).start()
     return {"ok": True, **op.to_dict()}
+
+
+@app.post("/api/model/preload", dependencies=[Depends(require_admin_auth)])
+def api_model_preload() -> dict[str, Any]:
+    """Idempotently preload an already-downloaded selected model when entering the web UI."""
+    if engine.demo_mode:
+        return {"ok": True, "status": "already_loaded", "task_id": None, "message": "演示模式已就绪"}
+    if engine.loaded and engine.pipe is not None:
+        return {"ok": True, "status": "already_loaded", "task_id": None, "message": f"模型已加载: {engine.model_id}"}
+    if not engine.is_selected_model_downloaded():
+        return {
+            "ok": True,
+            "status": "not_downloaded",
+            "task_id": None,
+            "message": f"模型 {engine.model_id} 尚未在本地下载完成，跳过自动加载",
+        }
+    return _start_model_op("preload")
 
 
 @app.post("/api/model/reload", dependencies=[Depends(require_admin_auth)])

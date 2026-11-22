@@ -110,6 +110,8 @@
     loraControlB64: null,
     comfyPollTimer: null,
     comfyOpenedOnce: false,
+    autoPreloadPolling: false,
+    activePreloadTaskId: null,
     galleryItems: [],
     galleryFilter: "all",
     gallerySearch: "",
@@ -677,7 +679,89 @@
   // -------------------------------------------------------------------------
   // Mode Switching
   // -------------------------------------------------------------------------
+  function syncImagesOnModeChange(prevMode, nextMode) {
+    if (prevMode === nextMode) return;
+
+    if (nextMode === "inpaint") {
+      const existingByB64 = new Map();
+      (state.inpaintItems || []).forEach((it) => {
+        if (it && it.b64 && !existingByB64.has(it.b64)) {
+          existingByB64.set(it.b64, it);
+        }
+      });
+
+      const incoming = [];
+      if (state.initImageB64) {
+        incoming.push({
+          b64: state.initImageB64,
+          width: state.initImageObj?.width || 1024,
+          height: state.initImageObj?.height || 1024,
+        });
+      }
+      (state.extraRefImages || []).forEach((it) => {
+        if (it && it.b64) {
+          incoming.push({
+            b64: it.b64,
+            width: it.width || 1024,
+            height: it.height || 1024,
+          });
+        }
+      });
+
+      if (incoming.length > 0) {
+        const merged = [];
+        const seen = new Set();
+        incoming.forEach((cand) => {
+          if (seen.has(cand.b64) || merged.length >= 10) return;
+          seen.add(cand.b64);
+          if (existingByB64.has(cand.b64)) {
+            merged.push(existingByB64.get(cand.b64));
+          } else {
+            merged.push({
+              id: `${Date.now()}_${Math.random().toString(16).slice(2, 7)}`,
+              b64: cand.b64,
+              width: cand.width,
+              height: cand.height,
+              maskB64: null,
+              maskPreviewB64: null,
+              hasMask: false,
+            });
+          }
+        });
+        (state.inpaintItems || []).forEach((it) => {
+          if (it && it.hasMask && it.b64 && !seen.has(it.b64) && merged.length < 10) {
+            seen.add(it.b64);
+            merged.push(it);
+          }
+        });
+        state.inpaintItems = merged;
+      } else if (state.inpaintItems.length > 0 && !state.initImageB64) {
+        syncPrimaryFromInpaintTop().then(() => refreshImageStage()).catch(() => {});
+      }
+      return;
+    }
+
+    if (prevMode === "inpaint" && (nextMode === "i2i" || nextMode === "hires")) {
+      if (state.inpaintItems.length > 0) {
+        const top = state.inpaintItems[0];
+        if (state.initImageB64 !== top.b64 || !state.initImageObj) {
+          syncPrimaryFromInpaintTop().then(() => {
+            if (state.mode === "i2i" || state.mode === "hires") refreshImageStage();
+          }).catch(() => {});
+        }
+        if (nextMode === "i2i" && state.inpaintItems.length > 1) {
+          state.extraRefImages = state.inpaintItems.slice(1, 10).map((it) => ({
+            b64: it.b64,
+            width: it.width || 1024,
+            height: it.height || 1024,
+          }));
+        }
+      }
+    }
+  }
+
   function setMode(mode, skipDenoiseReset = false) {
+    const prevMode = state.mode;
     state.mode = mode;
     document.querySelectorAll(".mode-tab").forEach((t) => {
       t.classList.toggle("active", t.dataset.mode === mode);
@@ -710,6 +794,7 @@
     }
     $("denoiseBlock").classList.toggle("hidden", mode === "t2i");
 
+    syncImagesOnModeChange(prevMode, mode);
     refreshImageStage();
     if (!skipDenoiseReset) scheduleSaveStudioPrefs();
   }
@@ -2317,6 +2402,7 @@
 
       let quantTag = "INT8";
       if (eng.quant_mode === "none") quantTag = `${eng.effective_dtype.toUpperCase()} 满血`;
+      else if (eng.quant_mode === "bf16-int8") quantTag = "BF16+INT8";
       else if (eng.quant_mode === "gguf-q8-int8") quantTag = "GGUF Q8+INT8";
       else if (eng.quant_mode === "gguf-q8-full" || eng.gguf_variant === "q8") quantTag = "GGUF Q8";
       else if (eng.quant_mode === "gguf-q4" || eng.gguf_variant === "q4") quantTag = "GGUF Q4";
@@ -2327,7 +2413,9 @@
       const modelShort = (eng.model_id || "Qwen-Image-2.1").split("/").pop();
       const ramPct = Math.round(Number(ram.percent || 0));
       const diskPct = Math.round(Number(disk.percent || 0));
-      $("engineStatusText").textContent = `${modelShort} · 内存 ${ramPct}% · 磁盘 ${diskPct}%`;
+      if (!state.autoPreloadPolling) {
+        $("engineStatusText").textContent = `${modelShort} · 内存 ${ramPct}% · 磁盘 ${diskPct}%` + (eng.loading ? " · 加载模型中..." : "");
+      }
 
       highlightActivePresetCard(eng.model_id, eng.quant_mode);
 
@@ -2357,7 +2445,7 @@
 
       $("outputsSizeText").textContent = `${s.storage.outputs_mb} MB`;
       $("hfCacheSizeText").textContent = `${s.storage.hf_cache_gb} GB`;
-      $("modelLoadedText").textContent = eng.demo_mode ? "演示模式" : eng.loaded ? "已加载" : "待加载";
+      $("modelLoadedText").textContent = eng.demo_mode ? "演示模式" : eng.loaded ? "已加载" : eng.loading ? "加载中..." : "待加载";
       $("uptimeText").textContent = formatUptime(eng.uptime_sec || 0);
 
       $("gpuProfileBadge").textContent = gpu.arch || "GPU 适配";
@@ -2374,6 +2462,7 @@
         $("galleryGdriveHint").textContent = s.gdrive.mounted
           ? `Google 云盘已挂载：${s.gdrive.target_dir}（可勾选作品或点击「保存云盘」备份）`
           : "未检测到 Google 云盘挂载（可在 Colab 启动器勾选 MOUNT_GDRIVE 后点击「保存云盘」备份）";
+        $("galleryGdriveHint").classList.remove("hidden");
       }
     } catch (_) {
       $("engineStatusText").textContent = "连接已断开";
@@ -2662,6 +2751,7 @@
             vae_tiling_mode: $("vaeTilingSelect").value,
             hf_token: $("hfTokenInput").value.trim() || null,
             inpaint_fast_crop: $("inpaintFastCropToggle").checked,
+            auto_load_on_open: $("autoLoadOnOpenToggle") ? $("autoLoadOnOpenToggle").checked : true,
             torch_compile: $("torchCompileToggle") ? $("torchCompileToggle").checked : false,
           }),
         },
@@ -2743,6 +2833,18 @@
   $("inpaintFastCropToggle").addEventListener("change", () =>
     savePreferenceOnly({ inpaint_fast_crop: $("inpaintFastCropToggle").checked }, "已更新局部重绘加速设置")
   );
+  if ($("autoLoadOnOpenToggle")) {
+    $("autoLoadOnOpenToggle").addEventListener("change", () => {
+      const enabled = $("autoLoadOnOpenToggle").checked;
+      savePreferenceOnly(
+        { auto_load_on_open: enabled },
+        enabled ? "已开启：进入网页自动加载本地已下载模型" : "已关闭进入网页自动加载模型"
+      );
+      if (enabled) {
+        apiFetch("/api/stats").then((st) => maybeTriggerAutoPreload(st?.engine)).catch(() => {});
+      }
+    });
+  }
   if ($("torchCompileToggle")) {
     $("torchCompileToggle").addEventListener("change", () =>
       savePreferenceOnly(
@@ -2758,6 +2860,10 @@
       try {
         const auth = await apiFetch("/api/auth/status");
         showToast(auth.authenticated ? "管理令牌验证成功" : "令牌无效，请核对 Colab 控制台输出");
+        if (auth.authenticated) {
+          const st = await apiFetch("/api/stats");
+          maybeTriggerAutoPreload(st?.engine);
+        }
       } catch (err) {
         showToast(`令牌校验失败: ${err.message}`);
       }
@@ -2776,7 +2882,9 @@
       if (auth.authenticated) {
         closeAuthTokenModal();
         showToast("管理令牌已验证并保存");
-        refreshStats();
+        await refreshStats();
+        const st = await apiFetch("/api/stats");
+        maybeTriggerAutoPreload(st?.engine);
       } else {
         showToast("管理令牌不匹配，请重新粘贴");
       }
@@ -3030,7 +3138,7 @@
     const file = e.target.files?.[0];
     if (!file) return;
     const rawUrl = await readFileAsDataUrl(file);
-    const dataUrl = await compressImageDataUrl(rawUrl, 1400, 0.88);
+    const { dataUrl } = await compressImageDataUrl(rawUrl, 1400, 0.88);
     state.loraControlB64 = dataUrl;
     $("loraCtrlPreviewImg").src = dataUrl;
     $("loraCtrlPlaceholder").classList.add("hidden");
@@ -3721,13 +3829,14 @@
   // Global Keyboard Shortcuts (Ctrl+Enter Generate, Esc Close Modals)
   // -------------------------------------------------------------------------
   function hasOpenModal() {
-    return ["lightboxModal", "shutdownModal", "loraDownloadModal", "inpaintCanvasModal", "aiAssistantModal"]
-      .some((id) => !$(id).classList.contains("hidden"));
+    return ["lightboxModal", "shutdownModal", "loraDownloadModal", "inpaintCanvasModal", "aiAssistantModal", "authTokenModal"]
+      .some((id) => !$(id)?.classList.contains("hidden"));
   }
 
   window.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
-      if (!$("lightboxModal").classList.contains("hidden")) closeLightbox();
+      if (!$("authTokenModal")?.classList.contains("hidden")) closeAuthTokenModal();
+      else if (!$("lightboxModal").classList.contains("hidden")) closeLightbox();
       else if (!$("aiAssistantModal").classList.contains("hidden")) closeAiModal();
       else if (!$("inpaintCanvasModal").classList.contains("hidden")) closeInpaintModal(false);
       else if (!$("loraDownloadModal").classList.contains("hidden")) closeLoraModal();
@@ -3741,6 +3850,68 @@
       }
     }
   });
+
+  // -------------------------------------------------------------------------
+  // Auto-Preload Cached Model on Entry
+  // -------------------------------------------------------------------------
+  async function pollAutoPreloadTask(taskId) {
+    if (!taskId) return;
+    if (state.autoPreloadPolling && state.activePreloadTaskId === taskId) return;
+    state.autoPreloadPolling = true;
+    state.activePreloadTaskId = taskId;
+    setTopBusy(true);
+    try {
+      while (state.activePreloadTaskId === taskId) {
+        const op = await apiFetch(`/api/model/op/${taskId}`);
+        const pct = Math.max(0, Math.min(100, Math.round((Number(op.progress) || 0) * 100)));
+        $("engineStatusText").textContent = `自动加载模型 ${pct}% · ${op.message || "加载中..."}`;
+        if ($("modelLoadedText")) $("modelLoadedText").textContent = `加载中 ${pct}%`;
+        const wrap = $("modelOpProgressWrap");
+        if (wrap && !wrap.classList.contains("hidden")) {
+          $("modelOpProgressMsg").textContent = op.message || "自动加载模型中...";
+          $("modelOpProgressPct").textContent = `${pct}%`;
+          $("modelOpProgressFill").style.width = `${Math.max(2, pct)}%`;
+        }
+        if (op.status === "completed") {
+          showToast(op.message || "已下载模型已自动加载就绪", 3200);
+          await refreshStats();
+          break;
+        }
+        if (op.status === "error") {
+          showToast(`自动加载模型失败: ${op.error || op.message || "未知错误"}`, 5000);
+          await refreshStats();
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 800));
+      }
+    } catch (_) {
+    } finally {
+      if (state.activePreloadTaskId === taskId) {
+        state.autoPreloadPolling = false;
+        state.activePreloadTaskId = null;
+      }
+      setTopBusy(false);
+    }
+  }
+
+  async function maybeTriggerAutoPreload(eng) {
+    if (!eng || eng.demo_mode || eng.loaded || eng.auto_load_on_open === false) return;
+    try {
+      const auth = await apiFetch("/api/auth/status");
+      if (!auth || !auth.authenticated) return;
+      if (eng.active_model_op && ["queued", "loading_model", "running"].includes(eng.active_model_op.status)) {
+        pollAutoPreloadTask(eng.active_model_op.task_id);
+        return;
+      }
+      if (!eng.selected_model_downloaded) return;
+      const pre = await apiFetch("/api/model/preload", { method: "POST" });
+      if (pre && pre.task_id) {
+        pollAutoPreloadTask(pre.task_id);
+      } else if (pre && pre.status === "already_loaded") {
+        await refreshStats();
+      }
+    } catch (_) {}
+  }
 
   // -------------------------------------------------------------------------
   // Init
@@ -3765,9 +3936,11 @@
     applyResolution(1024, 1024, true);
     const hadLocalPrefs = restoreStudioPrefs();
 
+    let initEngine = null;
     try {
       const stats = await apiFetch("/api/stats");
       const eng = stats.engine || {};
+      initEngine = eng;
       state.modelDefaultSteps = eng.default_steps || 8;
 
       if (eng.model_id) {
@@ -3790,6 +3963,9 @@
       if (eng.vae_tiling_mode) $("vaeTilingSelect").value = eng.vae_tiling_mode;
       if (typeof eng.inpaint_fast_crop === "boolean") {
         $("inpaintFastCropToggle").checked = eng.inpaint_fast_crop;
+      }
+      if (typeof eng.auto_load_on_open === "boolean" && $("autoLoadOnOpenToggle")) {
+        $("autoLoadOnOpenToggle").checked = eng.auto_load_on_open;
       }
       if (typeof eng.torch_compile === "boolean" && $("torchCompileToggle")) {
         $("torchCompileToggle").checked = eng.torch_compile;
@@ -3818,6 +3994,7 @@
     } catch (_) {}
 
     await refreshStats();
+    maybeTriggerAutoPreload(initEngine);
     refreshLoraList();
     pollComfyStatusLoop();
     scheduleNextStats();

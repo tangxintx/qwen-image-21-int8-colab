@@ -200,7 +200,6 @@ def _run_http_tests() -> None:
     _assert_gguf_and_comfy_extensions()
     _assert_new_pm_features_and_fixes()
     _assert_l4_perf_stability_and_security()
-    _assert_l4_perf_stability_and_security()
 
     # Verify Google Drive endpoints via HTTP TestClient (unmounted -> 400, mounted -> copies files)
     from pathlib import Path
@@ -667,7 +666,7 @@ def _assert_profiles_and_modes(update_fn) -> None:
         ("g4_rtx_pro_6000", "bfloat16", "none"),
         ("h100_sxm", "bfloat16", "none"),
         ("a100_sxm", "bfloat16", "none"),
-        ("l4_ada", "bfloat16", "none"),
+        ("l4_ada", "bfloat16", "smart_stage_offload"),
         ("t4_turing", "float16", "model_cpu_offload"),
     ]:
         eng = update_fn(
@@ -696,7 +695,7 @@ def _assert_profiles_and_modes(update_fn) -> None:
     assert full_cfg["default_steps"] == 40
     assert full_cfg["effective_offload"] == "sequential_cpu_offload"
 
-    # L4 FP8 DiT + INT8 TextEncoder + BF16 VAE -> full resident (`none`), no VAE tiling at <= 1536, no attention slicing
+    # L4 FP8 DiT + INT8 TextEncoder + BF16 VAE -> smart_stage_offload (DiT+VAE resident, TE offloaded), no VAE tiling at <= 1536
     l4_cfg = update_fn(
         {
             "model_id": "Qwen/Qwen-Image-2.1-Turbo",
@@ -708,10 +707,36 @@ def _assert_profiles_and_modes(update_fn) -> None:
     )
     assert l4_cfg["quant_mode"] == "fp8-int8"
     assert l4_cfg["effective_dtype"] == "bfloat16"
-    assert l4_cfg["effective_offload"] == "none"
+    assert l4_cfg["effective_offload"] == "smart_stage_offload"
     assert l4_cfg["effective_vae_tiling"] is False
 
-    # L4 GGUF Q8 + TorchAO INT8 TE fits resident (`none`) while BF16 TE uses true stage offload
+    # L4 Native BF16 DiT + INT8 TE (bf16-int8) -> smart_stage_offload on L4, sequential on T4
+    bf16_l4 = update_fn(
+        {
+            "model_id": "Qwen/Qwen-Image-2.1-Turbo",
+            "quant_mode": "bf16-int8",
+            "gpu_profile_override": "l4_ada",
+            "offload_mode": "auto",
+            "dtype_mode": "auto",
+        }
+    )
+    assert bf16_l4["quant_mode"] == "bf16-int8"
+    assert bf16_l4["effective_dtype"] == "bfloat16"
+    assert bf16_l4["effective_offload"] == "smart_stage_offload"
+    assert bf16_l4["effective_vae_tiling"] is False
+
+    bf16_t4 = update_fn(
+        {
+            "model_id": "Qwen/Qwen-Image-2.1-Turbo",
+            "quant_mode": "bf16-int8",
+            "gpu_profile_override": "t4_turing",
+            "offload_mode": "auto",
+            "dtype_mode": "auto",
+        }
+    )
+    assert bf16_t4["effective_offload"] == "sequential_cpu_offload"
+
+    # L4 GGUF Q8 + TorchAO INT8 TE uses smart_stage_offload on L4; Q4 fits fully resident (`none`)
     q8_int8_l4 = update_fn(
         {
             "model_id": "abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8",
@@ -722,7 +747,19 @@ def _assert_profiles_and_modes(update_fn) -> None:
         }
     )
     assert q8_int8_l4["gguf_variant"] == "q8" and q8_int8_l4["is_gguf"] is True
-    assert q8_int8_l4["effective_offload"] == "none"
+    assert q8_int8_l4["effective_offload"] == "smart_stage_offload"
+
+    q4_l4 = update_fn(
+        {
+            "model_id": "abenzerps/Qwen-Image-2.1-Turbo-Quantized:q4",
+            "quant_mode": "gguf-q4",
+            "gpu_profile_override": "l4_ada",
+            "offload_mode": "auto",
+            "dtype_mode": "auto",
+        }
+    )
+    assert q4_l4["gguf_variant"] == "q4" and q4_l4["is_gguf"] is True
+    assert q4_l4["effective_offload"] == "none"
 
     # Uncensored GGUF Q8 ("Q8直接拉满") & Q4 presets + offload rules
     assert "abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8" in server.MODEL_PRESETS
@@ -1011,6 +1048,7 @@ def _assert_l4_perf_stability_and_security() -> None:
                         "has_prompt": prompt is not None,
                         "has_embeds": prompt_embeds is not None,
                         "has_image_pad_mask": image_pad_mask is not None,
+                        "generator_device": getattr(getattr(generator, "device", None), "type", None),
                         "sigmas": sigmas,
                         "vae_tiling": self.vae.tiling,
                     }
@@ -1050,7 +1088,9 @@ def _assert_l4_perf_stability_and_security() -> None:
             assert fake_pipe.encode_calls == 1
             assert fake_pipe.pipe_calls[0]["has_prompt"] is False
             assert fake_pipe.pipe_calls[0]["has_embeds"] is True
+            assert fake_pipe.pipe_calls[0]["generator_device"] == "cpu", "Generator must stay on CPU for offload/retry safety"
             assert fake_pipe.pipe_calls[0]["sigmas"] == server.TURBO_SAMPLE_SIGMAS
+            assert job.stage_timings is not None and job.stage_timings["prompt_cache_hit"] is True
             assert fake_pipe.transformer.device_history == ["cpu", "cuda"]
             assert fake_pipe.text_encoder.device_history[-1] == "cpu"
 
@@ -1065,6 +1105,26 @@ def _assert_l4_perf_stability_and_security() -> None:
             assert out2.size == (1024, 1024)
             assert fake_pipe.encode_calls == 1
             assert fake_pipe.transformer.device_history == []
+            assert fake_pipe.pipe_calls[-1]["generator_device"] == "cpu"
+            assert job.stage_timings is not None and job.stage_timings["prompt_cache_hit"] is True
+
+            # Fresh prompt without OOM -> prompt_cache_hit=False on 1st call, True on 2nd call
+            eng.generate_one(
+                mode="t2i", prompt="alpine lake", negative_prompt="", width=1024, height=1024,
+                steps=8, denoise=0.75, true_cfg_scale=1.0, seed=203,
+                init_image=None, mask_image=None, extra_ref_images=None,
+                hires_scale=1.5, mask_blur=8, job=job, batch_idx=0,
+            )
+            assert fake_pipe.encode_calls == 2
+            assert job.stage_timings is not None and job.stage_timings["prompt_cache_hit"] is False
+            eng.generate_one(
+                mode="t2i", prompt="alpine lake", negative_prompt="", width=1024, height=1024,
+                steps=8, denoise=0.75, true_cfg_scale=1.0, seed=204,
+                init_image=None, mask_image=None, extra_ref_images=None,
+                hires_scale=1.5, mask_blur=8, job=job, batch_idx=1,
+            )
+            assert fake_pipe.encode_calls == 2
+            assert job.stage_timings is not None and job.stage_timings["prompt_cache_hit"] is True
 
             # Dynamic VAE tiling engages only above 1536x1536 in auto mode
             fake_pipe.vae.disable_tiling()
@@ -1076,6 +1136,52 @@ def _assert_l4_perf_stability_and_security() -> None:
                 hires_scale=1.5, mask_blur=8, job=job, batch_idx=1,
             )
             assert fake_pipe.pipe_calls[-1]["vae_tiling"] is True
+
+        # Adaptive VRAM cleanup helper & error cleanup hook
+        class _FakeCuda:
+            def __init__(self, free_gb: float, alloc_gb: float, res_gb: float):
+                self.free_b = int(free_gb * (1024**3))
+                self.alloc_b = int(alloc_gb * (1024**3))
+                self.res_b = int(res_gb * (1024**3))
+                self.empty_calls = 0
+
+            def is_available(self):
+                return True
+
+            def mem_get_info(self, _idx=0):
+                return self.free_b, int(24 * (1024**3))
+
+            def memory_allocated(self, _idx=0):
+                return self.alloc_b
+
+            def memory_reserved(self, _idx=0):
+                return self.res_b
+
+            def empty_cache(self):
+                self.empty_calls += 1
+
+        healthy_torch = SimpleNamespace(cuda=_FakeCuda(free_gb=12.0, alloc_gb=8.0, res_gb=8.3))
+        eng._maybe_release_vram(healthy_torch, force=False, collect_gc=False)
+        assert healthy_torch.cuda.empty_calls == 0
+
+        low_free_torch = SimpleNamespace(cuda=_FakeCuda(free_gb=2.5, alloc_gb=18.0, res_gb=18.2))
+        eng._maybe_release_vram(low_free_torch, force=False, collect_gc=False)
+        assert low_free_torch.cuda.empty_calls == 1
+
+        frag_torch = SimpleNamespace(cuda=_FakeCuda(free_gb=10.0, alloc_gb=8.0, res_gb=9.6))
+        eng._maybe_release_vram(frag_torch, force=False, collect_gc=False)
+        assert frag_torch.cuda.empty_calls == 1
+
+        cleanup_calls: list[bool] = []
+        with patch.object(server.engine, "cleanup_after_error", side_effect=lambda: cleanup_calls.append(True)):
+            err_job_id = server.api_generate(
+                server.GenerateRequest(mode="i2i", prompt="missing img triggers cleanup", width=256, height=256, steps=2)
+            )["job_id"]
+            for _ in range(40):
+                if server.api_get_job(err_job_id)["status"] == "error" and cleanup_calls:
+                    break
+                time.sleep(0.05)
+        assert cleanup_calls == [True], "Failed job must call engine.cleanup_after_error()"
 
         # 2) Dual-lock safety: unload() blocks until _infer_lock is released
         eng.loaded = True
@@ -1332,6 +1438,7 @@ def _assert_l4_perf_stability_and_security() -> None:
         "/api/system/clear-hf-cache",
         "/api/system/enable-swap",
         "/api/system/free-vram",
+        "/api/model/preload",
         "/api/model/reload",
         "/api/model/reinstall",
         "/api/model/op/{task_id}",
@@ -1376,6 +1483,102 @@ def _assert_l4_perf_stability_and_security() -> None:
     assert server._safe_child_path(server.OUTPUT_DIR, "") is None
     assert server._safe_child_path(server.OUTPUT_DIR, "..") is None
     assert "_has_qwen_diffusers" in inspect.getsource(__import__("build_colab_notebook"))
+
+    # 10) Auto-preload on entry: local cache detection, idempotent /api/model/preload, & frontend bugfix checks
+    old_demo = server.engine.demo_mode
+    old_loaded = server.engine.loaded
+    old_loading = server.engine.loading
+    old_pipe = server.engine.pipe
+    old_mid = server.engine.model_id
+    old_qmode = server.engine.quant_mode
+    old_ensure = server.engine.ensure_loaded
+    old_hub_env = os.environ.get("HF_HUB_CACHE")
+    try:
+        with tempfile.TemporaryDirectory(prefix="qwen_preload_hub_") as pre_hub:
+            os.environ["HF_HUB_CACHE"] = pre_hub
+            server.engine.demo_mode = False
+            server.engine.loaded = False
+            server.engine.loading = False
+            server.engine.pipe = None
+            server.engine.model_id = "Qwen/Qwen-Image-2.1-Turbo"
+            server.engine.quant_mode = "fp8-int8"
+
+            ensure_gate = threading.Event()
+            ensure_calls = 0
+
+            def _fake_ensure_loaded(op_job=None):
+                nonlocal ensure_calls
+                ensure_calls += 1
+                ensure_gate.wait(timeout=2.0)
+                server.engine.pipe = object()
+                server.engine.loaded = True
+
+            server.engine.ensure_loaded = _fake_ensure_loaded  # type: ignore
+
+            # Missing cache -> not_downloaded & ensure_loaded NOT invoked
+            assert server.engine.is_selected_model_downloaded() is False
+            res_missing = server.api_model_preload()
+            assert res_missing["status"] == "not_downloaded" and ensure_calls == 0
+
+            # Incomplete blob -> still False
+            repo_dir = Path(pre_hub) / "models--Qwen--Qwen-Image-2.1-Turbo"
+            snap_dir = repo_dir / "snapshots" / "rev_ok" / "transformer"
+            snap_dir.mkdir(parents=True, exist_ok=True)
+            ((repo_dir / "snapshots" / "rev_ok") / "model_index.json").write_text("{}", encoding="utf-8")
+            (snap_dir / "diffusion_pytorch_model.safetensors").write_bytes(b"weights")
+            blobs_dir = repo_dir / "blobs"
+            blobs_dir.mkdir(parents=True, exist_ok=True)
+            inc_blob = blobs_dir / "abc.incomplete"
+            inc_blob.write_bytes(b"part")
+            assert server.engine.is_selected_model_downloaded() is False
+
+            # Clean cache -> True; /api/model/preload starts idempotent background task and deduplicates 2nd call
+            inc_blob.unlink()
+            assert server.engine.is_selected_model_downloaded() is True
+            pre1 = server.api_model_preload()
+            assert pre1["ok"] is True and pre1.get("task_id")
+            pre2 = server.api_model_preload()
+            assert pre2["ok"] is True and pre2.get("reused") is True and pre2.get("task_id") == pre1["task_id"]
+
+            ensure_gate.set()
+            for _ in range(40):
+                op_st = server.api_model_op_status(pre1["task_id"])
+                if op_st["status"] == "completed":
+                    break
+                time.sleep(0.05)
+            assert op_st["status"] == "completed" and ensure_calls == 1
+            pre3 = server.api_model_preload()
+            assert pre3["status"] == "already_loaded" and pre3["task_id"] is None
+    finally:
+        server.engine.demo_mode = old_demo
+        server.engine.loaded = old_loaded
+        server.engine.loading = old_loading
+        server.engine.pipe = old_pipe
+        server.engine.model_id = old_mid
+        server.engine.quant_mode = old_qmode
+        server.engine.ensure_loaded = old_ensure
+        if old_hub_env is None:
+            os.environ.pop("HF_HUB_CACHE", None)
+        else:
+            os.environ["HF_HUB_CACHE"] = old_hub_env
+
+    # Auto-load-on-open config toggle persists without triggering model reload
+    server.api_update_config(server.ConfigUpdateRequest(auto_load_on_open=False))
+    assert server.api_stats()["engine"]["auto_load_on_open"] is False
+    server.api_update_config(server.ConfigUpdateRequest(auto_load_on_open=True))
+    assert server.api_stats()["engine"]["auto_load_on_open"] is True
+
+    # Frontend regression guards (inpaint image sync, LoRA control image destructuring, authTokenModal Esc, GDrive hint, auto-preload)
+    app_js = (server.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    index_html_now = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    assert "syncImagesOnModeChange" in app_js
+    assert "const { dataUrl } = await compressImageDataUrl(rawUrl, 1400, 0.88);" in app_js
+    assert '"authTokenModal"' in app_js
+    assert 'galleryGdriveHint").classList.remove("hidden")' in app_js
+    assert "/api/model/preload" in app_js
+    assert "autoLoadOnOpenToggle" in index_html_now
+    assert 'value="bf16-int8"' in index_html_now
+    assert "(默认 Q8 满血)" not in index_html_now
 
 
 def run_tests() -> None:
