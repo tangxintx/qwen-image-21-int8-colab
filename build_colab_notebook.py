@@ -29,9 +29,22 @@ from tqdm.auto import tqdm
 
 def _has_qwen_diffusers() -> bool:
     try:
+        import inspect
         import diffusers
 
-        return hasattr(diffusers, "QwenImage21Pipeline")
+        pipe_cls = getattr(diffusers, "QwenImage21Pipeline", None)
+        if pipe_cls is None:
+            return False
+        # Verify Turbo sample_sigmas support (merged in PR #14950, after initial PR #14804)
+        init_params = inspect.signature(pipe_cls.__init__).parameters
+        call_params = inspect.signature(pipe_cls.__call__).parameters
+        if "sample_sigmas" in init_params:
+            return True
+        src = inspect.getsource(pipe_cls)
+        has_sigmas = ("sample_sigmas" in src) and ("sigmas" in call_params)
+        if not has_sigmas:
+            print("[提示] 检测到旧版 Diffusers 缺少 Turbo sample_sigmas 调度支持，将升级至最新版...")
+        return has_sigmas
     except Exception:
         return False
 
@@ -108,10 +121,10 @@ from pathlib import Path
 from tqdm.auto import tqdm
 
 #@markdown ### 1. 模型方案与硬件预设
-EDITION = "Uncensored GGUF Q8 满血版 (Turbo-Quantized Q8_0 DiT + 全精度BF16编码器 + BF16 VAE)"  #@param ["Uncensored GGUF Q8 满血版 (Turbo-Quantized Q8_0 DiT + 全精度BF16编码器 + BF16 VAE)", "Uncensored GGUF Q4 轻量版 (Q4_K_M DiT + Qwen3-VL-8B Q4_K_M + BF16 VAE)", "L4 24GB 黄金方案 · Turbo FP8 DiT + INT8 编码器 + BF16 VAE", "L4 24GB 精绘方案 · Qwen-2.1 FP8 DiT + INT8 编码器 + BF16 VAE 40步", "INT8 轻量省显存版 (Turbo · 推荐 T4/L4)", "满血版 · Turbo 原生BF16/FP16不量化 (适合 A100/H100/G4)", "满血旗舰版 · Qwen-2.1 原生BF16/FP16 40步 (适合 A100-80G/H100/G4)", "自定义下方模型与量化参数"]
+EDITION = "L4 24GB 黄金极速方案 · Turbo FP8 DiT + INT8 编码器 + BF16 VAE (默认推荐)"  #@param ["L4 24GB 黄金极速方案 · Turbo FP8 DiT + INT8 编码器 + BF16 VAE (默认推荐)", "预量化 8-bit 极速加载版 (addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit)", "L4 24GB 精绘方案 · Qwen-2.1 FP8 DiT + INT8 编码器 + BF16 VAE 40步", "Uncensored GGUF Q8 + INT8编码器 (L4 常驻显存版)", "Uncensored GGUF Q8 满血版 (Turbo-Quantized Q8_0 DiT + 全精度BF16编码器 + BF16 VAE)", "Uncensored GGUF Q4 轻量版 (Q4_K_M DiT + Qwen3-VL-8B Q4_K_M + BF16 VAE)", "INT8 轻量省显存版 (Turbo · 推荐 T4/L4)", "满血版 · Turbo 原生BF16/FP16不量化 (适合 A100/H100/G4)", "满血旗舰版 · Qwen-2.1 原生BF16/FP16 40步 (适合 A100-80G/H100/G4)", "自定义下方模型与量化参数"]
 GPU_PROFILE = "auto"  #@param ["auto", "g4_rtx_pro_6000", "h100_sxm", "a100_sxm", "l4_ada", "t4_turing"]
-MODEL_ID = "abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8"  #@param ["abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8", "abenzerps/Qwen-Image-2.1-Turbo-Quantized:q4", "abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8", "abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4", "Qwen/Qwen-Image-2.1-Turbo", "Qwen/Qwen-Image-2.1", "addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit"] {{allow-input: true}}
-QUANT_MODE = "gguf-q8-full"  #@param ["gguf-q8-full", "gguf-q4", "fp8-int8", "fp8-all", "int8-torchao", "int8-bnb", "none"]
+MODEL_ID = "Qwen/Qwen-Image-2.1-Turbo"  #@param ["Qwen/Qwen-Image-2.1-Turbo", "addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit", "Qwen/Qwen-Image-2.1", "abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8", "abenzerps/Qwen-Image-2.1-Turbo-Quantized:q4", "abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8", "abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4"] {{allow-input: true}}
+QUANT_MODE = "fp8-int8"  #@param ["fp8-int8", "fp8-all", "int8-torchao", "int8-bnb", "gguf-q8-int8", "gguf-q8-full", "gguf-q4", "none"]
 
 #@markdown ### 2. 下载加速、Google 云盘挂载与内存选项
 HF_TOKEN = ""  #@param {{type:"string"}}
@@ -161,10 +174,12 @@ if str(work_dir) not in sys.path:
 
 # 2) 解析版本预设
 EDITION_MAP = [
-    ("Uncensored GGUF Q8", ("abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8", "gguf-q8-full", "auto")),
+    ("L4 24GB 黄金极速方案", ("Qwen/Qwen-Image-2.1-Turbo", "fp8-int8", "auto")),
+    ("预量化 8-bit", ("addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit", "int8-torchao", "auto")),
+    ("L4 24GB 精绘方案", ("Qwen/Qwen-Image-2.1", "fp8-int8", "auto")),
+    ("Uncensored GGUF Q8 + INT8编码器", ("abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8", "gguf-q8-int8", "auto")),
+    ("Uncensored GGUF Q8 满血版", ("abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8", "gguf-q8-full", "auto")),
     ("Uncensored GGUF Q4", ("abenzerps/Qwen-Image-2.1-Turbo-Quantized:q4", "gguf-q4", "auto")),
-    ("L4 24GB 黄金方案", ("Qwen/Qwen-Image-2.1-Turbo", "fp8-int8", "smart_stage_offload")),
-    ("L4 24GB 精绘方案", ("Qwen/Qwen-Image-2.1", "fp8-int8", "smart_stage_offload")),
     ("满血旗舰版", ("Qwen/Qwen-Image-2.1", "none", "auto")),
     ("满血版", ("Qwen/Qwen-Image-2.1-Turbo", "none", "auto")),
     ("INT8", ("Qwen/Qwen-Image-2.1-Turbo", "int8-torchao", "auto")),
@@ -238,8 +253,8 @@ colab_launch.launch_in_colab()
                     "> **GitHub 仓库**：[tangxintx/qwen-image-21-int8-colab](https://github.com/tangxintx/qwen-image-21-int8-colab)\n",
                     "\n",
                     "每次运行第 2 步会自动同步最新代码并保留本地作品、LoRA 与 AI 配置：\n",
-                    "- **默认启动下载 Quantized Q8 版**：`abenzerps/Qwen-Image-2.1-Turbo-Quantized` Q8_0 + BF16 编码器 + BF16 VAE，L4 自动逐层智能调度防爆显存\n",
-                    "- **智能增量依赖安装**：Cell 1 自动检测已有环境，重复运行数秒完成\n",
+                    "- **默认 L4 极速方案 (FP8 DiT + INT8 编码器 + BF16 VAE)**：`Qwen/Qwen-Image-2.1-Turbo` 在 L4 24GB 全显存常驻推理（告别 GGUF 动态反量化与 PCIe 反复搬运），也支持一键切换 `addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit`、GGUF Q8/Q4 与 ComfyUI INT8-ConvRot\n",
+                    "- **智能增量依赖安装**：Cell 1 自动校验 Diffusers `QwenImage21Pipeline` + Turbo `sample_sigmas` 支持，重复运行数秒完成\n",
                     "- **Google 云盘自选挂载 & 作品库一键备份**：勾选 `MOUNT_GDRIVE` 后，可在网页作品库中一键保存到 Google 云盘\n",
                     "- **四大创作模式固定悬浮切换**：文生图 / 图生图（`@0..@9` 多图引用） / 高清修复 / 多图涂抹局部重绘（支持非标比例透明扩图还原与前后对比滑块）\n",
                     "- **五档 GPU 自动适配**：`RTX PRO 6000 (96GB)` / `H100 (80GB)` / `A100 (80G/40G)` / `L4 (24GB)` / `T4 (16GB)`",

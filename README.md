@@ -33,10 +33,10 @@
 ### 4. 五档 Colab GPU 自适应 & LoRA / ComfyUI / 监控
 - **五档硬件自动适配**（[gpu_profiles.py](gpu_profiles.py)）：
   - `G4 · RTX PRO 6000 (96GB, sm_120)` / `H100 (80GB, sm_90)` / `A100 (80GB/40GB, sm_80)`：原生 BF16 + TF32 全驻留。
-  - `L4 (24GB, sm_89)`：推荐 FP8 DiT + INT8 编码器 + BF16 VAE + 智能分阶段显存调度。
+  - `L4 (24GB, sm_89)`：默认推荐 **`Qwen/Qwen-Image-2.1-Turbo`（TorchAO FP8 DiT + INT8 编码器 + BF16 VAE，全显存常驻，禁用 `attention_slicing`）**，支持 Prompt 编码结果 LRU 缓存；使用 BF16 编码器时自动开启真分阶段调度（仅将 TE 卸载至 CPU）。
   - `T4 (16GB, sm_75)`：FP16 + Model CPU Offload + VAE/注意力切片防 OOM。
-- **LoRA 管理**：支持 Hugging Face / Civitai 页面链接自动解析直链下载、`.safetensors` 文件头防 HTML 拦截校验、ComfyUI/Kohya 键名前缀自动重映射，支持画风模式与参考图控制模式。
-- **按需 ComfyUI + GGUF 插件**：在设置页手动按需一键部署 ComfyUI 与 [`city96/ComfyUI-GGUF`](https://github.com/city96/ComfyUI-GGUF)，自动挂载 Q4/Q8 模型并生成开箱即用的工作流 JSON。
+- **LoRA 管理**：支持 Hugging Face / Civitai 页面链接自动解析直链下载、`.safetensors` 文件头与 NaN/Inf 校验、Kohya `lora_unet_` 层级还原与 `.alpha` 缩放自动折算，支持画风模式与参考图控制模式。
+- **按需 ComfyUI + INT8-ConvRot / GGUF 插件**：在设置页手动按需一键部署 ComfyUI，支持原生 **`INT8-ConvRot`**（7.26 GB DiT + 9.35 GB TE，最高效 L4 工作流）及 [`city96/ComfyUI-GGUF`](https://github.com/city96/ComfyUI-GGUF) Q4/Q8 工作流，并按显卡显存自动注入 `--normalvram` / `--lowvram` 与端口冲突自适应。
 - **资源监控、Web 终端与一键关闭**：实时监测 VRAM / RAM / Swap / 磁盘占用、已加载与缓存模型清单、服务日志流、ZIP 打包导出，支持手机端一键卸载模型关闭服务并可选调用 `google.colab.runtime.unassign()` 释放 Colab 计算单元。
 
 ---
@@ -99,12 +99,11 @@ qwen-image-21-int8-colab/
 
 1. **硬件与方案选型建议**
    - **T4 (16GB)**：推荐使用 `Turbo INT8 通用版` 或 `GGUF Q4 轻量版`，输出分辨率建议保持 `1K` 档位；不要在 T4 上强制关闭 CPU Offload 运行原生 BF16。
-   - **L4 (24GB)**：首选 **`L4 黄金极速版`（FP8 DiT + INT8 编码器 + BF16 VAE + 智能分阶段调度）**，峰值显存稳定在 11~13 GB，画质与速度最均衡。
+   - **L4 (24GB)**：默认 **`Turbo FP8 + INT8`（FP8 DiT + INT8 编码器 + BF16 VAE，全显存常驻无 PCIe 往返，禁用 `attention_slicing`）**，或 `addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit` / `GGUF Q8 + INT8 编码`；追求极速推荐先生成 `1K`（`1344×768`）再高清放大（`1.5K 16:9` 原生为 `1920×1088` 像素近翻倍）。
    - **A100 (80GB) / H100 / RTX PRO 6000**：可直接选择原生 BF16 不量化满血版，开启 `1.5K / 2K` 直出与多图连抽。
-2. **隐私与 API 密钥安全**
+2. **隐私、鉴权与 API 密钥安全**
    - `/api/stats` 仅向前端返回 `has_api_key` 与脱敏掩码（如 `sk-a***9f2b`），绝不回传完整明文密钥。
-   - `.ai_config.json` 已列入 `.gitignore`，本地二次开发提交代码前仍请确认未将密钥硬编码进 `.py` 或 `.ipynb`。
-   - Cloudflare `trycloudflare.com` 生成的是临时公网链接，**请勿将您的隧道地址分享给不可信的第三方**（因为 Web 终端具有当前容器 Shell 执行权限）。
+   - **一次性管理令牌保护**：Web 终端（`/api/terminal/*`）、系统运维（`/api/system/*`）、配置修改（`/api/config`）、删除、LoRA 下载与关机接口均受随机生成的 **Bearer Token (`QWEN_ADMIN_TOKEN`)** 鉴权；通过 Colab 输出的 `#token=...` 链接/二维码打开会自动在本地保存并清除地址栏令牌，且手工及 AI 终端命令统一经过高危指令安全护栏校验。
 3. **自选「AI 自动运行代码」安全边界**
    - 该功能默认**关闭**，仅在您明确信任所用大模型并需要自动排查依赖/环境问题时开启。
    - 虽然内置了高危命令正则护栏与 5 轮上限 / 60 秒单命令超时保护，但仍建议在运行期间留意 AI 弹窗中的实时输出，随时可点击「停止自动执行」强行中断。

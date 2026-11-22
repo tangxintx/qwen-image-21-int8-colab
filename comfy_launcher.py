@@ -2,7 +2,7 @@
 On-demand ComfyUI Launcher for Google Colab.
 Never clones, downloads, or starts ComfyUI automatically on startup.
 Only runs when explicitly triggered by the user from Settings.
-Includes automatic installation of `city96/ComfyUI-GGUF` and Q8/Q4 GGUF model staging.
+Supports native INT8-ConvRot (`comfy-kitchen`) as well as `city96/ComfyUI-GGUF` Q8/Q4 staging.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -29,6 +30,65 @@ CLOUDFLARED_BIN = Path("/tmp/cloudflared")
 COMFY_GGUF_URL = "https://github.com/city96/ComfyUI-GGUF"
 COMFY_GGUF_GIT = f"{COMFY_GGUF_URL}.git"
 COMFY_GGUF_QWEN3VL_TE_GIT = "https://github.com/pottokao-dotcom/ComfyUI-GGUF-Qwen3VL-TE.git"
+
+
+def _is_port_in_use(port: int) -> bool:
+    """Return True if a process is already listening or bound on `port`."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.35)
+        if probe.connect_ex(("127.0.0.1", port)) == 0:
+            return True
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+        try:
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            srv.bind(("0.0.0.0", port))
+            return False
+        except OSError:
+            return True
+
+
+def _find_available_port(preferred_port: int, max_tries: int = 20) -> int:
+    """Return `preferred_port` if free, otherwise the next available port up to `preferred_port + max_tries - 1`."""
+    for offset in range(max_tries):
+        cand = preferred_port + offset
+        if not _is_port_in_use(cand):
+            return cand
+    raise RuntimeError(f"端口 {preferred_port}–{preferred_port + max_tries - 1} 均已被占用，请先停止旧进程")
+
+
+def _resolve_comfy_vram_args(
+    gpu_profile_key: Optional[str] = None,
+    main_model_loaded: bool = False,
+) -> list[str]:
+    """Select ComfyUI VRAM flags (`--lowvram` / `--normalvram`) from GPU profile or CUDA device."""
+    vram_gb: Optional[float] = None
+    if gpu_profile_key:
+        try:
+            from gpu_profiles import GPU_PROFILES
+
+            if gpu_profile_key in GPU_PROFILES:
+                vram_gb = float(GPU_PROFILES[gpu_profile_key].vram_gb)
+        except Exception:
+            pass
+
+    if vram_gb is None:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        except Exception:
+            pass
+
+    if vram_gb is None:
+        vram_gb = 16.0
+
+    if main_model_loaded or vram_gb <= 16.5:
+        return ["--lowvram"]
+    if vram_gb <= 42.0:
+        return ["--normalvram"]
+    return []
 
 
 def _link_or_copy(src: Path, dst: Path) -> None:
@@ -60,11 +120,44 @@ def build_gguf_workflow(
     vae_filename: str = "qwen_image_2.1_vae_bf16.safetensors",
 ) -> dict[str, Any]:
     """
-    Build a ready-to-import ComfyUI workflow JSON for `abenzerps/Qwen-Image-2.1-Uncensored-GGUF`
-    using `city96/ComfyUI-GGUF` (`UnetLoaderGGUF` + `CLIPLoader`/`CLIPLoaderGGUF`) and native `TextEncodeQwenImage21`.
+    Build a ready-to-import ComfyUI workflow JSON for Qwen-Image-2.1:
+    - `int8_convrot`: Native ComfyUI `UNETLoader` + `CLIPLoader` (`comfy-kitchen` INT8-ConvRot, fastest on L4)
+    - `q8`: `UnetLoaderGGUF` + `CLIPLoader`
+    - `q4`: `UnetLoaderGGUF` + `CLIPLoaderGGUF`
     """
     v = variant.lower().strip()
     is_q4 = v == "q4"
+    is_convrot = v == "int8_convrot"
+
+    dit_node = (
+        {
+            "id": 1,
+            "type": "UNETLoader",
+            "pos": [60, 80],
+            "size": [340, 82],
+            "flags": {},
+            "order": 0,
+            "mode": 0,
+            "inputs": [],
+            "outputs": [{"name": "MODEL", "type": "MODEL", "links": [1], "slot_index": 0}],
+            "properties": {"Node name for S&R": "UNETLoader"},
+            "widgets_values": [dit_filename, "default"],
+        }
+        if is_convrot
+        else {
+            "id": 1,
+            "type": "UnetLoaderGGUF",
+            "pos": [60, 80],
+            "size": [340, 58],
+            "flags": {},
+            "order": 0,
+            "mode": 0,
+            "inputs": [],
+            "outputs": [{"name": "MODEL", "type": "MODEL", "links": [1], "slot_index": 0}],
+            "properties": {"Node name for S&R": "UnetLoaderGGUF"},
+            "widgets_values": [dit_filename],
+        }
+    )
 
     te_node = (
         {
@@ -96,20 +189,10 @@ def build_gguf_workflow(
         }
     )
 
+    save_prefix = "Qwen21_INT8_ConvRot" if is_convrot else f"Qwen21_GGUF_{v.upper()}"
+
     nodes = [
-        {
-            "id": 1,
-            "type": "UnetLoaderGGUF",
-            "pos": [60, 80],
-            "size": [340, 58],
-            "flags": {},
-            "order": 0,
-            "mode": 0,
-            "inputs": [],
-            "outputs": [{"name": "MODEL", "type": "MODEL", "links": [1], "slot_index": 0}],
-            "properties": {"Node name for S&R": "UnetLoaderGGUF"},
-            "widgets_values": [dit_filename],
-        },
+        dit_node,
         te_node,
         {
             "id": 3,
@@ -264,7 +347,7 @@ def build_gguf_workflow(
             "inputs": [{"name": "images", "type": "IMAGE", "link": 13}],
             "outputs": [],
             "properties": {"Node name for S&R": "SaveImage"},
-            "widgets_values": [f"Qwen21_GGUF_{v.upper()}"],
+            "widgets_values": [save_prefix],
         },
     ]
 
@@ -303,10 +386,16 @@ def write_gguf_workflows(
     comfy_dir: Path,
     staged_meta: Optional[dict[str, dict[str, str]]] = None,
 ) -> list[str]:
-    """Write ready-to-use Q8 and Q4 ComfyUI-GGUF workflow JSONs into `user/default/workflows/`."""
+    """Write ready-to-use INT8-ConvRot, GGUF Q8, and GGUF Q4 workflow JSONs into `user/default/workflows/`."""
     wf_dir = comfy_dir / "user" / "default" / "workflows"
     wf_dir.mkdir(parents=True, exist_ok=True)
     defaults = {
+        "int8_convrot": {
+            "dit": "qwen-image-2.1-turbo-int8_convrot.safetensors",
+            "te": "qwen3vl_8b_int8_convrot.safetensors",
+            "vae": "qwen_image_2.1_vae_bf16.safetensors",
+            "out": "Qwen_Image_2.1_Turbo_INT8_ConvRot.json",
+        },
         "q8": {
             "dit": "qwen-image-2.1-turbo-Q8_0.gguf",
             "te": "qwen3vl_8b_bf16.safetensors",
@@ -339,16 +428,18 @@ _UNSET: Any = object()
 
 
 class ComfyUILauncher:
-    """Manages on-demand ComfyUI installation, ComfyUI-GGUF plugin, GGUF model staging, LoRA symlinking, and tunnel."""
+    """Manages on-demand ComfyUI installation, INT8-ConvRot / GGUF model staging, LoRA symlinking, and tunnel."""
 
     def __init__(self, loras_dir: Path) -> None:
         self.loras_dir = loras_dir
         self._lock = threading.Lock()
         self._status: str = "idle"  # idle | installing | starting | running | error
         self._progress: float = 0.0
-        self._message: str = "未启动（按需手动启动 · 含 city96/ComfyUI-GGUF 插件）"
+        self._message: str = "未启动（按需手动启动 · 支持 INT8-ConvRot / ComfyUI-GGUF）"
         self._public_url: Optional[str] = None
+        self._port: int = COMFY_PORT
         self._local_url: str = f"http://127.0.0.1:{COMFY_PORT}"
+        self._vram_args: list[str] = []
         self._error: Optional[str] = None
         self._proc: Optional[subprocess.Popen[Any]] = None
         self._tunnel_proc: Optional[subprocess.Popen[str]] = None
@@ -371,6 +462,8 @@ class ComfyUILauncher:
                 "message": self._message,
                 "public_url": self._public_url,
                 "local_url": self._local_url,
+                "port": self._port,
+                "vram_args": list(self._vram_args),
                 "error": self._error,
                 "installed": COMFY_DIR.exists(),
                 "gguf_plugin_installed": gguf_dir.exists(),
@@ -410,6 +503,17 @@ class ComfyUILauncher:
             except OSError:
                 pass
 
+    def _run_checked(self, cmd: list[str], err_label: str) -> None:
+        res = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if res.returncode != 0:
+            tail = (res.stdout or "")[-400:]
+            raise RuntimeError(f"{err_label} (exit={res.returncode}): {tail}")
+
     def _install_gguf_plugins(self) -> None:
         custom_nodes = COMFY_DIR / "custom_nodes"
         custom_nodes.mkdir(parents=True, exist_ok=True)
@@ -417,31 +521,30 @@ class ComfyUILauncher:
         gguf_dir = custom_nodes / "ComfyUI-GGUF"
         if not gguf_dir.exists():
             self._set_state("installing", 0.36, "正在安装 GGUF 加载器插件 city96/ComfyUI-GGUF...")
-            res = subprocess.run(
+            self._run_checked(
                 ["git", "clone", "--depth", "1", COMFY_GGUF_GIT, str(gguf_dir)],
+                "git clone ComfyUI-GGUF 失败",
+            )
+        else:
+            pull_res = subprocess.run(
+                ["git", "-C", str(gguf_dir), "pull", "--ff-only"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
             )
-            if res.returncode != 0:
-                raise RuntimeError(f"git clone ComfyUI-GGUF 失败: {(res.stdout or '')[-300:]}")
-        else:
-            subprocess.run(["git", "-C", str(gguf_dir), "pull", "--ff-only"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+            if pull_res.returncode != 0:
+                logger.warning("ComfyUI-GGUF git pull returned %s: %s", pull_res.returncode, (pull_res.stdout or "")[-200:])
 
         gguf_req = gguf_dir / "requirements.txt"
         self._set_state("installing", 0.44, "正在安装 ComfyUI-GGUF 依赖 (gguf / protobuf / sentencepiece)...")
         if gguf_req.exists():
-            subprocess.run(
+            self._run_checked(
                 [sys.executable, "-m", "pip", "install", "-q", "-r", str(gguf_req)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
+                "安装 ComfyUI-GGUF requirements.txt 失败",
             )
-        subprocess.run(
+        self._run_checked(
             [sys.executable, "-m", "pip", "install", "-q", "gguf>=0.13.0", "sentencepiece>=0.2.0", "protobuf>=4.25.0"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
+            "安装 gguf / sentencepiece / protobuf 失败",
         )
 
         # Best-effort Qwen3-VL TE GGUF compatibility node (auto no-op if upstream ComfyUI-GGUF already supports it)
@@ -464,7 +567,11 @@ class ComfyUILauncher:
         from hf_downloader import download_gguf_bundle_fast
 
         norm = (gguf_variant or "q4").strip().lower()
-        targets = ["q8", "q4"] if norm == "both" else ([norm] if norm in {"q8", "q4"} else [])
+        targets = (
+            ["q8", "q4"]
+            if norm == "both"
+            else ([norm] if norm in {"q8", "q4", "int8_convrot"} else [])
+        )
         staged_names: list[str] = []
         staged_meta: dict[str, dict[str, str]] = {}
 
@@ -481,7 +588,7 @@ class ComfyUILauncher:
                 progress_cb=_dl_cb,
                 use_tqdm=False,
                 include_diffusers_configs=False,
-                include_mmproj=True,
+                include_mmproj=(var == "q4"),
             )
 
             dit_src = Path(bundle["dit_path"])
@@ -539,18 +646,23 @@ class ComfyUILauncher:
         demo_mode: bool = False,
         gguf_variant: str = "q4",
         hf_token: Optional[str] = None,
+        gpu_profile_key: Optional[str] = None,
+        main_model_loaded: bool = False,
     ) -> dict[str, Any]:
         norm_var = (gguf_variant or "q4").strip().lower()
-        if norm_var not in {"q8", "q4", "both", "none"}:
+        if norm_var not in {"int8_convrot", "q8", "q4", "both", "none"}:
             norm_var = "q4"
+
+        vram_args = _resolve_comfy_vram_args(gpu_profile_key=gpu_profile_key, main_model_loaded=main_model_loaded)
 
         with self._lock:
             if self._status in {"installing", "starting", "running"}:
                 return self.get_status()
             self._gguf_variant = norm_var
+            self._vram_args = vram_args
             self._status = "installing"
             self._progress = 0.05
-            self._message = f"准备启动 ComfyUI（含 city96/ComfyUI-GGUF · 档位 {norm_var.upper()}）..."
+            self._message = f"准备启动 ComfyUI（档位 {norm_var.upper()}）..."
             self._public_url = None
             self._error = None
 
@@ -558,6 +670,11 @@ class ComfyUILauncher:
             try:
                 if demo_mode:
                     demo_staged: list[str] = []
+                    if norm_var == "int8_convrot":
+                        demo_staged.extend([
+                            "qwen-image-2.1-turbo-int8_convrot.safetensors",
+                            "qwen3vl_8b_int8_convrot.safetensors",
+                        ])
                     if norm_var in {"q8", "both"}:
                         demo_staged.extend(["qwen-image-2.1-turbo-Q8_0.gguf", "qwen3vl_8b_bf16.safetensors"])
                     if norm_var in {"q4", "both"}:
@@ -567,9 +684,9 @@ class ComfyUILauncher:
 
                     for pct, msg in [
                         (0.20, "[演示模式] 模拟克隆 ComfyUI 仓库..."),
-                        (0.42, "[演示模式] 模拟安装 city96/ComfyUI-GGUF 加载器插件..."),
-                        (0.68, f"[演示模式] 模拟准备 GGUF 模型与 VAE ({norm_var.upper()})..."),
-                        (0.88, "[演示模式] 模拟写入工作流并启动 ComfyUI (8188)..."),
+                        (0.42, "[演示模式] 模拟准备插件与显存参数..."),
+                        (0.68, f"[演示模式] 模拟准备模型与 VAE ({norm_var.upper()})..."),
+                        (0.88, f"[演示模式] 模拟写入工作流并启动 ComfyUI ({self._port})..."),
                     ]:
                         time.sleep(0.18)
                         self._set_state("installing", pct, msg)
@@ -577,13 +694,14 @@ class ComfyUILauncher:
                     with self._lock:
                         self._staged_files = list(dict.fromkeys(demo_staged))
                         self._workflows = [
+                            "Qwen_Image_2.1_Turbo_INT8_ConvRot.json",
                             "Qwen_Image_2.1_Uncensored_GGUF_Q8.json",
                             "Qwen_Image_2.1_Uncensored_GGUF_Q4.json",
                         ]
                     self._set_state(
                         status="running",
                         progress=1.0,
-                        message=f"ComfyUI + ComfyUI-GGUF 演示服务已就绪 ({norm_var.upper()})",
+                        message=f"ComfyUI 演示服务已就绪 ({norm_var.upper()})",
                         public_url=self._local_url,
                     )
                     return
@@ -591,39 +709,47 @@ class ComfyUILauncher:
                 # 1) Clone ComfyUI if not present
                 if not (COMFY_DIR / "main.py").exists():
                     self._set_state("installing", 0.14, "正在克隆 ComfyUI 仓库...")
-                    res = subprocess.run(
+                    self._run_checked(
                         ["git", "clone", "--depth", "1", "https://github.com/comfyanonymous/ComfyUI.git", str(COMFY_DIR)],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
+                        "git clone ComfyUI 失败",
                     )
-                    if res.returncode != 0:
-                        raise RuntimeError(f"git clone ComfyUI 失败: {(res.stdout or '')[-300:]}")
 
                 # 2) Install ComfyUI requirements
                 req_file = COMFY_DIR / "requirements.txt"
                 if req_file.exists():
                     self._set_state("installing", 0.28, "正在安装 ComfyUI 依赖...")
-                    subprocess.run(
+                    self._run_checked(
                         [sys.executable, "-m", "pip", "install", "-q", "-r", str(req_file)],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
+                        "安装 ComfyUI requirements.txt 失败",
                     )
 
-                # 3) Install city96/ComfyUI-GGUF plugin + dependencies
-                self._install_gguf_plugins()
+                # 3) Install city96/ComfyUI-GGUF plugin + dependencies (not needed for native INT8-ConvRot)
+                if norm_var != "int8_convrot":
+                    self._install_gguf_plugins()
 
-                # 4) Link LoRAs & stage GGUF DiT / Text Encoder / VAE + write workflows
+                # 4) Link LoRAs & stage DiT / Text Encoder / VAE + write workflows
                 self._link_loras_dir()
                 self._stage_gguf_models(norm_var, hf_token=hf_token)
 
-                self._set_state("starting", 0.78, f"正在启动 ComfyUI + GGUF 加载器 (端口 {COMFY_PORT})...")
+                # 5) Check for port conflicts before launching main.py
+                active_port = _find_available_port(COMFY_PORT)
+                if active_port != COMFY_PORT:
+                    logger.warning("ComfyUI preferred port %d is occupied; using free port %d.", COMFY_PORT, active_port)
+                with self._lock:
+                    self._port = active_port
+                    self._local_url = f"http://127.0.0.1:{active_port}"
+
+                self._set_state(
+                    "starting",
+                    0.78,
+                    f"正在启动 ComfyUI (端口 {active_port}" + (f" · {' '.join(vram_args)}" if vram_args else "") + ")...",
+                )
 
                 log_path = Path("/tmp/comfyui.log") if os.name != "nt" else (COMFY_DIR / "comfyui.log")
                 self._log_file = open(log_path, "ab")
+                cmd = [sys.executable, "main.py", "--listen", "0.0.0.0", "--port", str(active_port), *vram_args]
                 self._proc = subprocess.Popen(
-                    [sys.executable, "main.py", "--listen", "0.0.0.0", "--port", str(COMFY_PORT)],
+                    cmd,
                     cwd=str(COMFY_DIR),
                     stdout=self._log_file,
                     stderr=subprocess.STDOUT,
@@ -632,7 +758,7 @@ class ComfyUILauncher:
                 ready = False
                 for i in range(60):
                     if self._proc.poll() is not None:
-                        raise RuntimeError("ComfyUI 进程意外退出，请检查 /tmp/comfyui.log")
+                        raise RuntimeError(f"ComfyUI 进程意外退出，请检查 {log_path}")
                     try:
                         with urllib.request.urlopen(f"{self._local_url}/system_stats", timeout=1) as resp:
                             if resp.status == 200:
@@ -640,13 +766,13 @@ class ComfyUILauncher:
                                 break
                     except Exception:
                         pass
-                    self._set_state("starting", 0.78 + min(0.10, i * 0.002), f"等待 ComfyUI 监听端口 {COMFY_PORT}...")
+                    self._set_state("starting", 0.78 + min(0.10, i * 0.002), f"等待 ComfyUI 监听端口 {active_port}...")
                     time.sleep(1)
 
                 if not ready:
-                    raise RuntimeError(f"ComfyUI 在 60 秒内未能监听端口 {COMFY_PORT}")
+                    raise RuntimeError(f"ComfyUI 在 60 秒内未能监听端口 {active_port}")
 
-                # 5) Establish Cloudflared public tunnel
+                # 6) Establish Cloudflared public tunnel
                 public_url = self._local_url
                 cf_bin = self._ensure_cloudflared()
                 if cf_bin is not None:
@@ -684,7 +810,7 @@ class ComfyUILauncher:
                 self._set_state(
                     status="running",
                     progress=1.0,
-                    message=f"ComfyUI + ComfyUI-GGUF 已启动就绪 ({norm_var.upper()})",
+                    message=f"ComfyUI 已启动就绪 ({norm_var.upper()} · 端口 {active_port})",
                     public_url=public_url,
                 )
             except Exception as exc:
@@ -727,4 +853,3 @@ class ComfyUILauncher:
                 pass
         self._set_state(status="idle", progress=0.0, message="ComfyUI 已停止", public_url=None, error=None)
         return self.get_status()
-

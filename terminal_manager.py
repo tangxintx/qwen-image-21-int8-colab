@@ -35,6 +35,8 @@ DANGEROUS_CMD_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bcurl\b.*\|\s*(sh|bash)\b|\bwget\b.*\|\s*(sh|bash)\b", re.IGNORECASE), "从网络直接管道执行未知脚本需手动确认"),
 ]
 
+_CD_FORBIDDEN_META = ("&&", "||", ";", "|", ">", "<", "`", "$(", "(", ")", "&", "\n", "\r")
+
 
 def is_dangerous_command(command: str) -> tuple[bool, Optional[str]]:
     """Return `(True, reason)` if `command` matches high-risk destructive patterns."""
@@ -49,6 +51,25 @@ def is_dangerous_command(command: str) -> tuple[bool, Optional[str]]:
 
 def strip_ansi(text: str) -> str:
     return ANSI_ESCAPE_RE.sub("", text)
+
+
+def _terminate_popen(proc: subprocess.Popen[bytes]) -> None:
+    """Terminate a subprocess (and its process group on POSIX), escalating to SIGKILL if needed."""
+    if os.name != "nt":
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=1.5)
+        except subprocess.TimeoutExpired:
+            os.killpg(pgid, signal.SIGKILL)
+            proc.wait(timeout=1.0)
+    else:
+        proc.terminate()
+        try:
+            proc.wait(timeout=1.5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=1.0)
 
 
 class LogRingBuffer(logging.Handler):
@@ -80,6 +101,7 @@ class TerminalTask:
     command: str
     cwd: str
     running: bool = True
+    killed: bool = False
     exit_code: Optional[int] = None
     output: str = ""
     base_offset: int = 0
@@ -95,30 +117,55 @@ class TerminalManager:
     MAX_OUTPUT_CHARS = 200_000
 
     def __init__(self, initial_cwd: Path) -> None:
-        self.cwd = str(initial_cwd.resolve())
+        self._cwd = str(initial_cwd.resolve())
         self._lock = threading.Lock()
         self._tasks: dict[str, TerminalTask] = {}
 
-    def _resolve_cd(self, target_arg: str) -> tuple[bool, str]:
+    @property
+    def cwd(self) -> str:
+        with self._lock:
+            return self._cwd
+
+    @cwd.setter
+    def cwd(self, value: str) -> None:
+        with self._lock:
+            self._cwd = value
+
+    def _resolve_cd(self, target_arg: str) -> tuple[bool, str, str]:
+        """Resolve and update persistent working directory atomically under `self._lock`."""
         target_arg = target_arg.strip()
         if (target_arg.startswith('"') and target_arg.endswith('"')) or (
             target_arg.startswith("'") and target_arg.endswith("'")
         ):
             target_arg = target_arg[1:-1]
 
-        if not target_arg or target_arg == "~":
-            dest = Path.home()
-        else:
-            expanded = os.path.expanduser(target_arg)
-            candidate = Path(expanded)
-            if not candidate.is_absolute():
-                candidate = Path(self.cwd) / candidate
-            dest = candidate.resolve()
+        with self._lock:
+            if not target_arg or target_arg == "~":
+                dest = Path.home()
+            else:
+                expanded = os.path.expanduser(target_arg)
+                candidate = Path(expanded)
+                if not candidate.is_absolute():
+                    candidate = Path(self._cwd) / candidate
+                dest = candidate.resolve()
 
-        if dest.exists() and dest.is_dir():
-            self.cwd = str(dest)
-            return True, f"已切换目录: {self.cwd}\n"
-        return False, f"cd: 目录不存在: {dest}\n"
+            if dest.exists() and dest.is_dir():
+                self._cwd = str(dest)
+                return True, f"已切换目录: {self._cwd}\n", self._cwd
+            return False, f"cd: 目录不存在: {dest}\n", self._cwd
+
+    def _prune_tasks_locked(self) -> None:
+        if len(self._tasks) <= 40:
+            return
+        oldest_keys = sorted(self._tasks.keys(), key=lambda k: self._tasks[k].started_at)[:15]
+        for k in oldest_keys:
+            t = self._tasks.get(k)
+            if t is None:
+                continue
+            with t.lock:
+                is_running = t.running
+            if not is_running:
+                self._tasks.pop(k, None)
 
     def _append_task_output(self, task: TerminalTask, text: str) -> None:
         if not text:
@@ -136,17 +183,17 @@ class TerminalManager:
         cmd_str = command.strip()
         cmd_id = uuid.uuid4().hex[:10]
 
-        # Handle standalone `cd` / `cd <dir>` directly so working dir persists across commands
+        # Handle standalone `cd` / `cd <dir>` directly without spawning shell, rejecting metacharacters
         is_pure_cd = (cmd_str == "cd" or cmd_str.startswith("cd ")) and not any(
-            op in cmd_str for op in ("&&", "||", ";", "|")
+            op in cmd_str for op in _CD_FORBIDDEN_META
         )
         if is_pure_cd:
             arg = cmd_str[2:].strip()
-            ok, msg = self._resolve_cd(arg)
+            ok, msg, cur_cwd = self._resolve_cd(arg)
             task = TerminalTask(
                 cmd_id=cmd_id,
                 command=cmd_str,
-                cwd=self.cwd,
+                cwd=cur_cwd,
                 running=False,
                 exit_code=0 if ok else 1,
                 output=msg,
@@ -154,16 +201,14 @@ class TerminalManager:
             )
             with self._lock:
                 self._tasks[cmd_id] = task
+                self._prune_tasks_locked()
             return task
 
-        task = TerminalTask(cmd_id=cmd_id, command=cmd_str, cwd=self.cwd)
+        cur_cwd = self.cwd
+        task = TerminalTask(cmd_id=cmd_id, command=cmd_str, cwd=cur_cwd)
         with self._lock:
             self._tasks[cmd_id] = task
-            if len(self._tasks) > 40:
-                oldest_keys = sorted(self._tasks.keys(), key=lambda k: self._tasks[k].started_at)[:15]
-                for k in oldest_keys:
-                    if not self._tasks[k].running:
-                        self._tasks.pop(k, None)
+            self._prune_tasks_locked()
 
         env = os.environ.copy()
         env.setdefault("PYTHONIOENCODING", "utf-8")
@@ -193,7 +238,19 @@ class TerminalManager:
                     popen_kwargs["start_new_session"] = True
 
                 proc = subprocess.Popen(cmd_str, **popen_kwargs)
-                task.proc = proc
+                with task.lock:
+                    task.proc = proc
+                    was_killed = task.killed
+
+                if was_killed:
+                    try:
+                        _terminate_popen(proc)
+                    except Exception:
+                        pass
+                    with task.lock:
+                        task.exit_code = -1
+                    return
+
                 assert proc.stdout is not None
                 while True:
                     chunk = proc.stdout.read(1024)
@@ -205,13 +262,19 @@ class TerminalManager:
                     text = strip_ansi(_decode_chunk(chunk, utf8_dec, gbk_dec))
                     self._append_task_output(task, text)
                 proc.wait()
-                task.exit_code = proc.returncode
+                with task.lock:
+                    if not task.killed:
+                        task.exit_code = proc.returncode
             except Exception as exc:
                 self._append_task_output(task, f"\n[终端执行错误] {exc}\n")
-                task.exit_code = 1
+                with task.lock:
+                    if task.exit_code is None:
+                        task.exit_code = 1
             finally:
-                task.running = False
-                task.finished_at = time.time()
+                with task.lock:
+                    task.running = False
+                    if task.finished_at is None:
+                        task.finished_at = time.time()
 
         threading.Thread(target=_worker, daemon=True).start()
         return task
@@ -219,46 +282,48 @@ class TerminalManager:
     def poll(self, cmd_id: str, offset: int = 0) -> Optional[dict[str, Any]]:
         with self._lock:
             task = self._tasks.get(cmd_id)
+            cur_cwd = self._cwd
         if not task:
             return None
         with task.lock:
             rel_offset = max(0, offset - task.base_offset)
             new_text = task.output[rel_offset:]
             next_offset = task.base_offset + len(task.output)
+            running = task.running
+            exit_code = task.exit_code
+            elapsed = round((task.finished_at or time.time()) - task.started_at, 2)
         return {
             "cmd_id": task.cmd_id,
             "command": task.command,
-            "cwd": self.cwd,
-            "running": task.running,
-            "exit_code": task.exit_code,
+            "cwd": cur_cwd,
+            "running": running,
+            "exit_code": exit_code,
             "chunk": new_text,
             "offset": next_offset,
-            "elapsed_sec": round((task.finished_at or time.time()) - task.started_at, 2),
+            "elapsed_sec": elapsed,
         }
 
     def kill(self, cmd_id: str) -> bool:
         with self._lock:
             task = self._tasks.get(cmd_id)
-        if not task or not task.proc or not task.running:
+        if not task:
             return False
-        try:
-            if os.name != "nt":
-                pgid = os.getpgid(task.proc.pid)
-                os.killpg(pgid, signal.SIGTERM)
-                try:
-                    task.proc.wait(timeout=1.5)
-                except subprocess.TimeoutExpired:
-                    os.killpg(pgid, signal.SIGKILL)
-            else:
-                task.proc.terminate()
-                try:
-                    task.proc.wait(timeout=1.5)
-                except subprocess.TimeoutExpired:
-                    task.proc.kill()
-            self._append_task_output(task, "\n^C (已手动中断)\n")
+
+        with task.lock:
+            if not task.running:
+                return False
+            task.killed = True
+            proc = task.proc
+
+        if proc is not None:
+            try:
+                _terminate_popen(proc)
+            except Exception:
+                return False
+
+        self._append_task_output(task, "\n^C (已手动中断)\n")
+        with task.lock:
             task.running = False
             task.exit_code = -1
             task.finished_at = time.time()
-            return True
-        except Exception:
-            return False
+        return True

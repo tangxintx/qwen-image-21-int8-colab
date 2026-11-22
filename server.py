@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import ctypes
 import gc
+import hashlib
 import inspect
 import io
 import json
@@ -16,27 +17,31 @@ import math
 import os
 import random
 import re
+import secrets
 import shutil
 import signal
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
 import zipfile
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, Optional
 
 import psutil
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 from comfy_launcher import ComfyUILauncher
 from gpu_profiles import GPU_PROFILES, GPUProfile, match_gpu_profile
@@ -180,10 +185,26 @@ OUTPUT_DIR = Path(os.environ.get("QWEN_OUTPUT_DIR", str(BASE_DIR / "outputs"))).
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 GALLERY_INDEX_PATH = OUTPUT_DIR / "gallery.json"
 
-DEFAULT_MODEL_ID = os.environ.get("QWEN_MODEL_ID", "abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8")
-DEFAULT_QUANT_MODE = os.environ.get("QWEN_QUANT_MODE", "gguf-q8-full")
+DEFAULT_MODEL_ID = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen-Image-2.1-Turbo")
+DEFAULT_QUANT_MODE = os.environ.get("QWEN_QUANT_MODE", "fp8-int8")
 DEMO_MODE = os.environ.get("DEMO_MODE", "0").strip().lower() in {"1", "true", "yes"}
 PORT = int(os.environ.get("PORT", "7860"))
+ADMIN_AUTH_TOKEN = (os.environ.get("QWEN_ADMIN_TOKEN") or "").strip() or secrets.token_urlsafe(24)
+if not (os.environ.get("QWEN_ADMIN_TOKEN") or "").strip():
+    os.environ["QWEN_ADMIN_TOKEN"] = ADMIN_AUTH_TOKEN
+    logger.info("Generated per-session admin Bearer token (%s)", mask_secret(ADMIN_AUTH_TOKEN))
+
+TURBO_SAMPLE_SIGMAS: list[float] = [
+    1.0,
+    0.978453,
+    0.95418,
+    0.926626,
+    0.89508,
+    0.845148,
+    0.704534,
+    0.414568,
+]
+_MAX_DATA_URL_IMAGE_BYTES = 30 * 1024 * 1024  # 30 MB decoded safety cap
 
 DEFAULT_AI_ENDPOINT = os.environ.get("QWEN_AI_ENDPOINT", "https://api.pie-xian.com/v1/chat/completions")
 DEFAULT_AI_API_KEY = os.environ.get("QWEN_AI_API_KEY", "")
@@ -192,12 +213,32 @@ DEFAULT_AI_AUTO_RUN = os.environ.get("QWEN_AI_AUTO_RUN", "0").strip().lower() in
 AI_CONFIG_PATH = BASE_DIR / ".ai_config.json"
 
 MODEL_PRESETS = {
-    "abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8": {
-        "label": "Qwen-Image-2.1-Turbo-Quantized Q8 满血版 (BF16 编码器 + BF16 VAE)",
+    "Qwen/Qwen-Image-2.1-Turbo": {
+        "label": "Qwen-Image-2.1-Turbo (L4 推荐 · FP8 DiT + INT8 编码)",
         "default_steps": 8,
         "default_cfg": 1.0,
-        "quant_mode": "gguf-q8-full",
-        "description": "默认推荐：Q8_0 扩散权重 + 全精度 BF16 文本编码器与 BF16 VAE（L4 自动逐层调度防 OOM）",
+        "quant_mode": "fp8-int8",
+        "description": "默认推荐：8步极速出图，L4 原生 FP8 Tensor Core 全驻留推理（T4 自动降级 INT8）",
+    },
+    "addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit": {
+        "label": "Qwen-Image-2.1-Turbo 预量化 8bit (极速加载)",
+        "default_steps": 8,
+        "default_cfg": 1.0,
+        "quant_mode": "int8-torchao",
+        "description": "预量化 TorchAO 8bit 权重，L4 全驻留无需在线量化、加载更快",
+    },
+    "Qwen/Qwen-Image-2.1": {
+        "label": "Qwen-Image-2.1 (满血基础版 · 40步精绘)",
+        "default_steps": 40,
+        "default_cfg": 1.0,
+        "description": "满血高精细画质与文字海报渲染，支持40步精绘（可搭配 FP8+INT8 或原生 BF16）",
+    },
+    "abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8": {
+        "label": "Qwen-Image-2.1-Turbo-Quantized GGUF Q8 (可选 INT8/BF16 编码)",
+        "default_steps": 8,
+        "default_cfg": 1.0,
+        "quant_mode": "gguf-q8-int8",
+        "description": "Q8_0 扩散权重（支持 TorchAO INT8 编码器 L4 全驻留，或切换 gguf-q8-full 分阶段 BF16 编码）",
     },
     "abenzerps/Qwen-Image-2.1-Turbo-Quantized:q4": {
         "label": "Qwen-Image-2.1-Turbo-Quantized Q4 轻量版 (Qwen3-VL-8B Q4_K_M + BF16 VAE)",
@@ -206,30 +247,12 @@ MODEL_PRESETS = {
         "quant_mode": "gguf-q4",
         "description": "Q4_K_M 扩散权重 + Qwen3-VL-8B Q4_K_M 文本编码器，T4/L4 显存最省",
     },
-    "Qwen/Qwen-Image-2.1-Turbo": {
-        "label": "Qwen-Image-2.1-Turbo (INT8 极速版)",
-        "default_steps": 8,
-        "default_cfg": 1.0,
-        "description": "8步极速出图，适合T4/L4移动端高频交互",
-    },
-    "Qwen/Qwen-Image-2.1": {
-        "label": "Qwen-Image-2.1 (满血基础版 · 40步精绘)",
-        "default_steps": 40,
-        "default_cfg": 1.0,
-        "description": "满血高精细画质与文字海报渲染，支持40步精绘（可搭配不量化 BF16）",
-    },
-    "addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit": {
-        "label": "Qwen-Image-2.1-Turbo 预量化 8bit",
-        "default_steps": 8,
-        "default_cfg": 1.0,
-        "description": "预量化 TorchAO 8bit 权重，加载更快、显存更低",
-    },
     "abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8": {
         "label": "Qwen-Image-2.1 Uncensored GGUF Q8 满血版 (BF16 编码器 + BF16 VAE)",
         "default_steps": 8,
         "default_cfg": 1.0,
         "quant_mode": "gguf-q8-full",
-        "description": "Q8_0 扩散权重直接拉满，搭配全精度 BF16 文本编码器与 qwen_image_2.1_vae_bf16",
+        "description": "Q8_0 扩散权重 + 全精度 BF16 文本编码器（L4 自动分阶段仅卸载 TE）",
     },
     "abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4": {
         "label": "Qwen-Image-2.1 Uncensored GGUF Q4 轻量版 (Qwen3-VL-8B Q4_K_M + BF16 VAE)",
@@ -251,7 +274,7 @@ def resolve_gguf_variant(model_id: str, quant_mode: str) -> Optional[str]:
         GGUF_REDIRECTED_REPO.lower(),
         "m9ter1a/qwen-image-2.1-turbo-gguf",
     } or "gguf" in base_low
-    is_gguf_quant = qm in {"gguf-q8-full", "gguf-q4", "q8", "q4"}
+    is_gguf_quant = qm in {"gguf-q8-full", "gguf-q8-int8", "gguf-q4", "q8", "q4"}
 
     if not is_gguf_repo and not is_gguf_quant:
         return None
@@ -259,9 +282,113 @@ def resolve_gguf_variant(model_id: str, quant_mode: str) -> Optional[str]:
         return suffix
     if qm in {"gguf-q4", "q4"}:
         return "q4"
-    if qm in {"gguf-q8-full", "q8", "none"}:
+    if qm in {"gguf-q8-full", "gguf-q8-int8", "q8", "none"}:
         return "q8"
     return "q8"
+
+
+def verify_admin_token(authorization: Optional[str], x_admin_token: Optional[str]) -> bool:
+    """Validate constant-time Bearer / X-Admin-Token against `ADMIN_AUTH_TOKEN`."""
+    cand = ""
+    if authorization:
+        parts = authorization.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            cand = parts[1].strip()
+    if not cand and x_admin_token:
+        cand = x_admin_token.strip()
+    if not cand:
+        return False
+    return secrets.compare_digest(cand, ADMIN_AUTH_TOKEN)
+
+
+def require_admin_auth(
+    authorization: Optional[str] = Header(default=None),
+    x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
+) -> None:
+    """FastAPI dependency protecting sensitive system, config, gallery-mutation, and terminal endpoints."""
+    if not verify_admin_token(authorization, x_admin_token):
+        raise HTTPException(
+            status_code=401,
+            detail="未授权访问：请提供有效的管理令牌 (Authorization: Bearer <token>)",
+        )
+
+
+def _safe_child_path(parent_dir: Path, raw_name: str) -> Optional[Path]:
+    """Resolve a direct child path inside `parent_dir`, rejecting traversal or empty names."""
+    clean_name = Path((raw_name or "").strip()).name
+    if not clean_name or clean_name in {".", ".."}:
+        return None
+    base_resolved = parent_dir.resolve()
+    target = (base_resolved / clean_name).resolve()
+    if target.parent != base_resolved:
+        return None
+    return target
+
+
+def get_vram_safety_limits(profile: GPUProfile) -> dict[str, int]:
+    """Return GPU-VRAM-tiered bounds for Hires Fix resolution and multi-image references."""
+    vram = float(profile.vram_gb)
+    if vram <= 16.5:
+        return {
+            "max_hires_pixels": 1536 * 1536,
+            "max_hires_edge": 1792,
+            "max_extra_refs": 3,
+            "max_ref_edge": 768,
+        }
+    if vram <= 26.0:
+        return {
+            "max_hires_pixels": 2048 * 2048,
+            "max_hires_edge": 2560,
+            "max_extra_refs": 5,
+            "max_ref_edge": 1024,
+        }
+    if vram <= 48.0:
+        return {
+            "max_hires_pixels": 2560 * 2560,
+            "max_hires_edge": 2816,
+            "max_extra_refs": 7,
+            "max_ref_edge": 1280,
+        }
+    return {
+        "max_hires_pixels": 3072 * 3072,
+        "max_hires_edge": 3072,
+        "max_extra_refs": 9,
+        "max_ref_edge": 1536,
+    }
+
+
+def _prune_dict_store(
+    store: dict[str, Any],
+    done_statuses: set[str],
+    max_items: int,
+    keep_done: int,
+    ttl_sec: float = 3600.0,
+) -> None:
+    """Evict expired or excess finished records from `jobs` / `model_ops` in-memory dictionaries."""
+    now = time.time()
+    expired = [
+        k for k, v in store.items()
+        if getattr(v, "status", None) in done_statuses
+        and (now - float(getattr(v, "finished_at", None) or getattr(v, "created_at", now))) > ttl_sec
+    ]
+    for k in expired:
+        store.pop(k, None)
+
+    if len(store) > max_items:
+        done_keys = [
+            k for k, v in sorted(store.items(), key=lambda kv: float(getattr(kv[1], "created_at", 0.0)))
+            if getattr(v, "status", None) in done_statuses
+        ]
+        drop_count = max(0, len(done_keys) - keep_done)
+        for old_k in done_keys[:drop_count]:
+            store.pop(old_k, None)
+
+
+def _safe_unlink(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 
@@ -521,6 +648,8 @@ def decode_data_url_image(data_url: str) -> Image.Image:
     else:
         b64_part = data_url
     raw = base64.b64decode(b64_part)
+    if len(raw) > _MAX_DATA_URL_IMAGE_BYTES:
+        raise ValueError("上传图片数据体积超过 30 MB 安全限制")
     return Image.open(io.BytesIO(raw)).convert("RGB")
 
 
@@ -531,6 +660,8 @@ def decode_data_url_mask(data_url: str) -> Image.Image:
     else:
         b64_part = data_url
     raw = base64.b64decode(b64_part)
+    if len(raw) > _MAX_DATA_URL_IMAGE_BYTES:
+        raise ValueError("遮罩图片数据体积超过 30 MB 安全限制")
     img = Image.open(io.BytesIO(raw))
     if img.mode == "RGBA":
         # Support either painted alpha channel or white-on-black mask
@@ -588,12 +719,13 @@ class GalleryManager:
                 try:
                     data = json.loads(self.index_path.read_text(encoding="utf-8"))
                     if isinstance(data, list):
-                        # Filter out records whose image files were deleted externally
-                        self._items = [
-                            item
-                            for item in data
-                            if (self.output_dir / item.get("filename", "")).exists()
-                        ]
+                        # Filter out records whose image files were deleted externally or attempt path traversal
+                        valid_items: list[dict[str, Any]] = []
+                        for item in data:
+                            fpath = _safe_child_path(self.output_dir, item.get("filename", ""))
+                            if fpath is not None and fpath.exists():
+                                valid_items.append(item)
+                        self._items = valid_items
                         return
                 except Exception as exc:
                     logger.warning("Failed to load gallery index: %s", exc)
@@ -707,20 +839,21 @@ class GalleryManager:
     def delete_items(self, item_ids: list[str]) -> int:
         id_set = set(item_ids)
         removed = 0
+        sources_dir = self.output_dir / ".sources"
         with self._lock:
             remaining = []
             for item in self._items:
                 if item.get("id") in id_set:
-                    file_path = self.output_dir / item.get("filename", "")
-                    if file_path.exists():
+                    file_path = _safe_child_path(self.output_dir, item.get("filename", ""))
+                    if file_path is not None and file_path.exists():
                         try:
                             file_path.unlink()
                         except OSError:
                             pass
                     src_name = item.get("source_filename")
                     if src_name:
-                        src_path = self.output_dir / ".sources" / src_name
-                        if src_path.exists():
+                        src_path = _safe_child_path(sources_dir, src_name)
+                        if src_path is not None and src_path.exists():
                             try:
                                 src_path.unlink()
                             except OSError:
@@ -813,6 +946,26 @@ def _pipe_has_gguf_params(pipe_obj: Any) -> bool:
     return False
 
 
+def _clear_pipeline_hooks(pipe_obj: Any) -> None:
+    """Remove all accelerate offload / device hooks cleanly before re-attaching or unloading."""
+    if pipe_obj is None:
+        return
+    if hasattr(pipe_obj, "remove_all_hooks"):
+        try:
+            pipe_obj.remove_all_hooks()
+        except Exception as exc:
+            logger.debug("remove_all_hooks warning: %s", exc)
+    for comp_name in ("transformer", "unet", "text_encoder", "text_encoder_2", "vae"):
+        comp = getattr(pipe_obj, comp_name, None)
+        if comp is not None and hasattr(comp, "_hf_hook"):
+            try:
+                from accelerate.hooks import remove_hook_from_module
+
+                remove_hook_from_module(comp, recurse=True)
+            except Exception:
+                pass
+
+
 def _enable_sequential_offload_safe(
     pipe_obj: Any,
     is_gguf: bool,
@@ -825,6 +978,7 @@ def _enable_sequential_offload_safe(
     meta-device re-wrapping (`KeyError: None`), so GGUF pipelines fall back to
     `enable_model_cpu_offload()` cleanly.
     """
+    _clear_pipeline_hooks(pipe_obj)
     if is_gguf:
         logger.warning(
             "%s; GGUF weights are incompatible with accelerate sequential_cpu_offload "
@@ -841,17 +995,25 @@ def _enable_sequential_offload_safe(
             "sequential_cpu_offload failed (%r); falling back to model_cpu_offload.",
             seq_exc,
         )
-        if hasattr(pipe_obj, "remove_all_hooks"):
-            try:
-                pipe_obj.remove_all_hooks()
-            except Exception:
-                pass
+        _clear_pipeline_hooks(pipe_obj)
         pipe_obj.enable_model_cpu_offload()
         return fallback_device
 
 
+def _hash_condition_images(images: list[Image.Image]) -> str:
+    """Compute a fast deterministic content hash for conditioning images."""
+    if not images:
+        return "none"
+    h = hashlib.blake2b(digest_size=16)
+    h.update(str(len(images)).encode("ascii"))
+    for img in images:
+        h.update(f"{img.width}x{img.height}:{img.mode}".encode("ascii"))
+        h.update(img.tobytes())
+    return h.hexdigest()
+
+
 class QwenImage21Engine:
-    """Manages Qwen-Image-2.1 INT8 pipeline lifecycle across 5 Colab GPU tiers."""
+    """Manages Qwen-Image-2.1 INT8 / FP8 / GGUF pipeline lifecycle across 5 Colab GPU tiers."""
 
     def __init__(self) -> None:
         self.model_id: str = DEFAULT_MODEL_ID
@@ -862,6 +1024,7 @@ class QwenImage21Engine:
         self.vae_tiling_mode: str = os.environ.get("QWEN_VAE_TILING", "auto")
         self.hf_token: str = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
         self.inpaint_fast_crop: bool = False
+        self.torch_compile: bool = os.environ.get("QWEN_TORCH_COMPILE", "0").strip().lower() in {"1", "true", "yes"}
         self.ai_endpoint: str = DEFAULT_AI_ENDPOINT
         self.ai_api_key: str = DEFAULT_AI_API_KEY
         self.ai_model: str = DEFAULT_AI_MODEL
@@ -878,6 +1041,20 @@ class QwenImage21Engine:
         self._infer_lock = threading.Lock()
         self._pipe_supports_strength: Optional[bool] = None
         self._pipe_supports_mask: Optional[bool] = None
+        self._pipe_supports_sigmas: bool = False
+        self._pipe_has_sample_sigmas: bool = False
+        self._pipe_supports_prompt_embeds: bool = False
+        self._pipe_supports_prompt_embeds_mask: bool = False
+        self._pipe_supports_image_pad_mask: bool = False
+        self._pipe_supports_neg_prompt_embeds: bool = False
+        self._pipe_supports_neg_image_pad_mask: bool = False
+        self._pipe_encode_has_image: bool = False
+        self._stage_offload_active: bool = False
+        self._stage_swap_dit_for_te: bool = False
+        self._te_offload_hook: Any = None
+        self._oom_vae_tiling_forced: bool = False
+        self._prompt_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._prompt_cache_max: int = 16
         self._active_lora_path: Optional[str] = None
         self._active_lora_weight: Optional[float] = None
 
@@ -898,6 +1075,8 @@ class QwenImage21Engine:
                         self.ai_auto_run = bool(data["ai_auto_run"])
                     if "inpaint_fast_crop" in data:
                         self.inpaint_fast_crop = bool(data["inpaint_fast_crop"])
+                    if "torch_compile" in data and "QWEN_TORCH_COMPILE" not in os.environ:
+                        self.torch_compile = bool(data["torch_compile"])
             except Exception as exc:
                 logger.warning("Failed to load AI config: %s", exc)
 
@@ -912,6 +1091,7 @@ class QwenImage21Engine:
                         "ai_vision_enabled": self.ai_vision_enabled,
                         "ai_auto_run": self.ai_auto_run,
                         "inpaint_fast_crop": self.inpaint_fast_crop,
+                        "torch_compile": self.torch_compile,
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -987,20 +1167,28 @@ class QwenImage21Engine:
         profile = self.resolve_gpu_profile()
         eff_dtype = profile.dtype if self.dtype_mode == "auto" else self.dtype_mode
         gguf_var = resolve_gguf_variant(self.model_id, self.quant_mode)
+        qm = (self.quant_mode or "").strip().lower()
         if self.offload_mode == "auto":
-            # Unquantized (full-precision) weights exceed 16-24GB VRAM, so auto-upgrade T4/L4 to sequential offload
-            if self.quant_mode == "none" and profile.vram_gb <= 24:
-                eff_offload = "sequential_cpu_offload"
-            elif gguf_var == "q8" and profile.vram_gb <= 16:
-                eff_offload = "sequential_cpu_offload"
-            elif gguf_var == "q8" and profile.vram_gb <= 24:
-                eff_offload = "smart_stage_offload"
-            elif gguf_var == "q4" and profile.vram_gb <= 16:
-                eff_offload = "model_cpu_offload"
+            if profile.vram_gb <= 16.5:
+                # 16GB T4: full BF16 / BF16-TE Q8 need sequential offload; 8-bit/Q4 use model_cpu_offload
+                if qm == "none" or (gguf_var == "q8" and qm != "gguf-q8-int8"):
+                    eff_offload = "sequential_cpu_offload"
+                elif gguf_var in {"q4", "q8"}:
+                    eff_offload = "model_cpu_offload"
+                else:
+                    eff_offload = profile.offload_mode
+            elif profile.vram_gb <= 26.0:
+                # 24GB L4: 17.53GB BF16 TE (gguf-q8-full) or full BF16 (`none`) needs stage offload;
+                # 8-bit / Q4 / gguf-q8-int8 (~13–17.7 GB total) fit fully resident (`none`)!
+                if qm == "none" or (gguf_var == "q8" and qm != "gguf-q8-int8"):
+                    eff_offload = "smart_stage_offload"
+                else:
+                    eff_offload = "none"
             else:
                 eff_offload = profile.offload_mode
         else:
             eff_offload = self.offload_mode
+
         if self.vae_tiling_mode == "auto":
             eff_vae_tiling = profile.vae_tiling
         else:
@@ -1033,6 +1221,7 @@ class QwenImage21Engine:
         cfg_variant = GGUF_VARIANTS[gguf_variant]
         base_repo = cfg_variant["base_config_repo"]
 
+        use_quant_te_for_q8 = (gguf_variant == "q8" and (self.quant_mode or "").strip().lower() == "gguf-q8-int8")
         bundle = download_gguf_bundle_fast(
             variant=gguf_variant,
             token=token,
@@ -1040,6 +1229,7 @@ class QwenImage21Engine:
             use_tqdm=False,
             include_diffusers_configs=True,
             include_mmproj=False,
+            include_te=not use_quant_te_for_q8,
         )
         if job and job.cancel_event.is_set():
             raise InterruptedError("用户已取消生成")
@@ -1110,18 +1300,46 @@ class QwenImage21Engine:
                 token=token,
             )
 
-        # 2) Load Text Encoder: Q8 -> Full BF16 Qwen3-VL-8B ("直接拉满"); Q4 -> Qwen3-VL-8B Q4_K_M.gguf (w/ 4-bit fallback)
+        # 2) Load Text Encoder: Q8-INT8 -> TorchAO INT8; Q8-Full -> BF16; Q4 -> Qwen3-VL-8B Q4_K_M.gguf
         if job:
             job.progress = max(job.progress, 0.55)
-            job.message = (
-                f"[{profile.display_name}] 正在加载全精度 BF16 Qwen3-VL 文本编码器..."
-                if gguf_variant == "q8"
-                else f"[{profile.display_name}] 正在加载 Qwen3-VL-8B Q4_K_M 文本编码器..."
-            )
+            if use_quant_te_for_q8:
+                job.message = f"[{profile.display_name}] 正在加载 TorchAO INT8 Qwen3-VL 文本编码器..."
+            elif gguf_variant == "q8":
+                job.message = f"[{profile.display_name}] 正在加载全精度 BF16 Qwen3-VL 文本编码器..."
+            else:
+                job.message = f"[{profile.display_name}] 正在加载 Qwen3-VL-8B Q4_K_M 文本编码器..."
 
         text_encoder = None
         te_cfg = AutoConfig.from_pretrained(str(Path(base_cfg_dir) / "text_encoder"), local_files_only=True)
-        if gguf_variant == "q8":
+        if use_quant_te_for_q8:
+            try:
+                from torchao.quantization import Int8WeightOnlyConfig
+                from transformers import TorchAoConfig
+
+                text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+                    base_repo,
+                    subfolder="text_encoder",
+                    quantization_config=TorchAoConfig(Int8WeightOnlyConfig()),
+                    torch_dtype=dtype,
+                    low_cpu_mem_usage=True,
+                    token=token,
+                )
+                logger.info("Loaded TorchAO INT8 Qwen3-VL text encoder for GGUF Q8")
+            except Exception as te_int8_exc:
+                logger.warning("TorchAO INT8 TE load failed (%s); falling back to 4-bit BnB TE.", te_int8_exc)
+                from transformers import BitsAndBytesConfig
+
+                bnb_cfg = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=dtype)
+                text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+                    base_repo,
+                    subfolder="text_encoder",
+                    quantization_config=bnb_cfg,
+                    torch_dtype=dtype,
+                    low_cpu_mem_usage=True,
+                    token=token,
+                )
+        elif gguf_variant == "q8":
             try:
                 from safetensors.torch import load_file as load_safetensors_file
 
@@ -1417,6 +1635,8 @@ class QwenImage21Engine:
                     return total_b
 
                 transformer_bytes = _estimate_mod_bytes(getattr(pipe, "transformer", None))
+                te_bytes = _estimate_mod_bytes(getattr(pipe, "text_encoder", None))
+                vae_bytes = _estimate_mod_bytes(getattr(pipe, "vae", None))
                 total_vram_bytes = 0
                 if torch.cuda.is_available():
                     try:
@@ -1426,20 +1646,29 @@ class QwenImage21Engine:
                 if total_vram_bytes <= 0:
                     total_vram_bytes = int(profile.vram_gb * (1024**3))
 
+                # Only treat <= 16 GiB (e.g. T4) or oversized DiT (> 70% VRAM) as tight-VRAM.
+                # NEVER force attention_slicing on 24GB L4 (destroys PyTorch SDPA/FlashAttention fusion).
                 needs_tight_vram = (
-                    (total_vram_bytes <= 26 * (1024**3) and (gguf_variant == "q8" or self.quant_mode != "gguf-q4"))
-                    or (transformer_bytes > int(total_vram_bytes * 0.62))
+                    (total_vram_bytes <= 16 * (1024**3))
+                    or (transformer_bytes > int(total_vram_bytes * 0.70))
                 )
 
+                self._oom_vae_tiling_forced = False
                 if hasattr(pipe, "vae"):
                     if (eff["vae_tiling"] or needs_tight_vram) and hasattr(pipe.vae, "enable_tiling"):
                         pipe.vae.enable_tiling()
+                    elif hasattr(pipe.vae, "disable_tiling"):
+                        pipe.vae.disable_tiling()
                     if (eff["vae_slicing"] or needs_tight_vram) and hasattr(pipe.vae, "enable_slicing"):
                         pipe.vae.enable_slicing()
 
-                if (eff["attention_slicing"] or needs_tight_vram) and hasattr(pipe, "enable_attention_slicing"):
+                # Strictly honor GPU profile's attention_slicing setting (False on L4 Ada Lovelace)
+                if eff["attention_slicing"] and hasattr(pipe, "enable_attention_slicing"):
                     pipe.enable_attention_slicing("auto")
 
+                self._stage_offload_active = False
+                self._stage_swap_dit_for_te = False
+                self._te_offload_hook = None
                 is_gguf_pipe = (gguf_variant is not None) or _pipe_has_gguf_params(pipe)
                 if eff["offload_mode"] == "sequential_cpu_offload":
                     self.device = _enable_sequential_offload_safe(
@@ -1450,9 +1679,10 @@ class QwenImage21Engine:
                         "offload_mode=sequential_cpu_offload",
                     )
                 elif eff["offload_mode"] == "smart_stage_offload":
-                    if needs_tight_vram:
+                    _clear_pipeline_hooks(pipe)
+                    if transformer_bytes > int(total_vram_bytes * 0.80):
                         logger.info(
-                            "Smart stage offload detected tight VRAM (DiT=%.2f GB / VRAM=%.2f GB); selecting safe offload.",
+                            "Smart stage offload detected oversized DiT (DiT=%.2f GB / VRAM=%.2f GB); selecting sequential offload.",
                             transformer_bytes / (1024**3),
                             total_vram_bytes / (1024**3),
                         )
@@ -1461,12 +1691,30 @@ class QwenImage21Engine:
                             is_gguf_pipe,
                             "cuda (smart_stage_offload)",
                             "cuda (smart_stage_offload · sequential)",
-                            f"Smart stage offload tight VRAM (DiT={transformer_bytes / (1024**3):.2f} GB / VRAM={total_vram_bytes / (1024**3):.2f} GB)",
+                            f"Smart stage offload oversized DiT (DiT={transformer_bytes / (1024**3):.2f} GB / VRAM={total_vram_bytes / (1024**3):.2f} GB)",
                         )
                     else:
-                        pipe.enable_model_cpu_offload()
-                        self.device = "cuda (smart_stage_offload)"
+                        # True stage offload: keep DiT + VAE permanently resident on CUDA and offload ONLY text_encoder to CPU.
+                        if getattr(pipe, "transformer", None) is not None:
+                            pipe.transformer.to("cuda")
+                        if getattr(pipe, "vae", None) is not None:
+                            pipe.vae.to("cuda")
+                        te_mod = getattr(pipe, "text_encoder", None)
+                        te_hook = None
+                        if te_mod is not None:
+                            try:
+                                from accelerate import cpu_offload_with_hook
+
+                                _, te_hook = cpu_offload_with_hook(te_mod, execution_device=torch.device("cuda"))
+                            except Exception as hook_exc:
+                                logger.warning("cpu_offload_with_hook unavailable (%s); falling back to manual TE CPU placement.", hook_exc)
+                                te_mod.to("cpu")
+                        self._stage_offload_active = True
+                        self._te_offload_hook = te_hook
+                        self._stage_swap_dit_for_te = (transformer_bytes + vae_bytes + te_bytes) > int(total_vram_bytes * 0.85)
+                        self.device = "cuda (stage_offload: TE->CPU, DiT+VAE resident)"
                 elif eff["offload_mode"] == "model_cpu_offload":
+                    _clear_pipeline_hooks(pipe)
                     if transformer_bytes > int(total_vram_bytes * 0.78):
                         self.device = _enable_sequential_offload_safe(
                             pipe,
@@ -1479,22 +1727,62 @@ class QwenImage21Engine:
                         pipe.enable_model_cpu_offload()
                         self.device = "cuda (model_offload)"
                 else:
+                    _clear_pipeline_hooks(pipe)
                     pipe = pipe.to("cuda")
                     self.device = "cuda (full)"
+
+                # Optional experimental torch.compile (disabled by default due to diffusers#14821)
+                if self.torch_compile and not is_gguf_pipe and "sequential" not in self.device and getattr(pipe, "transformer", None) is not None:
+                    try:
+                        pipe.transformer = torch.compile(pipe.transformer, fullgraph=False)
+                        logger.info("Enabled experimental torch.compile(fullgraph=False) on transformer.")
+                    except Exception as comp_exc:
+                        logger.warning("torch.compile failed (%s); continuing in eager mode.", comp_exc)
 
                 trim_host_memory()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+
                 sig = inspect.signature(pipe.__call__)
                 self._pipe_supports_strength = "strength" in sig.parameters
                 self._pipe_supports_mask = "mask_image" in sig.parameters
+                self._pipe_supports_sigmas = "sigmas" in sig.parameters
+                self._pipe_supports_prompt_embeds = "prompt_embeds" in sig.parameters
+                self._pipe_supports_prompt_embeds_mask = "prompt_embeds_mask" in sig.parameters
+                self._pipe_supports_image_pad_mask = "image_pad_mask" in sig.parameters
+                self._pipe_supports_neg_prompt_embeds = "negative_prompt_embeds" in sig.parameters
+                self._pipe_supports_neg_image_pad_mask = "negative_image_pad_mask" in sig.parameters
 
+                encode_fn = getattr(pipe, "encode_prompt", None)
+                if encode_fn is not None:
+                    try:
+                        enc_sig = inspect.signature(encode_fn)
+                        self._pipe_encode_has_image = "image" in enc_sig.parameters
+                    except Exception:
+                        self._pipe_encode_has_image = False
+                else:
+                    self._pipe_encode_has_image = False
+
+                pipe_cfg = getattr(pipe, "config", None)
+                has_cfg_sigmas = bool(
+                    (isinstance(pipe_cfg, dict) and pipe_cfg.get("sample_sigmas"))
+                    or getattr(pipe_cfg, "sample_sigmas", None)
+                )
+                if not has_cfg_sigmas:
+                    try:
+                        init_sig = inspect.signature(pipe.__class__.__init__)
+                        has_cfg_sigmas = "sample_sigmas" in init_sig.parameters
+                    except Exception:
+                        has_cfg_sigmas = False
+                self._pipe_has_sample_sigmas = has_cfg_sigmas
+
+                self._prompt_cache.clear()
                 self.pipe = pipe
                 self.loaded = True
                 if job:
                     job.status = "running"
                     job.progress = 0.0
-                    job.message = f"[{profile.display_name}] 模型已驻留，开始推理..."
+                    job.message = f"[{profile.display_name}] 模型已就绪 ({self.device})，开始推理..."
                 logger.info("Pipeline loaded successfully on %s", self.device)
             except Exception:
                 trim_host_memory()
@@ -1518,6 +1806,119 @@ class QwenImage21Engine:
         if torch is not None and has_cuda:
             torch.cuda.empty_cache()
 
+    def _offload_te_now(self, torch_mod: Any) -> None:
+        if self._te_offload_hook is not None and hasattr(self._te_offload_hook, "offload"):
+            try:
+                self._te_offload_hook.offload()
+                return
+            except Exception:
+                pass
+        te_mod = getattr(self.pipe, "text_encoder", None) if self.pipe is not None else None
+        if te_mod is not None:
+            try:
+                te_mod.to("cpu")
+            except Exception:
+                pass
+
+    def _get_or_encode_prompt(
+        self,
+        resolved_prompt: str,
+        negative_prompt: str,
+        do_true_cfg: bool,
+        cond_images: Optional[list[Image.Image]],
+        exec_device: Any,
+        torch_mod: Any,
+    ) -> Optional[dict[str, Any]]:
+        """
+        Encode prompt + optional condition images once and LRU-cache CPU copies
+        (including `prompt_embeds`, `prompt_embeds_mask`, `image_pad_mask` and negative equivalents)
+        so seed/step/batch variations skip redundant 8B Qwen3-VL inference.
+        """
+        if self.pipe is None or not hasattr(self.pipe, "encode_prompt") or not self._pipe_supports_prompt_embeds:
+            return None
+        imgs = cond_images or []
+        if imgs and (not self._pipe_encode_has_image or not self._pipe_supports_image_pad_mask):
+            return None
+        if do_true_cfg and (not self._pipe_supports_neg_prompt_embeds or (imgs and not self._pipe_supports_neg_image_pad_mask)):
+            return None
+
+        neg_key = negative_prompt.strip() if do_true_cfg else ""
+        img_hash = _hash_condition_images(imgs)
+        cache_key = json.dumps(
+            [self.model_id, self.quant_mode, self.dtype_mode, resolved_prompt, neg_key, do_true_cfg, img_hash],
+            ensure_ascii=False,
+        )
+
+        cached = self._prompt_cache.get(cache_key)
+        if cached is not None:
+            self._prompt_cache.move_to_end(cache_key)
+            return {k: (v.to(exec_device) if v is not None else None) for k, v in cached.items()}
+
+        dit_mod = getattr(self.pipe, "transformer", None)
+        swapped_dit = False
+        try:
+            if self._stage_offload_active and self._stage_swap_dit_for_te and dit_mod is not None:
+                dit_mod.to("cpu")
+                swapped_dit = True
+                if torch_mod.cuda.is_available():
+                    torch_mod.cuda.empty_cache()
+
+            if self._stage_offload_active and self._te_offload_hook is None:
+                te_mod = getattr(self.pipe, "text_encoder", None)
+                if te_mod is not None:
+                    te_mod.to(exec_device)
+
+            def _call_encode(txt: str) -> tuple[Any, Any, Any]:
+                enc_kw: dict[str, Any] = {
+                    "prompt": txt,
+                    "device": exec_device,
+                    "num_images_per_prompt": 1,
+                }
+                if self._pipe_encode_has_image:
+                    enc_kw["image"] = imgs if imgs else None
+                res = self.pipe.encode_prompt(**enc_kw)
+                if isinstance(res, tuple):
+                    if len(res) >= 3:
+                        return res[0], res[1], res[2]
+                    if len(res) == 2:
+                        return res[0], res[1], None
+                return res, None, None
+
+            with torch_mod.inference_mode():
+                pe, pe_mask, img_pad_mask = _call_encode(resolved_prompt)
+                neg_pe = neg_pe_mask = neg_img_pad_mask = None
+                if do_true_cfg:
+                    neg_pe, neg_pe_mask, neg_img_pad_mask = _call_encode(neg_key)
+        finally:
+            if self._stage_offload_active:
+                self._offload_te_now(torch_mod)
+            if swapped_dit and dit_mod is not None:
+                if torch_mod.cuda.is_available():
+                    torch_mod.cuda.empty_cache()
+                dit_mod.to(exec_device)
+
+        if img_pad_mask is None and imgs:
+            return None
+
+        bundle = {
+            "prompt_embeds": pe,
+            "prompt_embeds_mask": pe_mask,
+            "image_pad_mask": img_pad_mask,
+            "negative_prompt_embeds": neg_pe,
+            "negative_prompt_embeds_mask": neg_pe_mask,
+            "negative_image_pad_mask": neg_img_pad_mask,
+        }
+        cpu_bundle = {
+            k: (v.detach().to("cpu") if v is not None else None)
+            for k, v in bundle.items()
+        }
+        self._prompt_cache[cache_key] = cpu_bundle
+        self._prompt_cache.move_to_end(cache_key)
+        while len(self._prompt_cache) > self._prompt_cache_max:
+            self._prompt_cache.popitem(last=False)
+
+        return bundle
+
     def sync_lora(self, lora_enabled: bool, lora_name: Optional[str], lora_weight: float) -> None:
         """Hot-load, remap keys with strict=False, adjust weight, or cleanly unload LoRA."""
         if self.pipe is None:
@@ -1528,19 +1929,21 @@ class QwenImage21Engine:
                 self._unload_active_lora()
             return
 
-        target_path = (LORAS_DIR / Path(lora_name).name).resolve()
-        if not target_path.exists():
-            raise FileNotFoundError(f"未找到 LoRA 文件: {target_path}")
+        target_path = _safe_child_path(LORAS_DIR, lora_name)
+        if target_path is None or not target_path.exists():
+            raise FileNotFoundError(f"未找到 LoRA 文件: {lora_name}")
 
         target_str = str(target_path)
         if self._active_lora_path != target_str:
             self._unload_active_lora()
             state_dict, info = normalize_lora_state_dict(target_path)
             logger.info(
-                "Loading LoRA %s (keys=%d, stripped=%s, weight=%.2f)",
+                "Loading LoRA %s (keys=%d, stripped=%s, alpha_scaled=%d, collisions=%d, weight=%.2f)",
                 target_path.name,
                 info["mapped_keys"],
                 info["stripped_prefixes"],
+                info.get("alpha_scaled_layers", 0),
+                len(info.get("collisions") or []),
                 lora_weight,
             )
             try:
@@ -1572,19 +1975,31 @@ class QwenImage21Engine:
                 self.pipe.set_adapters(["user_lora"], adapter_weights=[float(lora_weight)])
             self._active_lora_weight = float(lora_weight)
 
+    def _unload_locked(self) -> None:
+        """Unload active pipeline & clear cached embeddings (caller MUST hold `_load_lock` then `_infer_lock`)."""
+        self._active_lora_path = None
+        self._active_lora_weight = None
+        self._stage_offload_active = False
+        self._stage_swap_dit_for_te = False
+        self._te_offload_hook = None
+        self._oom_vae_tiling_forced = False
+        self._prompt_cache.clear()
+        if self.pipe is not None:
+            _clear_pipeline_hooks(self.pipe)
+            del self.pipe
+            self.pipe = None
+        self.loaded = False
+        self.device = "cpu"
+        trim_host_memory()
+        torch, has_cuda = self._detect_torch()
+        if torch is not None and has_cuda:
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
     def unload(self) -> None:
         with self._load_lock:
-            self._active_lora_path = None
-            self._active_lora_weight = None
-            if self.pipe is not None:
-                del self.pipe
-                self.pipe = None
-            self.loaded = False
-            trim_host_memory()
-            torch, has_cuda = self._detect_torch()
-            if torch is not None and has_cuda:
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
+            with self._infer_lock:
+                self._unload_locked()
 
     def reconfigure(
         self,
@@ -1599,6 +2014,7 @@ class QwenImage21Engine:
         cpu_offload: Optional[bool] = None,
         vae_tiling: Optional[bool] = None,
         inpaint_fast_crop: Optional[bool] = None,
+        torch_compile: Optional[bool] = None,
         ai_endpoint: Optional[str] = None,
         ai_api_key: Optional[str] = None,
         clear_ai_api_key: bool = False,
@@ -1606,7 +2022,6 @@ class QwenImage21Engine:
         ai_vision_enabled: Optional[bool] = None,
         ai_auto_run: Optional[bool] = None,
     ) -> None:
-        needs_reload = False
         prefs_changed = False
         if ai_endpoint is not None and ai_endpoint.strip():
             self.ai_endpoint = ai_endpoint.strip()
@@ -1629,49 +2044,59 @@ class QwenImage21Engine:
         if inpaint_fast_crop is not None:
             self.inpaint_fast_crop = bool(inpaint_fast_crop)
             prefs_changed = True
-        if prefs_changed:
-            self._save_ai_config()
 
-        if clear_hf_token:
-            self.hf_token = ""
-            os.environ.pop("HF_TOKEN", None)
-            os.environ.pop("HUGGING_FACE_HUB_TOKEN", None)
-        elif hf_token is not None and hf_token.strip():
-            self.hf_token = hf_token.strip()
-            os.environ["HF_TOKEN"] = self.hf_token
-        if model_id:
-            if model_id != self.model_id:
-                self._user_modified_model = True
-                self.model_id = model_id
-                needs_reload = True
-        if quant_mode and quant_mode != self.quant_mode:
-            self.quant_mode = quant_mode
-            needs_reload = True
-        if gpu_profile_override and gpu_profile_override != self.gpu_profile_override:
-            self.gpu_profile_override = gpu_profile_override
-            needs_reload = True
-        if dtype_mode and dtype_mode != self.dtype_mode:
-            self.dtype_mode = dtype_mode
-            needs_reload = True
-        if offload_mode and offload_mode != self.offload_mode:
-            self.offload_mode = offload_mode
-            needs_reload = True
-        elif cpu_offload is not None:
-            mapped = "model_cpu_offload" if cpu_offload else "none"
-            if mapped != self.offload_mode:
-                self.offload_mode = mapped
-                needs_reload = True
-        if vae_tiling_mode and vae_tiling_mode != self.vae_tiling_mode:
-            self.vae_tiling_mode = vae_tiling_mode
-            needs_reload = True
-        elif vae_tiling is not None:
-            mapped_t = "on" if vae_tiling else "off"
-            if mapped_t != self.vae_tiling_mode:
-                self.vae_tiling_mode = mapped_t
-                needs_reload = True
+        with self._load_lock:
+            needs_reload = False
+            if torch_compile is not None:
+                tc = bool(torch_compile)
+                if tc != self.torch_compile:
+                    self.torch_compile = tc
+                    prefs_changed = True
+                    needs_reload = True
+            if prefs_changed:
+                self._save_ai_config()
 
-        if needs_reload and self.loaded:
-            self.unload()
+            if clear_hf_token:
+                self.hf_token = ""
+                os.environ.pop("HF_TOKEN", None)
+                os.environ.pop("HUGGING_FACE_HUB_TOKEN", None)
+            elif hf_token is not None and hf_token.strip():
+                self.hf_token = hf_token.strip()
+                os.environ["HF_TOKEN"] = self.hf_token
+            if model_id:
+                if model_id != self.model_id:
+                    self._user_modified_model = True
+                    self.model_id = model_id
+                    needs_reload = True
+            if quant_mode and quant_mode != self.quant_mode:
+                self.quant_mode = quant_mode
+                needs_reload = True
+            if gpu_profile_override and gpu_profile_override != self.gpu_profile_override:
+                self.gpu_profile_override = gpu_profile_override
+                needs_reload = True
+            if dtype_mode and dtype_mode != self.dtype_mode:
+                self.dtype_mode = dtype_mode
+                needs_reload = True
+            if offload_mode and offload_mode != self.offload_mode:
+                self.offload_mode = offload_mode
+                needs_reload = True
+            elif cpu_offload is not None:
+                mapped = "model_cpu_offload" if cpu_offload else "none"
+                if mapped != self.offload_mode:
+                    self.offload_mode = mapped
+                    needs_reload = True
+            if vae_tiling_mode and vae_tiling_mode != self.vae_tiling_mode:
+                self.vae_tiling_mode = vae_tiling_mode
+                needs_reload = True
+            elif vae_tiling is not None:
+                mapped_t = "on" if vae_tiling else "off"
+                if mapped_t != self.vae_tiling_mode:
+                    self.vae_tiling_mode = mapped_t
+                    needs_reload = True
+
+            if needs_reload and self.loaded:
+                with self._infer_lock:
+                    self._unload_locked()
 
     def _run_demo_image(
         self,
@@ -1782,8 +2207,32 @@ class QwenImage21Engine:
     ) -> Image.Image:
         width = align_dim(width, 16)
         height = align_dim(height, 16)
-        refs_list = (extra_ref_images or [])[:9]
+        vram_limits = get_vram_safety_limits(self.resolve_gpu_profile())
+        raw_refs = extra_ref_images or []
+        max_extra = vram_limits["max_extra_refs"]
+        refs_dropped = max(0, len(raw_refs) - max_extra)
+        refs_list = raw_refs[:max_extra]
         total_refs = (1 if init_image is not None else 0) + len(refs_list)
+        ref_limit_notice = (
+            f"当前显存档位最多支持 {max_extra} 张附加参考图，已自动截断超出部分以防止 OOM。"
+            if refs_dropped > 0
+            else None
+        )
+
+        def _cap_hires_dims(raw_w: int, raw_h: int) -> tuple[int, int, Optional[str]]:
+            max_pix = vram_limits["max_hires_pixels"]
+            max_edge = vram_limits["max_hires_edge"]
+            scale = 1.0
+            if raw_w * raw_h > max_pix:
+                scale = min(scale, math.sqrt(max_pix / max(1, raw_w * raw_h)))
+            if max(raw_w, raw_h) > max_edge:
+                scale = min(scale, max_edge / max(1, max(raw_w, raw_h)))
+            if scale < 0.999:
+                cw = align_dim(int(round(raw_w * scale)), 16)
+                ch = align_dim(int(round(raw_h * scale)), 16)
+                return cw, ch, f"高清修复目标分辨率 ({raw_w}×{raw_h}) 超出显存安全上限，已自动保护缩放至 {cw}×{ch}。"
+            return align_dim(raw_w, 16), align_dim(raw_h, 16), None
+
         working_prompt = prompt
         if lora_enabled and lora_trigger.strip():
             trig = lora_trigger.strip()
@@ -1839,18 +2288,27 @@ class QwenImage21Engine:
             crop_info: Optional[dict[str, Any]] = None
             target_w = align_dim(int(width * hires_scale), 16) if mode == "hires" and demo_init else width
             target_h = align_dim(int(height * hires_scale), 16) if mode == "hires" and demo_init else height
+            hires_cap_notice: Optional[str] = None
             if demo_init is not None:
                 if fast_crop_box is not None:
                     req_base_w = align_dim(max(512, demo_init.width), 16)
                     req_base_h = align_dim(max(512, demo_init.height), 16)
+                elif mode == "hires":
+                    req_base_w, req_base_h, hires_cap_notice = _cap_hires_dims(
+                        align_dim(int(demo_init.width * hires_scale), 16),
+                        align_dim(int(demo_init.height * hires_scale), 16),
+                    )
                 else:
-                    req_base_w = align_dim(int(demo_init.width * hires_scale), 16) if mode == "hires" else width
-                    req_base_h = align_dim(int(demo_init.height * hires_scale), 16) if mode == "hires" else height
+                    req_base_w = width
+                    req_base_h = height
                 demo_init, demo_mask, target_w, target_h, crop_info, pad_notice = auto_pad_transparent_to_supported(
                     demo_init, demo_mask, req_w=req_base_w, req_h=req_base_h
                 )
-                if fast_crop_notice or pad_notice:
-                    job.notice = " ".join(x for x in (fast_crop_notice, pad_notice) if x)
+                notices = [x for x in (fast_crop_notice, hires_cap_notice, ref_limit_notice, pad_notice) if x]
+                if notices:
+                    job.notice = " ".join(notices)
+            elif ref_limit_notice:
+                job.notice = ref_limit_notice
             demo_out = self._run_demo_image(
                 mode=mode,
                 prompt=resolved_prompt,
@@ -1873,229 +2331,395 @@ class QwenImage21Engine:
                 )
             return demo_out
 
-        if job.cancel_event.is_set():
-            raise InterruptedError("用户已取消生成")
-        self.ensure_loaded(job)
-        if job.cancel_event.is_set():
-            raise InterruptedError("用户已取消生成")
-        torch, _ = self._detect_torch()
-
-        with self._infer_lock:
+        # Acquire _infer_lock cleanly; if a concurrent unload() cleared self.pipe before we got _infer_lock, reload safely.
+        while True:
             if job.cancel_event.is_set():
                 raise InterruptedError("用户已取消生成")
-            self.sync_lora(lora_enabled=lora_enabled, lora_name=lora_name, lora_weight=lora_weight)
-            generator = torch.Generator(device="cuda" if torch.cuda.is_available() else "cpu").manual_seed(seed)
+            self.ensure_loaded(job)
+            if job.cancel_event.is_set():
+                raise InterruptedError("用户已取消生成")
+            with self._infer_lock:
+                if self.pipe is not None and self.loaded:
+                    return self._generate_locked(
+                        mode=mode,
+                        resolved_prompt=resolved_prompt,
+                        negative_prompt=negative_prompt,
+                        width=width,
+                        height=height,
+                        steps=steps,
+                        denoise=denoise,
+                        true_cfg_scale=true_cfg_scale,
+                        seed=seed,
+                        init_image=init_image,
+                        mask_image=mask_image,
+                        refs_list=refs_list,
+                        hires_scale=hires_scale,
+                        mask_blur=mask_blur,
+                        job=job,
+                        batch_idx=batch_idx,
+                        lora_enabled=lora_enabled,
+                        lora_name=lora_name,
+                        lora_weight=lora_weight,
+                        using_lora_control=using_lora_control,
+                        lora_control_image=lora_control_image,
+                        lora_control_strength=lora_control_strength,
+                        fast_crop_box=fast_crop_box,
+                        fast_crop_orig_img=fast_crop_orig_img,
+                        fast_crop_orig_mask=fast_crop_orig_mask,
+                        fast_crop_notice=fast_crop_notice,
+                        ref_limit_notice=ref_limit_notice,
+                        vram_limits=vram_limits,
+                        cap_hires_dims=_cap_hires_dims,
+                    )
 
-            target_w, target_h = width, height
-            ref_image = init_image
-            prepared_mask: Optional[Image.Image] = None
-            prepared_extras: list[Image.Image] = []
-            crop_info = None
+    def _generate_locked(
+        self,
+        *,
+        mode: str,
+        resolved_prompt: str,
+        negative_prompt: str,
+        width: int,
+        height: int,
+        steps: int,
+        denoise: float,
+        true_cfg_scale: float,
+        seed: int,
+        init_image: Optional[Image.Image],
+        mask_image: Optional[Image.Image],
+        refs_list: list[Image.Image],
+        hires_scale: float,
+        mask_blur: int,
+        job: JobState,
+        batch_idx: int,
+        lora_enabled: bool,
+        lora_name: Optional[str],
+        lora_weight: float,
+        using_lora_control: bool,
+        lora_control_image: Optional[Image.Image],
+        lora_control_strength: float,
+        fast_crop_box: Optional[tuple[int, int, int, int]],
+        fast_crop_orig_img: Optional[Image.Image],
+        fast_crop_orig_mask: Optional[Image.Image],
+        fast_crop_notice: Optional[str],
+        ref_limit_notice: Optional[str],
+        vram_limits: dict[str, int],
+        cap_hires_dims: Any,
+    ) -> Image.Image:
+        torch, _ = self._detect_torch()
+        if job.cancel_event.is_set():
+            raise InterruptedError("用户已取消生成")
+        self.sync_lora(lora_enabled=lora_enabled, lora_name=lora_name, lora_weight=lora_weight)
+        generator = torch.Generator(device="cuda" if torch.cuda.is_available() else "cpu").manual_seed(seed)
 
-            src_primary = init_image if init_image is not None else (
-                lora_control_image if (mode == "t2i" and using_lora_control) else None
-            )
-            if src_primary is not None:
-                if fast_crop_box is not None:
-                    area_scale = math.sqrt(max(512 * 512, min(width * height, 1024 * 1024)) / max(1, src_primary.width * src_primary.height))
-                    req_base_w = align_dim(int(round(src_primary.width * area_scale)), 16)
-                    req_base_h = align_dim(int(round(src_primary.height * area_scale)), 16)
-                else:
-                    req_base_w = align_dim(int(src_primary.width * hires_scale), 16) if mode == "hires" else width
-                    req_base_h = align_dim(int(src_primary.height * hires_scale), 16) if mode == "hires" else height
-                padded_img, padded_mask, target_w, target_h, crop_info, pad_notice = auto_pad_transparent_to_supported(
-                    src_primary,
-                    mask_image if mode == "inpaint" else None,
-                    req_w=req_base_w,
-                    req_h=req_base_h,
+        target_w, target_h = width, height
+        ref_image = init_image
+        prepared_mask: Optional[Image.Image] = None
+        prepared_extras: list[Image.Image] = []
+        crop_info = None
+        hires_cap_notice: Optional[str] = None
+
+        src_primary = init_image if init_image is not None else (
+            lora_control_image if (mode == "t2i" and using_lora_control) else None
+        )
+        if src_primary is not None:
+            if fast_crop_box is not None:
+                area_scale = math.sqrt(max(512 * 512, min(width * height, 1024 * 1024)) / max(1, src_primary.width * src_primary.height))
+                req_base_w = align_dim(int(round(src_primary.width * area_scale)), 16)
+                req_base_h = align_dim(int(round(src_primary.height * area_scale)), 16)
+            elif mode == "hires":
+                req_base_w, req_base_h, hires_cap_notice = cap_hires_dims(
+                    align_dim(int(src_primary.width * hires_scale), 16),
+                    align_dim(int(src_primary.height * hires_scale), 16),
                 )
-                if fast_crop_notice or pad_notice:
-                    job.notice = " ".join(x for x in (fast_crop_notice, pad_notice) if x)
-                    logger.info("Notice for job %s: %s", job.job_id, job.notice)
+            else:
+                req_base_w = width
+                req_base_h = height
+            padded_img, padded_mask, target_w, target_h, crop_info, pad_notice = auto_pad_transparent_to_supported(
+                src_primary,
+                mask_image if mode == "inpaint" else None,
+                req_w=req_base_w,
+                req_h=req_base_h,
+            )
+            notices = [x for x in (fast_crop_notice, hires_cap_notice, ref_limit_notice, pad_notice) if x]
+            if notices:
+                job.notice = " ".join(notices)
+                logger.info("Notice for job %s: %s", job.job_id, job.notice)
 
-                ref_image = padded_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
-                if mode == "inpaint" and padded_mask is not None:
-                    prepared_mask = padded_mask.resize((target_w, target_h), Image.Resampling.BILINEAR)
-                if mode in {"i2i", "inpaint"}:
-                    if refs_list:
-                        max_edge = max(target_w, target_h, 1024)
-                        prepared_extras = [resize_preserve_aspect(rimg, max_edge=max_edge) for rimg in refs_list]
-                    if using_lora_control and lora_control_image is not None:
-                        prepared_extras.append(resize_preserve_aspect(lora_control_image, max_edge=max(target_w, target_h, 1024)))
+            ref_image = padded_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
+            if mode == "inpaint" and padded_mask is not None:
+                prepared_mask = padded_mask.resize((target_w, target_h), Image.Resampling.BILINEAR)
+            if mode in {"i2i", "inpaint"}:
+                max_ref_edge = min(max(target_w, target_h, 768), vram_limits["max_ref_edge"])
+                if vram_limits["max_ref_edge"] <= 1024 and (1 + len(refs_list)) >= 3:
+                    max_ref_edge = min(max_ref_edge, 768)
+                if refs_list:
+                    prepared_extras = [resize_preserve_aspect(rimg, max_edge=max_ref_edge) for rimg in refs_list]
+                if using_lora_control and lora_control_image is not None:
+                    prepared_extras.append(resize_preserve_aspect(lora_control_image, max_edge=max_ref_edge))
+        elif ref_limit_notice:
+            job.notice = ref_limit_notice
 
-            eff_now = self.effective_settings()
-            is_smart_stage = eff_now["offload_mode"] == "smart_stage_offload"
+        eff_now = self.effective_settings()
+        profile_now: GPUProfile = eff_now["profile"]
 
-            def step_callback(_pipe: Any, step_index: int, _timestep: Any, callback_kwargs: dict[str, Any]) -> dict[str, Any]:
-                if job.cancel_event.is_set():
-                    raise InterruptedError("用户已取消生成")
-                pipe_total = getattr(_pipe, "_num_timesteps", None)
-                if not isinstance(pipe_total, int) or pipe_total <= 0:
-                    ts = getattr(_pipe, "timesteps", None)
-                    try:
-                        pipe_total = len(ts) if ts is not None else steps
-                    except TypeError:
-                        pipe_total = steps
-                cur = step_index + 1
-                actual_total = max(int(pipe_total or steps), cur, 1)
-                if is_smart_stage and torch.cuda.is_available() and (step_index == 0 or cur == actual_total):
-                    # Stage boundary trim: flush text_encoder blocks at step 0, and DiT blocks before VAE decode
-                    torch.cuda.empty_cache()
-                job.total_steps = actual_total
-                job.current_step = cur
-                base_progress = batch_idx / job.batch_size
-                step_progress = (cur / actual_total) / job.batch_size
-                job.progress = min(0.99, base_progress + step_progress)
-                job.message = f"第 {batch_idx + 1}/{job.batch_size} 张 · Step {cur}/{actual_total}"
-                return callback_kwargs
+        # Dynamic VAE tiling when auto mode is active: keep off at <= 1536x1536, enable only for huge outputs / hires
+        if self.vae_tiling_mode == "auto" and not eff_now["vae_tiling"] and not self._oom_vae_tiling_forced and hasattr(self.pipe, "vae"):
+            need_dynamic_tiling = (target_w * target_h > 1536 * 1536) or (mode == "hires" and target_w * target_h >= 1536 * 1536)
+            if need_dynamic_tiling and hasattr(self.pipe.vae, "enable_tiling"):
+                self.pipe.vae.enable_tiling()
+            elif not need_dynamic_tiling and hasattr(self.pipe.vae, "disable_tiling"):
+                self.pipe.vae.disable_tiling()
 
-            call_kwargs: dict[str, Any] = {
-                "prompt": resolved_prompt,
-                "width": target_w,
-                "height": target_h,
-                "num_inference_steps": steps,
-                "true_cfg_scale": true_cfg_scale,
-                "generator": generator,
-                "callback_on_step_end": step_callback,
-            }
-            if true_cfg_scale > 1.0 and negative_prompt.strip():
-                call_kwargs["negative_prompt"] = negative_prompt.strip()
+        def step_callback(_pipe: Any, step_index: int, _timestep: Any, callback_kwargs: dict[str, Any]) -> dict[str, Any]:
+            if job.cancel_event.is_set():
+                raise InterruptedError("用户已取消生成")
+            pipe_total = getattr(_pipe, "_num_timesteps", None)
+            if not isinstance(pipe_total, int) or pipe_total <= 0:
+                ts = getattr(_pipe, "timesteps", None)
+                try:
+                    pipe_total = len(ts) if ts is not None else steps
+                except TypeError:
+                    pipe_total = steps
+            cur = step_index + 1
+            actual_total = max(int(pipe_total or steps), cur, 1)
+            job.total_steps = actual_total
+            job.current_step = cur
+            base_progress = batch_idx / job.batch_size
+            step_progress = (cur / actual_total) / job.batch_size
+            job.progress = min(0.99, base_progress + step_progress)
+            job.message = f"第 {batch_idx + 1}/{job.batch_size} 张 · Step {cur}/{actual_total}"
+            return callback_kwargs
 
-            if ref_image is not None and (mode in {"i2i", "hires", "inpaint"} or (mode == "t2i" and using_lora_control)):
-                call_kwargs["image"] = [ref_image, *prepared_extras] if prepared_extras else ref_image
-                if self._pipe_supports_strength:
-                    eff_strength = lora_control_strength if (mode == "t2i" and using_lora_control) else denoise
-                    call_kwargs["strength"] = max(0.05, min(1.0, float(eff_strength)))
-                if mode == "inpaint" and prepared_mask is not None and self._pipe_supports_mask:
-                    call_kwargs["mask_image"] = prepared_mask
+        do_true_cfg = true_cfg_scale > 1.0 and bool(negative_prompt.strip())
+        call_kwargs: dict[str, Any] = {
+            "prompt": resolved_prompt,
+            "width": target_w,
+            "height": target_h,
+            "num_inference_steps": steps,
+            "true_cfg_scale": true_cfg_scale,
+            "generator": generator,
+            "callback_on_step_end": step_callback,
+        }
+        if do_true_cfg:
+            call_kwargs["negative_prompt"] = negative_prompt.strip()
 
-            # Register fast mid-step abort hooks so clicking Stop cancels immediately
-            hook_handles: list[Any] = []
+        # Pass fixed Turbo 8-step sigmas if running an older diffusers release lacking sample_sigmas (PR #14950)
+        is_turbo = ("turbo" in self.model_id.lower()) or (eff_now.get("gguf_variant") is not None)
+        if is_turbo and steps == 8 and not self._pipe_has_sample_sigmas and self._pipe_supports_sigmas:
+            logger.warning(
+                "Detected QwenImage21Pipeline without native `sample_sigmas`; injecting Turbo 8-step sigmas (please upgrade diffusers)."
+            )
+            call_kwargs["sigmas"] = list(TURBO_SAMPLE_SIGMAS)
 
-            def _abort_pre_hook(*_args: Any, **_kwargs: Any) -> None:
-                if job.cancel_event.is_set():
-                    raise InterruptedError("用户已取消生成")
+        cond_images: Optional[list[Image.Image]] = None
+        if ref_image is not None and (mode in {"i2i", "hires", "inpaint"} or (mode == "t2i" and using_lora_control)):
+            cond_images = [ref_image, *prepared_extras]
+            call_kwargs["image"] = cond_images if prepared_extras else ref_image
+            if self._pipe_supports_strength:
+                eff_strength = lora_control_strength if (mode == "t2i" and using_lora_control) else denoise
+                call_kwargs["strength"] = max(0.05, min(1.0, float(eff_strength)))
+            if mode == "inpaint" and prepared_mask is not None and self._pipe_supports_mask:
+                call_kwargs["mask_image"] = prepared_mask
+
+        # Prompt Encoding LRU Cache + True Stage Offload pre-encode helper
+        exec_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        pipe_call_params = inspect.signature(self.pipe.__call__).parameters
+
+        def _clear_prompt_embed_kwargs() -> None:
+            for k_rem in (
+                "prompt_embeds",
+                "prompt_embeds_mask",
+                "image_pad_mask",
+                "negative_prompt_embeds",
+                "negative_prompt_embeds_mask",
+                "negative_image_pad_mask",
+            ):
+                call_kwargs.pop(k_rem, None)
+
+        def _attach_cached_embeds(imgs_for_encode: Optional[list[Image.Image]]) -> bool:
+            _clear_prompt_embed_kwargs()
+            try:
+                cached_embeds = self._get_or_encode_prompt(
+                    resolved_prompt=resolved_prompt,
+                    negative_prompt=negative_prompt,
+                    do_true_cfg=do_true_cfg,
+                    cond_images=imgs_for_encode,
+                    exec_device=exec_device,
+                    torch_mod=torch,
+                )
+            except InterruptedError:
+                raise
+            except Exception as enc_exc:
+                err_low = str(enc_exc).lower()
+                if "out of memory" in err_low or "cuda error: out of memory" in err_low:
+                    raise
+                logger.warning("Pre-encode prompt caching skipped (%s); falling back to pipeline prompt encoding.", enc_exc)
+                cached_embeds = None
+
+            if cached_embeds is None:
+                call_kwargs["prompt"] = resolved_prompt
+                if do_true_cfg:
+                    call_kwargs["negative_prompt"] = negative_prompt.strip()
+                return False
+
+            call_kwargs.pop("prompt", None)
+            call_kwargs["prompt_embeds"] = cached_embeds["prompt_embeds"]
+            if self._pipe_supports_prompt_embeds_mask and cached_embeds["prompt_embeds_mask"] is not None:
+                call_kwargs["prompt_embeds_mask"] = cached_embeds["prompt_embeds_mask"]
+            if self._pipe_supports_image_pad_mask and cached_embeds["image_pad_mask"] is not None:
+                call_kwargs["image_pad_mask"] = cached_embeds["image_pad_mask"]
+            if do_true_cfg and cached_embeds["negative_prompt_embeds"] is not None:
+                call_kwargs.pop("negative_prompt", None)
+                call_kwargs["negative_prompt_embeds"] = cached_embeds["negative_prompt_embeds"]
+                if "negative_prompt_embeds_mask" in pipe_call_params and cached_embeds["negative_prompt_embeds_mask"] is not None:
+                    call_kwargs["negative_prompt_embeds_mask"] = cached_embeds["negative_prompt_embeds_mask"]
+                if self._pipe_supports_neg_image_pad_mask and cached_embeds["negative_image_pad_mask"] is not None:
+                    call_kwargs["negative_image_pad_mask"] = cached_embeds["negative_image_pad_mask"]
+            return True
+
+        # Register fast mid-step abort hooks + stage-boundary TE offload guard
+        hook_handles: list[Any] = []
+
+        def _abort_pre_hook(*_args: Any, **_kwargs: Any) -> None:
+            if job.cancel_event.is_set():
+                raise InterruptedError("用户已取消生成")
+
+        def _stage_dit_pre_hook(*_args: Any, **_kwargs: Any) -> None:
+            if self._stage_offload_active:
+                self._offload_te_now(torch)
+
+        try:
+            if hasattr(self.pipe, "_interrupt"):
+                setattr(self.pipe, "_interrupt", False)
+            for comp_name in ("transformer", "text_encoder", "vae"):
+                comp = getattr(self.pipe, comp_name, None)
+                if comp is not None and hasattr(comp, "register_forward_pre_hook"):
+                    hook_handles.append(comp.register_forward_pre_hook(_abort_pre_hook))
+            transformer = getattr(self.pipe, "transformer", None)
+            if transformer is not None and hasattr(transformer, "register_forward_pre_hook") and self._stage_offload_active:
+                hook_handles.append(transformer.register_forward_pre_hook(_stage_dit_pre_hook))
+            blocks = getattr(transformer, "transformer_blocks", None) if transformer is not None else None
+            if blocks is not None:
+                for blk in blocks:
+                    if hasattr(blk, "register_forward_pre_hook"):
+                        hook_handles.append(blk.register_forward_pre_hook(_abort_pre_hook))
+
+            def _run_pipe_with_rgba_fallback() -> Any:
+                _attach_cached_embeds(cond_images)
+                try:
+                    return self.pipe(**call_kwargs)
+                except Exception as pipe_exc:
+                    if ref_image is not None and ref_image.mode == "RGBA" and not job.cancel_event.is_set():
+                        err_s = str(pipe_exc).lower()
+                        if any(k in err_s for k in ("channel", "rgba", "shape", "size", "mode", "rgb", "mismatch")):
+                            logger.warning("Pipeline rejected RGBA canvas (%s); falling back to RGB canvas.", pipe_exc)
+                            rgb_ref = ref_image.convert("RGB")
+                            rgb_cond = [rgb_ref, *prepared_extras]
+                            call_kwargs["image"] = rgb_cond if prepared_extras else rgb_ref
+                            _attach_cached_embeds(rgb_cond)
+                            return self.pipe(**call_kwargs)
+                    raise
 
             try:
-                if hasattr(self.pipe, "_interrupt"):
-                    setattr(self.pipe, "_interrupt", False)
-                for comp_name in ("transformer", "text_encoder", "vae"):
-                    comp = getattr(self.pipe, comp_name, None)
-                    if comp is not None and hasattr(comp, "register_forward_pre_hook"):
-                        hook_handles.append(comp.register_forward_pre_hook(_abort_pre_hook))
-                transformer = getattr(self.pipe, "transformer", None)
-                blocks = getattr(transformer, "transformer_blocks", None) if transformer is not None else None
-                if blocks is not None:
-                    for blk in blocks:
-                        if hasattr(blk, "register_forward_pre_hook"):
-                            hook_handles.append(blk.register_forward_pre_hook(_abort_pre_hook))
-
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-                def _run_pipe_with_rgba_fallback() -> Any:
-                    try:
-                        return self.pipe(**call_kwargs)
-                    except Exception as pipe_exc:
-                        if ref_image is not None and ref_image.mode == "RGBA" and not job.cancel_event.is_set():
-                            err_s = str(pipe_exc).lower()
-                            if any(k in err_s for k in ("channel", "rgba", "shape", "size", "mode", "rgb", "mismatch")):
-                                logger.warning("Pipeline rejected RGBA canvas (%s); falling back to RGB canvas.", pipe_exc)
-                                rgb_ref = ref_image.convert("RGB")
-                                call_kwargs["image"] = [rgb_ref, *prepared_extras] if prepared_extras else rgb_ref
-                                return self.pipe(**call_kwargs)
-                        raise
-
-                try:
-                    out = _run_pipe_with_rgba_fallback()
-                except Exception as oom_exc:
-                    err_low = str(oom_exc).lower()
-                    is_oom = ("out of memory" in err_low or "cuda error: out of memory" in err_low)
-                    is_gguf_pipe = (eff_now.get("gguf_variant") is not None) or _pipe_has_gguf_params(self.pipe)
-                    can_retry_oom = (
-                        is_oom
-                        and not job.cancel_event.is_set()
-                        and "sequential" not in self.device
-                        and (not is_gguf_pipe or ("offload" not in self.device and hasattr(self.pipe, "enable_model_cpu_offload")))
-                    )
-                    if can_retry_oom:
-                        if hasattr(self.pipe, "vae"):
-                            if hasattr(self.pipe.vae, "enable_tiling"):
-                                self.pipe.vae.enable_tiling()
-                            if hasattr(self.pipe.vae, "enable_slicing"):
-                                self.pipe.vae.enable_slicing()
-                        if hasattr(self.pipe, "enable_attention_slicing"):
-                            self.pipe.enable_attention_slicing("auto")
-                        trim_host_memory()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        if is_gguf_pipe:
-                            logger.warning(
-                                "CUDA OOM detected on GGUF pipeline (%s); switching pipeline to model_cpu_offload and retrying once.",
-                                oom_exc,
-                            )
-                            job.notice = "检测到显存不足，已自动切换至模型 CPU 卸载模式并重试..."
-                            self.pipe.enable_model_cpu_offload()
-                            self.device = "cuda (auto_model_offload_fallback)"
-                        else:
-                            logger.warning("CUDA OOM detected (%s); switching pipeline to sequential_cpu_offload and retrying once.", oom_exc)
-                            job.notice = "检测到显存不足，已自动切换至逐层显存调度模式并重试..."
-                            if hasattr(self.pipe, "enable_sequential_cpu_offload"):
-                                self.device = _enable_sequential_offload_safe(
-                                    self.pipe,
-                                    is_gguf=False,
-                                    fallback_device="cuda (auto_model_offload_fallback)",
-                                    seq_device="cuda (auto_sequential_fallback)",
-                                    reason="CUDA OOM fallback",
-                                )
-                        out = _run_pipe_with_rgba_fallback()
-                    else:
-                        raise
-            finally:
-                for h in hook_handles:
-                    try:
-                        h.remove()
-                    except Exception:
-                        pass
-                if is_smart_stage and torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    trim_host_memory()
-
-            result_img: Image.Image = out.images[0].convert("RGB")
-
-            # Guarantee exact size & RGB mode match before blend/composite (prevents PIL "images do not match")
-            # Note: when `fast_crop_box` is active, defer denoise blending & feathered compositing
-            # to `stitch_inpaint_crop_patch()` below to avoid double-blending and double-blurring.
-            if ref_image is not None:
-                ref_rgb = ref_image.convert("RGB")
-                if result_img.size != ref_rgb.size:
-                    result_img = result_img.resize(ref_rgb.size, Image.Resampling.LANCZOS)
-                if mode == "inpaint" and prepared_mask is not None and fast_crop_box is None:
-                    if prepared_mask.size != ref_rgb.size:
-                        prepared_mask = prepared_mask.resize(ref_rgb.size, Image.Resampling.BILINEAR)
-                    feather = prepared_mask.convert("L")
-                    if mask_blur > 0:
-                        feather = feather.filter(ImageFilter.GaussianBlur(radius=mask_blur))
-                    if denoise < 0.99:
-                        blended = Image.blend(ref_rgb, result_img, alpha=max(0.05, min(1.0, denoise)))
-                        result_img = Image.composite(blended, ref_rgb, feather)
-                    else:
-                        result_img = Image.composite(result_img, ref_rgb, feather)
-                elif (
-                    mode in {"i2i", "hires"}
-                    and not prepared_extras
-                    and not self._pipe_supports_strength
-                    and denoise < 0.99
-                ):
-                    alpha = max(0.1, min(1.0, denoise))
-                    result_img = Image.blend(ref_rgb, result_img, alpha=alpha)
-
-            final_img = crop_back_to_original_ratio(result_img, crop_info)
-            if fast_crop_box is not None and fast_crop_orig_img is not None and fast_crop_orig_mask is not None:
-                final_img = stitch_inpaint_crop_patch(
-                    fast_crop_orig_img, final_img, fast_crop_orig_mask, fast_crop_box, mask_blur=mask_blur, denoise=denoise
+                out = _run_pipe_with_rgba_fallback()
+            except Exception as oom_exc:
+                err_low = str(oom_exc).lower()
+                is_oom = ("out of memory" in err_low or "cuda error: out of memory" in err_low)
+                is_gguf_pipe = (eff_now.get("gguf_variant") is not None) or _pipe_has_gguf_params(self.pipe)
+                can_retry_oom = (
+                    is_oom
+                    and not job.cancel_event.is_set()
+                    and "sequential" not in self.device
+                    and (not is_gguf_pipe or ("auto_model_offload_fallback" not in self.device and hasattr(self.pipe, "enable_model_cpu_offload")))
                 )
-            return final_img
+                if can_retry_oom:
+                    if hasattr(self.pipe, "vae"):
+                        if hasattr(self.pipe.vae, "enable_tiling"):
+                            self.pipe.vae.enable_tiling()
+                            self._oom_vae_tiling_forced = True
+                        if hasattr(self.pipe.vae, "enable_slicing"):
+                            self.pipe.vae.enable_slicing()
+                    if profile_now.vram_gb <= 16.5 and hasattr(self.pipe, "enable_attention_slicing"):
+                        self.pipe.enable_attention_slicing("auto")
+
+                    # Clear existing offload hooks BEFORE re-attaching fallback hooks
+                    _clear_pipeline_hooks(self.pipe)
+                    self._stage_offload_active = False
+                    self._stage_swap_dit_for_te = False
+                    self._te_offload_hook = None
+                    trim_host_memory()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                    if is_gguf_pipe:
+                        logger.warning(
+                            "CUDA OOM detected on GGUF pipeline (%s); switching pipeline to model_cpu_offload and retrying once.",
+                            oom_exc,
+                        )
+                        job.notice = "检测到显存不足，已自动切换至模型 CPU 卸载模式并重试..."
+                        self.pipe.enable_model_cpu_offload()
+                        self.device = "cuda (auto_model_offload_fallback)"
+                    elif self.device == "cuda (full)" and hasattr(self.pipe, "enable_model_cpu_offload"):
+                        logger.warning(
+                            "CUDA OOM detected on full-resident pipeline (%s); downgrading to model_cpu_offload and retrying once.",
+                            oom_exc,
+                        )
+                        job.notice = "检测到显存不足，已自动降级至模型 CPU 卸载模式并重试..."
+                        self.pipe.enable_model_cpu_offload()
+                        self.device = "cuda (auto_model_offload_fallback)"
+                    else:
+                        logger.warning("CUDA OOM detected (%s); switching pipeline to sequential_cpu_offload and retrying once.", oom_exc)
+                        job.notice = "检测到显存不足，已自动切换至逐层显存调度模式并重试..."
+                        if hasattr(self.pipe, "enable_sequential_cpu_offload"):
+                            self.device = _enable_sequential_offload_safe(
+                                self.pipe,
+                                is_gguf=False,
+                                fallback_device="cuda (auto_model_offload_fallback)",
+                                seq_device="cuda (auto_sequential_fallback)",
+                                reason="CUDA OOM fallback",
+                            )
+                    out = _run_pipe_with_rgba_fallback()
+                else:
+                    raise
+        finally:
+            for h in hook_handles:
+                try:
+                    h.remove()
+                except Exception:
+                    pass
+
+        result_img: Image.Image = out.images[0].convert("RGB")
+
+        if ref_image is not None:
+            ref_rgb = ref_image.convert("RGB")
+            if result_img.size != ref_rgb.size:
+                result_img = result_img.resize(ref_rgb.size, Image.Resampling.LANCZOS)
+            if mode == "inpaint" and prepared_mask is not None and fast_crop_box is None:
+                if prepared_mask.size != ref_rgb.size:
+                    prepared_mask = prepared_mask.resize(ref_rgb.size, Image.Resampling.BILINEAR)
+                feather = prepared_mask.convert("L")
+                if mask_blur > 0:
+                    feather = feather.filter(ImageFilter.GaussianBlur(radius=mask_blur))
+                if denoise < 0.99:
+                    blended = Image.blend(ref_rgb, result_img, alpha=max(0.05, min(1.0, denoise)))
+                    result_img = Image.composite(blended, ref_rgb, feather)
+                else:
+                    result_img = Image.composite(result_img, ref_rgb, feather)
+            elif (
+                mode in {"i2i", "hires"}
+                and not prepared_extras
+                and not self._pipe_supports_strength
+                and denoise < 0.99
+            ):
+                alpha = max(0.1, min(1.0, denoise))
+                result_img = Image.blend(ref_rgb, result_img, alpha=alpha)
+
+        final_img = crop_back_to_original_ratio(result_img, crop_info)
+        if fast_crop_box is not None and fast_crop_orig_img is not None and fast_crop_orig_mask is not None:
+            final_img = stitch_inpaint_crop_patch(
+                fast_crop_orig_img, final_img, fast_crop_orig_mask, fast_crop_box, mask_blur=mask_blur, denoise=denoise
+            )
+        return final_img
 
 
 # ---------------------------------------------------------------------------
@@ -2163,6 +2787,7 @@ class ConfigUpdateRequest(BaseModel):
     cpu_offload: Optional[bool] = None
     vae_tiling: Optional[bool] = None
     inpaint_fast_crop: Optional[bool] = None
+    torch_compile: Optional[bool] = None
     ai_endpoint: Optional[str] = None
     ai_api_key: Optional[str] = None
     clear_ai_api_key: bool = False
@@ -2204,7 +2829,7 @@ class LoraDownloadRequest(BaseModel):
 
 
 class ComfyLaunchRequest(BaseModel):
-    gguf_variant: Literal["q8", "q4", "both", "none"] = "q4"
+    gguf_variant: Literal["int8_convrot", "q8", "q4", "both", "none"] = "q4"
 
 
 class SaveGDriveRequest(BaseModel):
@@ -2398,6 +3023,7 @@ def collect_system_stats() -> dict[str, Any]:
             "offload_mode": engine.offload_mode,
             "vae_tiling_mode": engine.vae_tiling_mode,
             "inpaint_fast_crop": engine.inpaint_fast_crop,
+            "torch_compile": engine.torch_compile,
             "effective_dtype": eff["dtype"],
             "effective_offload": eff["offload_mode"],
             "effective_vae_tiling": eff["vae_tiling"],
@@ -2518,6 +3144,17 @@ def _run_generation_job(job_id: str, req: GenerateRequest) -> None:
 # ---------------------------------------------------------------------------
 
 
+@app.get("/api/auth/status")
+def api_auth_status(
+    authorization: Optional[str] = Header(default=None),
+    x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
+) -> dict[str, Any]:
+    return {
+        "auth_required": True,
+        "authenticated": verify_admin_token(authorization, x_admin_token),
+    }
+
+
 @app.get("/api/health")
 def api_health() -> dict[str, Any]:
     return {
@@ -2526,6 +3163,7 @@ def api_health() -> dict[str, Any]:
         "quant_mode": engine.quant_mode,
         "demo_mode": engine.demo_mode,
         "loaded": engine.loaded,
+        "auth_required": True,
         "presets": MODEL_PRESETS,
         "gpu_profiles": {k: v.to_dict() for k, v in GPU_PROFILES.items()},
         "active_gpu_profile": engine.resolve_gpu_profile().to_dict(),
@@ -2537,7 +3175,7 @@ def api_stats() -> dict[str, Any]:
     return collect_system_stats()
 
 
-@app.post("/api/config")
+@app.post("/api/config", dependencies=[Depends(require_admin_auth)])
 def api_update_config(req: ConfigUpdateRequest) -> dict[str, Any]:
     engine.reconfigure(
         model_id=req.model_id,
@@ -2551,6 +3189,7 @@ def api_update_config(req: ConfigUpdateRequest) -> dict[str, Any]:
         cpu_offload=req.cpu_offload,
         vae_tiling=req.vae_tiling,
         inpaint_fast_crop=req.inpaint_fast_crop,
+        torch_compile=req.torch_compile,
         ai_endpoint=req.ai_endpoint,
         ai_api_key=req.ai_api_key,
         clear_ai_api_key=req.clear_ai_api_key,
@@ -2561,14 +3200,14 @@ def api_update_config(req: ConfigUpdateRequest) -> dict[str, Any]:
     return {"ok": True, "stats": collect_system_stats()}
 
 
-@app.get("/api/terminal/cwd")
+@app.get("/api/terminal/cwd", dependencies=[Depends(require_admin_auth)])
 def api_terminal_cwd() -> dict[str, Any]:
     return {"cwd": terminal.cwd}
 
 
-@app.post("/api/terminal/run")
+@app.post("/api/terminal/run", dependencies=[Depends(require_admin_auth)])
 def api_terminal_run(req: TerminalRunRequest) -> dict[str, Any]:
-    if req.source == "ai" and not req.allow_dangerous:
+    if not req.allow_dangerous:
         dangerous, reason = is_dangerous_command(req.command)
         if dangerous:
             return {
@@ -2588,7 +3227,7 @@ def api_terminal_run(req: TerminalRunRequest) -> dict[str, Any]:
     }
 
 
-@app.get("/api/terminal/poll/{cmd_id}")
+@app.get("/api/terminal/poll/{cmd_id}", dependencies=[Depends(require_admin_auth)])
 def api_terminal_poll(cmd_id: str, offset: int = Query(default=0, ge=0)) -> dict[str, Any]:
     data = terminal.poll(cmd_id, offset=offset)
     if data is None:
@@ -2596,7 +3235,7 @@ def api_terminal_poll(cmd_id: str, offset: int = Query(default=0, ge=0)) -> dict
     return data
 
 
-@app.post("/api/terminal/kill/{cmd_id}")
+@app.post("/api/terminal/kill/{cmd_id}", dependencies=[Depends(require_admin_auth)])
 def api_terminal_kill(cmd_id: str) -> dict[str, Any]:
     killed = terminal.kill(cmd_id)
     return {"ok": killed}
@@ -2647,7 +3286,7 @@ def _filter_error_log_lines(raw_lines: list[str]) -> list[str]:
     return filtered
 
 
-@app.get("/api/logs")
+@app.get("/api/logs", dependencies=[Depends(require_admin_auth)])
 def api_server_logs(
     limit: int = Query(default=150, ge=10, le=500),
     errors_only: bool = Query(default=False),
@@ -2659,8 +3298,8 @@ def api_server_logs(
             file_lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
             if file_lines:
                 raw_lines = file_lines if errors_only else file_lines[-limit:]
-        except OSError:
-            pass
+        except OSError as exc:
+            logger.warning("Failed to read server log file %s: %s", log_file, exc)
     lines = _filter_error_log_lines(raw_lines)[-limit:] if errors_only else raw_lines[-limit:]
     return {"lines": lines, "errors_only": errors_only, "ts": time.time()}
 
@@ -2670,10 +3309,11 @@ def api_list_loras() -> dict[str, Any]:
     return {"loras_dir": str(LORAS_DIR), "items": list_loras(LORAS_DIR)}
 
 
-@app.delete("/api/loras/{lora_name}")
+@app.delete("/api/loras/{lora_name}", dependencies=[Depends(require_admin_auth)])
 def api_delete_lora(lora_name: str) -> dict[str, Any]:
-    if engine._active_lora_path and Path(engine._active_lora_path).name == Path(lora_name).name:
-        engine._unload_active_lora()
+    with engine._infer_lock:
+        if engine._active_lora_path and Path(engine._active_lora_path).name == Path(lora_name).name:
+            engine._unload_active_lora()
     ok = delete_lora(LORAS_DIR, lora_name)
     if not ok:
         raise HTTPException(status_code=404, detail="LoRA file not found")
@@ -2690,8 +3330,8 @@ def _extract_ai_actions(reply_text: str) -> Optional[dict[str, Any]]:
             parsed = json.loads(raw_json)
             if isinstance(parsed, dict):
                 return parsed
-        except Exception:
-            continue
+        except json.JSONDecodeError as exc:
+            logger.warning("Failed to parse JSON action block from AI reply: %s", exc)
     return None
 
 
@@ -2713,7 +3353,7 @@ def _build_ai_system_prompt(scene: str, context: dict[str, Any]) -> str:
         f"- 终端当前目录: {terminal.cwd}\n"
         f"{auto_run_note}"
         f"- 支持的仓库预设: Qwen/Qwen-Image-2.1-Turbo (推荐8步), Qwen/Qwen-Image-2.1 (推荐40步), addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit, abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q8 (Q8满血, 推荐8步), abenzerps/Qwen-Image-2.1-Uncensored-GGUF:q4 (Q4轻量, 推荐8步)\n"
-        f"- 支持的量化模式: fp8-int8, fp8-all, int8-torchao, int8-bnb, gguf-q8-full, gguf-q4, none\n"
+        f"- 支持的量化模式: fp8-int8, fp8-all, int8-torchao, int8-bnb, gguf-q8-int8, gguf-q8-full, gguf-q4, none\n"
         f"- 支持的显存调度: auto, smart_stage_offload, none, model_cpu_offload, sequential_cpu_offload\n"
         f"- 支持的生成比例: 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3\n"
     )
@@ -2865,7 +3505,7 @@ def api_ai_chat(req: AIChatRequest) -> dict[str, Any]:
     return {"ok": True, "reply": reply, "actions": actions, "model": engine.ai_model, "used_vision": use_vision}
 
 
-@app.post("/api/loras/download")
+@app.post("/api/loras/download", dependencies=[Depends(require_admin_auth)])
 def api_download_lora(req: LoraDownloadRequest) -> dict[str, Any]:
     task_id = lora_downloads.start_download(
         url=req.url,
@@ -2889,17 +3529,19 @@ def api_comfyui_status() -> dict[str, Any]:
     return comfy_launcher.get_status()
 
 
-@app.post("/api/comfyui/launch")
+@app.post("/api/comfyui/launch", dependencies=[Depends(require_admin_auth)])
 def api_comfyui_launch(req: Optional[ComfyLaunchRequest] = None) -> dict[str, Any]:
     gguf_variant = req.gguf_variant if req is not None else "q4"
     return comfy_launcher.launch(
         demo_mode=engine.demo_mode,
         gguf_variant=gguf_variant,
         hf_token=engine.hf_token or None,
+        gpu_profile_key=engine.resolve_gpu_profile().key,
+        main_model_loaded=engine.loaded,
     )
 
 
-@app.post("/api/comfyui/stop")
+@app.post("/api/comfyui/stop", dependencies=[Depends(require_admin_auth)])
 def api_comfyui_stop() -> dict[str, Any]:
     return comfy_launcher.stop()
 
@@ -2917,13 +3559,13 @@ def api_generate(req: GenerateRequest) -> dict[str, Any]:
     )
     with jobs_lock:
         jobs[job_id] = job
-        if len(jobs) > 50:
-            done_keys = [
-                k for k, v in sorted(jobs.items(), key=lambda kv: kv[1].created_at)
-                if v.status in {"completed", "cancelled", "error"}
-            ]
-            for old_k in done_keys[:-30]:
-                jobs.pop(old_k, None)
+        _prune_dict_store(
+            jobs,
+            done_statuses={"completed", "cancelled", "error"},
+            max_items=100,
+            keep_done=50,
+            ttl_sec=3600.0,
+        )
 
     worker = threading.Thread(target=_run_generation_job, args=(job_id, req), daemon=True)
     worker.start()
@@ -2952,9 +3594,10 @@ def api_cancel_job(job_id: str) -> dict[str, Any]:
             job.message = "已取消排队"
         else:
             job.message = "正在立即中断生成..."
-    if engine.pipe is not None and hasattr(engine.pipe, "_interrupt"):
+    pipe_ref = engine.pipe
+    if pipe_ref is not None and hasattr(pipe_ref, "_interrupt"):
         try:
-            setattr(engine.pipe, "_interrupt", True)
+            setattr(pipe_ref, "_interrupt", True)
         except Exception:
             pass
     return {"ok": True}
@@ -2970,7 +3613,7 @@ def api_gallery(
     return gallery.list_items(mode=mode, query=q, limit=limit, offset=offset)
 
 
-@app.delete("/api/gallery/{item_id}")
+@app.delete("/api/gallery/{item_id}", dependencies=[Depends(require_admin_auth)])
 def api_delete_gallery_item(item_id: str) -> dict[str, Any]:
     removed = gallery.delete_items([item_id])
     if removed == 0:
@@ -2978,37 +3621,42 @@ def api_delete_gallery_item(item_id: str) -> dict[str, Any]:
     return {"ok": True, "removed": removed}
 
 
-@app.post("/api/gallery/batch-delete")
+@app.post("/api/gallery/batch-delete", dependencies=[Depends(require_admin_auth)])
 def api_batch_delete_gallery(req: BatchDeleteRequest) -> dict[str, Any]:
     removed = gallery.delete_items(req.ids)
     return {"ok": True, "removed": removed}
 
 
 @app.get("/api/gallery/export")
-def api_export_gallery(ids: Optional[str] = Query(default=None)) -> StreamingResponse:
-    """Bundle selected or all gallery images + metadata JSON into a single ZIP."""
+def api_export_gallery(ids: Optional[str] = Query(default=None)) -> FileResponse:
+    """Bundle selected or all gallery images + metadata JSON into a disk-backed temp ZIP without RAM spikes."""
     target_ids = set(ids.split(",")) if ids else None
     listing = gallery.list_items(limit=500)["items"]
     if target_ids:
         listing = [x for x in listing if x["id"] in target_ids]
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for item in listing:
-            fpath = OUTPUT_DIR / item["filename"]
-            if fpath.exists():
-                zf.write(fpath, arcname=item["filename"])
-        zf.writestr("metadata.json", json.dumps(listing, ensure_ascii=False, indent=2))
-    buf.seek(0)
-    zip_bytes = buf.getvalue()
+    tmp_file = tempfile.NamedTemporaryFile(prefix="qwen_export_", suffix=".zip", delete=False)
+    tmp_path = Path(tmp_file.name)
+    tmp_file.close()
+    try:
+        with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for item in listing:
+                fpath = _safe_child_path(OUTPUT_DIR, item.get("filename", ""))
+                if fpath is not None and fpath.exists():
+                    zf.write(fpath, arcname=fpath.name)
+            zf.writestr("metadata.json", json.dumps(listing, ensure_ascii=False, indent=2))
+        stat_res = os.stat(tmp_path)
+    except Exception:
+        _safe_unlink(tmp_path)
+        raise
+
     filename = f"qwen_gallery_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-    return StreamingResponse(
-        io.BytesIO(zip_bytes),
+    return FileResponse(
+        path=str(tmp_path),
         media_type="application/zip",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Content-Length": str(len(zip_bytes)),
-        },
+        filename=filename,
+        stat_result=stat_res,
+        background=BackgroundTask(_safe_unlink, tmp_path),
     )
 
 
@@ -3017,7 +3665,7 @@ def api_gdrive_status() -> dict[str, Any]:
     return get_gdrive_status()
 
 
-@app.post("/api/gallery/save-gdrive")
+@app.post("/api/gallery/save-gdrive", dependencies=[Depends(require_admin_auth)])
 def api_save_gallery_to_gdrive(req: Optional[SaveGDriveRequest] = None) -> dict[str, Any]:
     """Copy selected (or all) gallery images and metadata to mounted Google Drive."""
     status = get_gdrive_status()
@@ -3041,10 +3689,12 @@ def api_save_gallery_to_gdrive(req: Optional[SaveGDriveRequest] = None) -> dict[
     saved = 0
     skipped = 0
     for item in listing:
-        src_path = OUTPUT_DIR / item["filename"]
-        if not src_path.exists():
+        src_path = _safe_child_path(OUTPUT_DIR, item.get("filename", ""))
+        if src_path is None or not src_path.exists():
             continue
-        dst_path = target_dir / item["filename"]
+        dst_path = _safe_child_path(target_dir, src_path.name)
+        if dst_path is None:
+            continue
         if src_path.resolve() == dst_path.resolve():
             skipped += 1
             continue
@@ -3074,14 +3724,14 @@ def api_save_gallery_to_gdrive(req: Optional[SaveGDriveRequest] = None) -> dict[
     }
 
 
-@app.post("/api/system/enable-swap")
+@app.post("/api/system/enable-swap", dependencies=[Depends(require_admin_auth)])
 def api_enable_swap(req: Optional[SwapRequest] = None) -> dict[str, Any]:
     size_gb = req.size_gb if req else 8
     result = enable_linux_swap(size_gb=size_gb)
     return {**result, "stats": collect_system_stats()}
 
 
-@app.post("/api/system/free-vram")
+@app.post("/api/system/free-vram", dependencies=[Depends(require_admin_auth)])
 def api_free_vram(unload_model: bool = Query(default=False)) -> dict[str, Any]:
     if unload_model:
         engine.unload()
@@ -3110,7 +3760,7 @@ def _clear_all_hf_models_cache() -> None:
         globals()["_hf_inventory_cache"] = (0.0, [])
 
 
-@app.post("/api/system/clear-hf-cache")
+@app.post("/api/system/clear-hf-cache", dependencies=[Depends(require_admin_auth)])
 def api_clear_hf_cache() -> dict[str, Any]:
     _clear_all_hf_models_cache()
     return {"ok": True, "stats": collect_system_stats()}
@@ -3137,13 +3787,13 @@ def _start_model_op(action: Literal["reload", "reinstall"]) -> dict[str, Any]:
         )
         model_ops[op.task_id] = op
         _active_model_op_id = op.task_id
-        if len(model_ops) > 30:
-            done_keys = [
-                k for k, v in sorted(model_ops.items(), key=lambda kv: kv[1].created_at)
-                if v.status in {"completed", "error"}
-            ]
-            for old_k in done_keys[:-20]:
-                model_ops.pop(old_k, None)
+        _prune_dict_store(
+            model_ops,
+            done_statuses={"completed", "error"},
+            max_items=50,
+            keep_done=20,
+            ttl_sec=3600.0,
+        )
 
     def _worker() -> None:
         global _active_model_op_id
@@ -3192,17 +3842,17 @@ def _start_model_op(action: Literal["reload", "reinstall"]) -> dict[str, Any]:
     return {"ok": True, **op.to_dict()}
 
 
-@app.post("/api/model/reload")
+@app.post("/api/model/reload", dependencies=[Depends(require_admin_auth)])
 def api_model_reload() -> dict[str, Any]:
     return _start_model_op("reload")
 
 
-@app.post("/api/model/reinstall")
+@app.post("/api/model/reinstall", dependencies=[Depends(require_admin_auth)])
 def api_model_reinstall() -> dict[str, Any]:
     return _start_model_op("reinstall")
 
 
-@app.get("/api/model/op/{task_id}")
+@app.get("/api/model/op/{task_id}", dependencies=[Depends(require_admin_auth)])
 def api_model_op_status(task_id: str) -> dict[str, Any]:
     with model_ops_lock:
         op = model_ops.get(task_id)
@@ -3211,7 +3861,7 @@ def api_model_op_status(task_id: str) -> dict[str, Any]:
         return op.to_dict()
 
 
-@app.post("/api/shutdown")
+@app.post("/api/shutdown", dependencies=[Depends(require_admin_auth)])
 def api_shutdown(req: ShutdownRequest) -> JSONResponse:
     """Gracefully unload model, stop tunnel/server, and optionally unassign Colab runtime."""
     def _shutdown_sequence() -> None:
@@ -3223,13 +3873,23 @@ def api_shutdown(req: ShutdownRequest) -> JSONResponse:
         except Exception as exc:
             logger.warning("Unload warning: %s", exc)
 
-        # Terminate external tunnel pid if registered by Colab launcher
-        tunnel_pid = os.environ.get("CLOUDFLARED_PID")
+        # Terminate external tunnel pid via CLOUDFLARED_PID or CLOUDFLARED_PID_FILE
+        tunnel_pid = os.environ.get("CLOUDFLARED_PID", "").strip()
+        pid_file_env = os.environ.get("CLOUDFLARED_PID_FILE", "").strip()
+        if not tunnel_pid and pid_file_env:
+            pid_file = Path(pid_file_env)
+            if pid_file.exists():
+                try:
+                    tunnel_pid = pid_file.read_text(encoding="utf-8").strip()
+                except OSError:
+                    pass
         if tunnel_pid and tunnel_pid.isdigit():
             try:
                 os.kill(int(tunnel_pid), signal.SIGTERM)
             except OSError:
                 pass
+        if pid_file_env:
+            _safe_unlink(Path(pid_file_env))
 
         if req.unassign_colab:
             try:

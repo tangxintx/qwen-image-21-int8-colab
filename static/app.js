@@ -3,11 +3,14 @@
 
   // -------------------------------------------------------------------------
   // Constants & Presets
+  // Note: 1.5K 16:9 (1920x1088 = 2,088,960 px) is ~1.99x pixels of 1K 1:1 (1024x1024 = 1,048,576 px),
+  // and DiT self-attention scales as O(N^2), making native 1.5K inference ~2.2x-3.0x slower on L4.
+  // For fastest iteration on L4, start with 1K 16:9 (1344x768) and upscale with Hires Fix if needed.
   // -------------------------------------------------------------------------
   const RESOLUTION_PRESETS = {
     "1k": {
-      "1:1": [1024, 1024],
-      "16:9": [1344, 768],
+      "1:1": [1024, 1024],   // 1.00x (1.05 MP)
+      "16:9": [1344, 768],   // 0.98x (1.03 MP) — L4 极速推荐
       "9:16": [768, 1344],
       "4:3": [1152, 864],
       "3:4": [864, 1152],
@@ -15,8 +18,8 @@
       "2:3": [832, 1248],
     },
     "1.5k": {
-      "1:1": [1536, 1536],
-      "16:9": [1920, 1088],
+      "1:1": [1536, 1536],   // 2.25x (2.36 MP)
+      "16:9": [1920, 1088],  // 1.99x (2.09 MP) — 注意 O(N^2) 耗时约 1K 的 2.2~3.0 倍
       "9:16": [1088, 1920],
       "4:3": [1664, 1248],
       "3:4": [1248, 1664],
@@ -54,6 +57,7 @@
     prefs: "qwen_studio_prefs_v2",
     history: "qwen_prompt_history_v2",
     favorites: "qwen_prompt_favorites_v2",
+    adminToken: "qwen_studio_admin_token_v1",
   };
   const ACCENT_THEMES = {
     blue: {
@@ -203,6 +207,69 @@
     } catch (_) {}
   }
 
+  // -------------------------------------------------------------------------
+  // Admin Bearer Token & API Helpers
+  // -------------------------------------------------------------------------
+  function extractTokenFromUrl() {
+    try {
+      const hash = window.location.hash || "";
+      const hashMatch = hash.match(/token=([^&]+)/);
+      if (hashMatch && hashMatch[1]) {
+        const tok = decodeURIComponent(hashMatch[1]).trim();
+        if (tok) {
+          localStorage.setItem(STORAGE_KEYS.adminToken, tok);
+          const cleanUrl = window.location.pathname + window.location.search;
+          window.history.replaceState(null, "", cleanUrl);
+          return tok;
+        }
+      }
+      const searchParams = new URLSearchParams(window.location.search || "");
+      const qTok = (searchParams.get("token") || "").trim();
+      if (qTok) {
+        localStorage.setItem(STORAGE_KEYS.adminToken, qTok);
+        searchParams.delete("token");
+        const qs = searchParams.toString();
+        window.history.replaceState(null, "", window.location.pathname + (qs ? `?${qs}` : "") + (window.location.hash || ""));
+        return qTok;
+      }
+    } catch (_) {}
+    return "";
+  }
+
+  function getAdminToken() {
+    try {
+      return (localStorage.getItem(STORAGE_KEYS.adminToken) || "").trim();
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function setAdminToken(tok) {
+    try {
+      const clean = (tok || "").trim();
+      if (clean) localStorage.setItem(STORAGE_KEYS.adminToken, clean);
+      else localStorage.removeItem(STORAGE_KEYS.adminToken);
+    } catch (_) {}
+  }
+
+  function getAuthHeaders(extra = {}) {
+    const hdrs = { ...extra };
+    const tok = getAdminToken();
+    if (tok) hdrs["Authorization"] = `Bearer ${tok}`;
+    return hdrs;
+  }
+
+  function openAuthTokenModal() {
+    const m = $("authTokenModal");
+    if (!m) return;
+    if ($("authModalTokenInput")) $("authModalTokenInput").value = getAdminToken();
+    m.classList.remove("hidden");
+  }
+
+  function closeAuthTokenModal() {
+    $("authTokenModal")?.classList.add("hidden");
+  }
+
   let _topBusyCount = 0;
   function setTopBusy(busy) {
     _topBusyCount = Math.max(0, _topBusyCount + (busy ? 1 : -1));
@@ -212,8 +279,13 @@
   async function apiFetch(url, options = {}, showTopBar = false) {
     if (showTopBar) setTopBusy(true);
     try {
-      const res = await fetch(url, options);
+      const mergedOptions = {
+        ...options,
+        headers: getAuthHeaders(options.headers || {}),
+      };
+      const res = await fetch(url, mergedOptions);
       if (!res.ok) {
+        if (res.status === 401) openAuthTokenModal();
         let detail = `HTTP ${res.status}`;
         try {
           const err = await res.json();
@@ -233,6 +305,8 @@
       const xhr = new XMLHttpRequest();
       xhr.open("POST", url, true);
       xhr.setRequestHeader("Content-Type", "application/json");
+      const tok = getAdminToken();
+      if (tok) xhr.setRequestHeader("Authorization", `Bearer ${tok}`);
       if (onUploadProgress && xhr.upload) {
         xhr.upload.onprogress = (ev) => {
           if (ev.lengthComputable && ev.total > 0) {
@@ -248,6 +322,7 @@
         if (xhr.status >= 200 && xhr.status < 300) {
           resolve(parsed || {});
         } else {
+          if (xhr.status === 401) openAuthTokenModal();
           const detail = parsed?.detail || parsed?.message || `HTTP ${xhr.status}`;
           reject(new Error(detail));
         }
@@ -646,12 +721,29 @@
   // -------------------------------------------------------------------------
   // Resolution & Aspect Ratio Controls
   // -------------------------------------------------------------------------
+  function updateResolutionSpeedHint(w, h) {
+    const el = $("resolutionSpeedHint");
+    if (!el) return;
+    const pixels = w * h;
+    const ratio1k = pixels / (1024 * 1024);
+    if (w === 1920 && h === 1088) {
+      el.textContent = "1.5K 16:9 实际为 1920×1088（像素数为 1K 的 1.99 倍，推理耗时约为 2.2~3.0 倍）；L4 追求极速建议先用 1K 1344×768 出图再高清放大。";
+    } else if (pixels > 1536 * 1536) {
+      el.textContent = `当前像素为 1024×1024 的 ${ratio1k.toFixed(2)} 倍，将自动启用 VAE 分块解码防爆显存；极速预览建议先选 1K。`;
+    } else if (pixels > 1280 * 1280) {
+      el.textContent = `当前像素为 1024×1024 的 ${ratio1k.toFixed(2)} 倍（DiT 注意力按像素平方增长），L4 极速出图推荐 1K 档位。`;
+    } else {
+      el.textContent = `像素负载 ${ratio1k.toFixed(2)}×（1K 高效档，适合 L4/T4 快速出图）。`;
+    }
+  }
+
   function applyResolution(w, h, skipSave = false) {
     state.width = align16(w);
     state.height = align16(h);
     $("widthInput").value = state.width;
     $("heightInput").value = state.height;
     $("currentResBadge").textContent = `${state.width} × ${state.height}`;
+    updateResolutionSpeedHint(state.width, state.height);
     if (!skipSave) scheduleSaveStudioPrefs();
   }
 
@@ -1822,7 +1914,7 @@
     pctEl.textContent = "准备中";
 
     try {
-      const res = await fetch(`/api/gallery/export${ids}`);
+      const res = await fetch(`/api/gallery/export${ids}`, { headers: getAuthHeaders() });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const total = Number(res.headers.get("content-length") || 0);
       const reader = res.body?.getReader();
@@ -2225,6 +2317,7 @@
 
       let quantTag = "INT8";
       if (eng.quant_mode === "none") quantTag = `${eng.effective_dtype.toUpperCase()} 满血`;
+      else if (eng.quant_mode === "gguf-q8-int8") quantTag = "GGUF Q8+INT8";
       else if (eng.quant_mode === "gguf-q8-full" || eng.gguf_variant === "q8") quantTag = "GGUF Q8";
       else if (eng.quant_mode === "gguf-q4" || eng.gguf_variant === "q4") quantTag = "GGUF Q4";
       else if (eng.quant_mode === "fp8-int8") quantTag = "FP8+INT8";
@@ -2445,11 +2538,23 @@
     appendTerminalText(`\n[${cwdNow}]$ ${cmd}\n`);
 
     try {
-      const res = await apiFetch("/api/terminal/run", {
+      let res = await apiFetch("/api/terminal/run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ command: cmd, source: "user" }),
+        body: JSON.stringify({ command: cmd, source: "user", allow_dangerous: false }),
       });
+      if (res.blocked) {
+        const proceed = window.confirm(`⚠️ 安全护栏拦截：${res.reason}\n\n确认仍要执行命令：\n${cmd}`);
+        if (!proceed) {
+          appendTerminalText(`[已取消高危命令] ${res.reason}\n`);
+          return;
+        }
+        res = await apiFetch("/api/terminal/run", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ command: cmd, source: "user", allow_dangerous: true }),
+        });
+      }
       $("terminalCwdText").textContent = res.cwd || cwdNow;
       termState.activeCmdId = res.cmd_id;
       termState.offset = 0;
@@ -2557,6 +2662,7 @@
             vae_tiling_mode: $("vaeTilingSelect").value,
             hf_token: $("hfTokenInput").value.trim() || null,
             inpaint_fast_crop: $("inpaintFastCropToggle").checked,
+            torch_compile: $("torchCompileToggle") ? $("torchCompileToggle").checked : false,
           }),
         },
         true
@@ -2573,8 +2679,9 @@
       }
       const qVal = $("quantSelect").value;
       if ($("comfyGgufSelect") && !$("comfyGgufSelect").disabled) {
-        if (qVal === "gguf-q8-full") $("comfyGgufSelect").value = "q8";
+        if (qVal === "gguf-q8-full" || qVal === "gguf-q8-int8") $("comfyGgufSelect").value = "q8";
         else if (qVal === "gguf-q4") $("comfyGgufSelect").value = "q4";
+        else if (qVal === "fp8-int8" || qVal === "int8-torchao") $("comfyGgufSelect").value = "int8_convrot";
       }
       highlightActivePresetCard($("modelSelect").value, qVal);
       showToast("引擎配置已保存（下次生成生效）");
@@ -2636,6 +2743,47 @@
   $("inpaintFastCropToggle").addEventListener("change", () =>
     savePreferenceOnly({ inpaint_fast_crop: $("inpaintFastCropToggle").checked }, "已更新局部重绘加速设置")
   );
+  if ($("torchCompileToggle")) {
+    $("torchCompileToggle").addEventListener("change", () =>
+      savePreferenceOnly(
+        { torch_compile: $("torchCompileToggle").checked },
+        $("torchCompileToggle").checked ? "已开启实验性 torch.compile（下次模型加载生效）" : "已关闭 torch.compile（下次模型加载生效）"
+      )
+    );
+  }
+  if ($("saveAdminTokenBtn")) {
+    $("saveAdminTokenBtn").addEventListener("click", async () => {
+      const tok = ($("adminTokenInput")?.value || "").trim();
+      setAdminToken(tok);
+      try {
+        const auth = await apiFetch("/api/auth/status");
+        showToast(auth.authenticated ? "管理令牌验证成功" : "令牌无效，请核对 Colab 控制台输出");
+      } catch (err) {
+        showToast(`令牌校验失败: ${err.message}`);
+      }
+    });
+  }
+  $("authTokenCloseBtn")?.addEventListener("click", closeAuthTokenModal);
+  $("authTokenCancelBtn")?.addEventListener("click", closeAuthTokenModal);
+  $("authTokenBackdrop")?.addEventListener("click", closeAuthTokenModal);
+  $("authTokenConfirmBtn")?.addEventListener("click", async () => {
+    const tok = ($("authModalTokenInput")?.value || "").trim();
+    if (!tok) return showToast("请输入管理令牌");
+    setAdminToken(tok);
+    if ($("adminTokenInput")) $("adminTokenInput").value = tok;
+    try {
+      const auth = await apiFetch("/api/auth/status");
+      if (auth.authenticated) {
+        closeAuthTokenModal();
+        showToast("管理令牌已验证并保存");
+        refreshStats();
+      } else {
+        showToast("管理令牌不匹配，请重新粘贴");
+      }
+    } catch (err) {
+      showToast(`验证失败: ${err.message}`);
+    }
+  });
   $("aiVisionToggle").addEventListener("change", () =>
     savePreferenceOnly({ ai_vision_enabled: $("aiVisionToggle").checked }, "已更新 AI 识图开关")
   );
@@ -3504,16 +3652,19 @@
       }
     }
     if ($("comfyGgufMeta")) {
-      const pluginOk = st.gguf_plugin_installed ? "已安装 city96/ComfyUI-GGUF" : "自动安装 city96/ComfyUI-GGUF";
+      const varStr = String(st.gguf_variant || "q4").toLowerCase();
+      const pluginOk = varStr === "int8_convrot"
+        ? "原生 comfy-kitchen INT8-ConvRot"
+        : (st.gguf_plugin_installed ? "已安装 city96/ComfyUI-GGUF" : "自动安装 city96/ComfyUI-GGUF");
       const stagedCount = Array.isArray(st.staged_files) ? st.staged_files.length : 0;
       const wfCount = Array.isArray(st.workflows) ? st.workflows.length : 0;
       if (running || stagedCount > 0 || wfCount > 0) {
         $("comfyGgufMeta").textContent =
-          `${pluginOk} · 档位 ${(st.gguf_variant || "q4").toUpperCase()}` +
+          `${pluginOk} · 档位 ${varStr.toUpperCase()}` +
           (stagedCount ? ` · 已挂载 ${stagedCount} 个模型文件` : "") +
           (wfCount ? ` · 已生成 ${wfCount} 份工作流` : "");
       } else {
-        $("comfyGgufMeta").innerHTML = '按需部署 <a href="https://github.com/city96/ComfyUI-GGUF" target="_blank" class="text-link">city96/ComfyUI-GGUF</a> 扩展并自动生成工作流';
+        $("comfyGgufMeta").innerHTML = '支持原生 INT8-ConvRot 极速方案及 <a href="https://github.com/city96/ComfyUI-GGUF" target="_blank" class="text-link">city96/ComfyUI-GGUF</a> 扩展并自动生成工作流';
       }
     }
     $("comfyLaunchBtn").disabled = busy || running;
@@ -3595,6 +3746,10 @@
   // Init
   // -------------------------------------------------------------------------
   async function init() {
+    extractTokenFromUrl();
+    if ($("adminTokenInput") && getAdminToken()) {
+      $("adminTokenInput").value = getAdminToken();
+    }
     const savedAccent = (() => {
       try { return localStorage.getItem(STORAGE_KEYS.accent); } catch (_) { return null; }
     })();
@@ -3635,6 +3790,9 @@
       if (eng.vae_tiling_mode) $("vaeTilingSelect").value = eng.vae_tiling_mode;
       if (typeof eng.inpaint_fast_crop === "boolean") {
         $("inpaintFastCropToggle").checked = eng.inpaint_fast_crop;
+      }
+      if (typeof eng.torch_compile === "boolean" && $("torchCompileToggle")) {
+        $("torchCompileToggle").checked = eng.torch_compile;
       }
       if (!hadLocalPrefs && eng.default_steps) {
         $("stepsSlider").value = String(eng.default_steps);

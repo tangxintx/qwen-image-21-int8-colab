@@ -198,7 +198,7 @@
           <div class="brand-text">
             <div class="brand-title">
               <span class="brand-name">Qwen Image 2.1</span>
-              <span class="status-pill" id="headerQuantBadge">GGUF Q8</span>
+              <span class="status-pill" id="headerQuantBadge">FP8+INT8</span>
             </div>
             <div class="brand-sub" id="engineStatusText">连接中...</div>
           </div>
@@ -401,6 +401,7 @@
                 <button class="ratio-chip" data-ratio="original" type="button">原图比例</button>
                 <button class="ratio-chip" data-ratio="custom" type="button">自定义</button>
               </div>
+              <div class="card-sub" id="resolutionSpeedHint"></div>
 
               <details class="sub-details" id="manualResDetails">
                 <summary>自定义像素宽高 (W × H)</summary>
@@ -920,48 +921,56 @@
             <div class="card">
               <div class="card-header">
                 <span class="card-title">推荐方案一键切换</span>
-                <span class="card-sub">默认 Quantized Q8 · 点击即刻生效</span>
+                <span class="card-sub">默认 L4 FP8+INT8 极速常驻 · 点击即刻生效</span>
               </div>
 
               <div class="preset-card-grid" id="editionQuickBtns">
+                <button class="preset-card" data-model="Qwen/Qwen-Image-2.1-Turbo" data-quant="fp8-int8" data-offload="auto" data-steps="8" type="button">
+                  <div class="preset-card-top">
+                    <strong>Turbo FP8 + INT8</strong>
+                    <span class="preset-tag">L4 默认极速</span>
+                  </div>
+                  <div class="preset-card-desc">8步极速 · FP8 DiT + INT8 编码 + BF16 VAE（L4 全显存常驻）</div>
+                </button>
+
+                <button class="preset-card" data-model="addlabsviral/Qwen-Image-2.1-Turbo-diffuser-8bit" data-quant="int8-torchao" data-offload="auto" data-steps="8" type="button">
+                  <div class="preset-card-top">
+                    <strong>预量化 8-bit 极速版</strong>
+                    <span class="preset-tag">秒加载</span>
+                  </div>
+                  <div class="preset-card-desc">预量化 TorchAO 8bit，L4 全驻留无需在线量化转换</div>
+                </button>
+
+                <button class="preset-card" data-model="abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8" data-quant="gguf-q8-int8" data-offload="auto" data-steps="8" type="button">
+                  <div class="preset-card-top">
+                    <strong>GGUF Q8 + INT8 编码</strong>
+                    <span class="preset-tag">L4 常驻</span>
+                  </div>
+                  <div class="preset-card-desc">Q8_0 DiT + TorchAO INT8 编码 + BF16 VAE（约 17.5GB 常驻）</div>
+                </button>
+
                 <button class="preset-card" data-model="abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8" data-quant="gguf-q8-full" data-offload="auto" data-steps="8" type="button">
                   <div class="preset-card-top">
                     <strong>Quantized Q8 满血版</strong>
-                    <span class="preset-tag">默认推荐</span>
+                    <span class="preset-tag">BF16 编码</span>
                   </div>
-                  <div class="preset-card-desc">Q8_0 DiT + BF16 编码 + BF16 VAE（L4 智能逐层防爆显存）</div>
+                  <div class="preset-card-desc">Q8_0 DiT + BF16 编码 + BF16 VAE（L4 仅卸载 TE 到 CPU）</div>
                 </button>
 
                 <button class="preset-card" data-model="abenzerps/Qwen-Image-2.1-Turbo-Quantized:q4" data-quant="gguf-q4" data-offload="auto" data-steps="8" type="button">
                   <div class="preset-card-top">
                     <strong>Quantized Q4 轻量版</strong>
-                    <span class="preset-tag">省显存</span>
+                    <span class="preset-tag">T4 / 省显存</span>
                   </div>
                   <div class="preset-card-desc">Q4_K_M DiT + Qwen3-VL Q4_K_M + BF16 VAE</div>
                 </button>
 
-                <button class="preset-card" data-model="Qwen/Qwen-Image-2.1-Turbo" data-quant="fp8-int8" data-offload="smart_stage_offload" data-steps="8" type="button">
-                  <div class="preset-card-top">
-                    <strong>Turbo FP8 + INT8</strong>
-                    <span class="preset-tag">L4 极速</span>
-                  </div>
-                  <div class="preset-card-desc">Turbo 8步 · FP8 DiT + INT8 编码 + BF16 VAE</div>
-                </button>
-
-                <button class="preset-card" data-model="Qwen/Qwen-Image-2.1" data-quant="fp8-int8" data-offload="smart_stage_offload" data-steps="40" type="button">
+                <button class="preset-card" data-model="Qwen/Qwen-Image-2.1" data-quant="fp8-int8" data-offload="auto" data-steps="40" type="button">
                   <div class="preset-card-top">
                     <strong>Qwen-2.1 40步精绘版</strong>
                     <span class="preset-tag">高画质</span>
                   </div>
-                  <div class="preset-card-desc">Qwen-2.1 基础版 · FP8+INT8 智能调度</div>
-                </button>
-
-                <button class="preset-card" data-model="Qwen/Qwen-Image-2.1-Turbo" data-quant="int8-torchao" data-offload="auto" data-steps="8" type="button">
-                  <div class="preset-card-top">
-                    <strong>Turbo INT8 通用版</strong>
-                    <span class="preset-tag">T4 / L4</span>
-                  </div>
-                  <div class="preset-card-desc">TorchAO 全 8-bit 量化，8步极速交互</div>
+                  <div class="preset-card-desc">Qwen-2.1 基础版 · FP8+INT8 L4 全驻留</div>
                 </button>
 
                 <button class="preset-card" data-model="Qwen/Qwen-Image-2.1" data-quant="none" data-offload="auto" data-steps="40" type="button">
@@ -979,6 +988,14 @@
                   <div class="switch-desc">自动裁剪涂抹周边区域推理，生成后精准羽化回贴原图</div>
                 </div>
                 <input type="checkbox" id="inpaintFastCropToggle" />
+              </label>
+
+              <label class="switch-row">
+                <div>
+                  <div class="switch-title">实验性 torch.compile 编译加速（默认关闭）</div>
+                  <div class="switch-desc">仅对非 GGUF 模型尝试 fullgraph=False 编译；首次出图编译耗时较长，切换分辨率将重编译（diffusers#14821）</div>
+                </div>
+                <input type="checkbox" id="torchCompileToggle" />
               </label>
 
               <div class="action-row" id="modelMaintenanceRow">
@@ -1033,12 +1050,13 @@
                     <div class="form-group">
                       <label for="quantSelect">量化精度</label>
                       <select id="quantSelect">
-                        <option value="gguf-q8-full">GGUF Q8_0 + BF16 编码</option>
-                        <option value="gguf-q4">GGUF Q4_K_M 轻量</option>
-                        <option value="fp8-int8">FP8 DiT + INT8 编码 + BF16 VAE</option>
+                        <option value="fp8-int8">FP8 DiT + INT8 编码 + BF16 VAE (L4推荐)</option>
                         <option value="fp8-all">全 FP8 + BF16 VAE</option>
                         <option value="int8-torchao">TorchAO 全 INT8 + BF16 VAE</option>
                         <option value="int8-bnb">BitsAndBytes 8-bit</option>
+                        <option value="gguf-q8-int8">GGUF Q8_0 + TorchAO INT8 编码 (L4常驻)</option>
+                        <option value="gguf-q8-full">GGUF Q8_0 + BF16 编码</option>
+                        <option value="gguf-q4">GGUF Q4_K_M 轻量</option>
                         <option value="none">原生 BF16/FP16 不量化</option>
                       </select>
                     </div>
@@ -1078,6 +1096,14 @@
                     <div class="form-group">
                       <label for="hfTokenInput">Hugging Face Token</label>
                       <input type="password" id="hfTokenInput" placeholder="hf_...（可选）" autocomplete="off" />
+                    </div>
+                  </div>
+
+                  <div class="form-group">
+                    <label for="adminTokenInput">管理访问令牌 (Admin Bearer Token)</label>
+                    <div class="seed-row">
+                      <input type="password" id="adminTokenInput" placeholder="从 Colab 控制台复制令牌（通过 #token= 打开时自动填充）" autocomplete="off" />
+                      <button class="btn-chip" id="saveAdminTokenBtn" type="button">应用令牌</button>
                     </div>
                   </div>
 
@@ -1208,11 +1234,12 @@
                 <span class="status-pill" id="comfyStatusBadge">未启动</span>
               </div>
               <div class="form-group">
-                <label for="comfyGgufSelect">GGUF 模型与插件部署档位</label>
+                <label for="comfyGgufSelect">模型与插件部署档位</label>
                 <select id="comfyGgufSelect">
-                  <option value="q8">Q8 满血版 (Q8_0 DiT + BF16 编码 + BF16 VAE)</option>
-                  <option value="q4">Q4 轻量版 (Q4_K_M DiT + Qwen3-VL Q4_K_M + BF16 VAE)</option>
-                  <option value="both">同时部署 Q8 + Q4 全套文件与工作流</option>
+                  <option value="int8_convrot">INT8-ConvRot 极速版 (L4 推荐 · 7.3GB DiT + 9.4GB TE)</option>
+                  <option value="q8">GGUF Q8 满血版 (Q8_0 DiT + BF16 编码 + BF16 VAE)</option>
+                  <option value="q4">GGUF Q4 轻量版 (Q4_K_M DiT + Qwen3-VL Q4_K_M + BF16 VAE)</option>
+                  <option value="both">同时部署 GGUF Q8 + Q4 全套文件与工作流</option>
                   <option value="none">仅安装 ComfyUI + ComfyUI-GGUF 插件</option>
                 </select>
               </div>
@@ -1551,6 +1578,33 @@
           <svg class="icon"><use href="#ic-sparkles" /></svg>
           <span>发送</span>
         </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Admin Token Modal (Shown on HTTP 401 when accessed without #token=) -->
+  <div class="modal hidden" id="authTokenModal">
+    <div class="modal-backdrop" id="authTokenBackdrop"></div>
+    <div class="modal-sheet confirm-sheet">
+      <div class="modal-top">
+        <span class="modal-title modal-title-row">
+          <svg class="icon"><use href="#ic-shield" /></svg>
+          <span>需要管理访问令牌</span>
+        </span>
+        <button class="btn-close" id="authTokenCloseBtn" title="关闭" type="button">
+          <svg class="icon"><use href="#ic-close" /></svg>
+        </button>
+      </div>
+      <p class="confirm-desc">
+        终端、系统运维、配置修改与删除操作受一次性 Bearer Token 保护。请使用 Colab 控制台输出的带 <code>#token=</code> 链接打开，或在此粘贴管理令牌：
+      </p>
+      <div class="form-group">
+        <label for="authModalTokenInput">Admin Bearer Token</label>
+        <input type="password" id="authModalTokenInput" placeholder="粘贴 Colab 控制台输出的管理令牌..." autocomplete="off" />
+      </div>
+      <div class="confirm-btns">
+        <button class="btn-secondary" id="authTokenCancelBtn" type="button">稍后</button>
+        <button class="btn-primary" id="authTokenConfirmBtn" type="button">保存并验证</button>
       </div>
     </div>
   </div>

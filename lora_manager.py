@@ -2,8 +2,8 @@
 LoRA Manager for Qwen-Image-2.1 INT8 / FP8 Colab Studio.
 - Manages `/content/loras` (Colab) or local fallback directory
 - Downloads LoRA weights from direct URLs, Hugging Face, and Civitai (with API page resolution + token)
-- Validates `.safetensors` headers to reject HTML/login error pages before saving
-- Auto-remaps non-standard `.safetensors` prefixes (e.g., ComfyUI `diffusion_model.`) for Diffusers
+- Validates `.safetensors` headers (and optional tensor finiteness) before saving
+- Auto-remaps non-standard prefixes (ComfyUI `diffusion_model.`, Kohya `lora_unet_` hierarchy, `.alpha` scaling) for Diffusers
 """
 
 from __future__ import annotations
@@ -27,6 +27,53 @@ ALLOWED_LORA_EXTS = {".safetensors", ".pt", ".bin", ".ckpt"}
 _MIN_VALID_LORA_BYTES = 16 * 1024  # 16 KB minimum sanity floor for real weight files
 _MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024  # 100 MB safety cap
 
+# Known multi-word snake_case module & attribute tokens in Qwen-Image / DiT / Flux LoRA keys
+_KOHYA_COMPOUND_TOKENS = (
+    "single_transformer_blocks",
+    "transformer_blocks",
+    "double_blocks",
+    "single_blocks",
+    "time_text_embed",
+    "timestep_embedder",
+    "context_embedder",
+    "add_q_proj",
+    "add_k_proj",
+    "add_v_proj",
+    "to_add_out",
+    "norm_added_q",
+    "norm_added_k",
+    "norm_q",
+    "norm_k",
+    "adaLN_modulation",
+    "proj_in",
+    "final_layer",
+    "to_out",
+    "to_q",
+    "to_k",
+    "to_v",
+    "img_mlp",
+    "txt_mlp",
+    "img_mod",
+    "txt_mod",
+    "img_in",
+    "txt_in",
+    "x_embedder",
+    "proj_out",
+    "norm_out",
+    "ff_context",
+    "gate_up",
+    "gate_layer",
+    "linear_1",
+    "linear_2",
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "up_proj",
+    "down_proj",
+    "gate_proj",
+)
+
 
 def get_loras_dir(base_dir: Optional[Path] = None) -> Path:
     """Resolve `/content/loras` on Colab/Linux when writable, otherwise `<base_dir>/loras`."""
@@ -48,9 +95,24 @@ def get_loras_dir(base_dir: Optional[Path] = None) -> Path:
     return p
 
 
-def validate_lora_file(lora_path: Path) -> tuple[bool, Optional[str]]:
+def _check_state_dict_finite(raw_sd: dict[str, Any]) -> tuple[bool, Optional[str]]:
+    """Verify no floating-point tensors contain NaN or Inf values."""
+    try:
+        import torch
+    except ImportError:
+        return True, None
+
+    for name, val in raw_sd.items():
+        if isinstance(val, torch.Tensor) and val.is_floating_point():
+            if not bool(torch.isfinite(val).all()):
+                return False, f"权重张量 {name} 包含 NaN 或 Inf，文件可能已损坏"
+    return True, None
+
+
+def validate_lora_file(lora_path: Path, check_tensors: bool = False) -> tuple[bool, Optional[str]]:
     """
     Validate that a LoRA file is a genuine binary weight file and not a saved HTML/JSON error page.
+    When `check_tensors=True`, also loads weights on CPU to verify there are no NaN/Inf tensors.
     Returns `(is_valid, issue_reason)`.
     """
     if not lora_path.exists() or not lora_path.is_file():
@@ -65,7 +127,7 @@ def validate_lora_file(lora_path: Path) -> tuple[bool, Optional[str]]:
 
     try:
         with open(lora_path, "rb") as f:
-            prefix = f.read(16)
+            prefix = f.read(32)
     except OSError as exc:
         return False, f"无法读取文件头: {exc}"
 
@@ -73,7 +135,10 @@ def validate_lora_file(lora_path: Path) -> tuple[bool, Optional[str]]:
     if stripped.startswith((b"<!DOCTYPE", b"<!doctype", b"<html", b"<HTML", b"<?xml")):
         return False, "文件内容为 HTML 网页（可能缺少 Civitai Token 或下载链接不是权重直链）"
 
+    is_demo_placeholder = prefix.startswith(b"DEMO_LORA_PLACEHOLDER")
     if lora_path.suffix.lower() == ".safetensors":
+        if is_demo_placeholder:
+            return True, None
         if len(prefix) < 8:
             return False, "safetensors 文件头过短"
         header_len = struct.unpack("<Q", prefix[:8])[0]
@@ -86,7 +151,6 @@ def validate_lora_file(lora_path: Path) -> tuple[bool, Optional[str]]:
             with open(lora_path, "rb") as f:
                 f.seek(8)
                 header_bytes = f.read(min(header_len, 4096))
-                # Quick sanity check that header starts like JSON object
                 if not header_bytes.lstrip().startswith(b"{"):
                     return False, "safetensors 元数据非 JSON 格式"
                 if header_len <= 1024 * 1024:
@@ -97,8 +161,31 @@ def validate_lora_file(lora_path: Path) -> tuple[bool, Optional[str]]:
                         return False, "safetensors 元数据结构异常"
         except Exception:
             return False, "safetensors 文件头解析失败，请重新下载"
-    elif size < _MIN_VALID_LORA_BYTES and b"DEMO_LORA_PLACEHOLDER" not in prefix:
-        return False, f"权重文件过小 ({size} B)，可能下载不完整"
+
+        if check_tensors:
+            try:
+                from safetensors.torch import load_file
+
+                sd = load_file(str(lora_path), device="cpu")
+                ok, reason = _check_state_dict_finite(sd)
+                if not ok:
+                    return False, reason
+            except Exception as exc:
+                return False, f"safetensors 张量读取校验失败: {exc}"
+    else:
+        if size < _MIN_VALID_LORA_BYTES and not is_demo_placeholder:
+            return False, f"权重文件过小 ({size} B)，可能下载不完整"
+        if check_tensors and not is_demo_placeholder:
+            try:
+                import torch
+
+                raw = torch.load(str(lora_path), map_location="cpu", weights_only=True)
+                sd = _unwrap_state_dict(raw)
+                ok, reason = _check_state_dict_finite(sd)
+                if not ok:
+                    return False, reason
+            except Exception as exc:
+                return False, f"权重张量校验失败: {exc}"
 
     return True, None
 
@@ -111,9 +198,8 @@ def list_loras(loras_dir: Path) -> list[dict[str, Any]]:
     for entry in loras_dir.iterdir():
         if entry.is_file() and entry.suffix.lower() in ALLOWED_LORA_EXTS:
             st = entry.stat()
-            valid, issue = validate_lora_file(entry)
-            # Allow demo placeholder in test/demo environments without flagging broken
-            if not valid and entry.stat().st_size < 128:
+            valid, issue = validate_lora_file(entry, check_tensors=False)
+            if not valid and st.st_size < 128:
                 try:
                     if entry.read_bytes().startswith(b"DEMO_LORA_PLACEHOLDER"):
                         valid, issue = True, None
@@ -254,13 +340,43 @@ def _extract_filename(url: str, content_disp: str) -> str:
     return f"lora_{int(time.time())}.safetensors"
 
 
+def _sanitize_lora_filename(raw_name: str) -> str:
+    name = Path(raw_name).name.strip()
+    if not name:
+        name = f"lora_{int(time.time())}.safetensors"
+    if not Path(name).suffix:
+        name += ".safetensors"
+    name = re.sub(r"[^A-Za-z0-9._\-\u4e00-\u9fff]", "_", name)
+    # Prevent hidden dot-files or `..` names
+    name = name.lstrip(".") or f"lora_{int(time.time())}.safetensors"
+    return name
+
+
 class LoraDownloadManager:
-    """Manages async LoRA file downloads into `LORAS_DIR` with real-time progress."""
+    """Manages async LoRA file downloads into `LORAS_DIR` with real-time progress and bounded task history."""
 
     def __init__(self, loras_dir: Path) -> None:
         self.loras_dir = loras_dir
         self._lock = threading.Lock()
         self._tasks: dict[str, dict[str, Any]] = {}
+
+    def _prune_tasks_locked(self, max_items: int = 50, ttl_sec: float = 3600.0) -> None:
+        now = time.time()
+        expired = [
+            k for k, v in self._tasks.items()
+            if v.get("status") in {"completed", "error"}
+            and (now - float(v.get("created_at", now))) > ttl_sec
+        ]
+        for k in expired:
+            self._tasks.pop(k, None)
+
+        if len(self._tasks) > max_items:
+            done = [
+                k for k, v in sorted(self._tasks.items(), key=lambda kv: float(kv[1].get("created_at", 0.0)))
+                if v.get("status") in {"completed", "error"}
+            ]
+            for old_k in done[: max(0, len(self._tasks) - max_items)]:
+                self._tasks.pop(old_k, None)
 
     def start_download(
         self,
@@ -280,17 +396,18 @@ class LoraDownloadManager:
             "filename": "",
             "message": "正在解析并连接下载地址...",
             "error": None,
+            "created_at": time.time(),
         }
         with self._lock:
             self._tasks[task_id] = state
+            self._prune_tasks_locked()
 
         def _worker() -> None:
             tmp_dest: Optional[Path] = None
             try:
                 if demo_mode:
-                    fname = filename_override or _extract_filename(url, "")
-                    if not Path(fname).suffix:
-                        fname += ".safetensors"
+                    raw_name = filename_override if (filename_override and filename_override.strip()) else _extract_filename(url, "")
+                    fname = _sanitize_lora_filename(raw_name)
                     for i in range(1, 6):
                         time.sleep(0.12)
                         with self._lock:
@@ -322,18 +439,15 @@ class LoraDownloadManager:
                     cd = resp.headers.get("Content-Disposition", "")
                     total_bytes = int(resp.headers.get("Content-Length") or 0)
                     if filename_override and filename_override.strip():
-                        fname = Path(filename_override).name
+                        raw_fname = filename_override
                     elif cd:
-                        fname = _extract_filename(final_url, cd)
+                        raw_fname = _extract_filename(final_url, cd)
                     elif suggested_name:
-                        fname = Path(suggested_name).name
+                        raw_fname = suggested_name
                     else:
-                        fname = _extract_filename(final_url, cd)
+                        raw_fname = _extract_filename(final_url, cd)
 
-                    if not Path(fname).suffix:
-                        fname += ".safetensors"
-                    fname = re.sub(r"[^A-Za-z0-9._\-\u4e00-\u9fff]", "_", fname)
-
+                    fname = _sanitize_lora_filename(raw_fname)
                     self.loras_dir.mkdir(parents=True, exist_ok=True)
                     dest = self.loras_dir / fname
                     tmp_dest = self.loras_dir / f".{fname}.{task_id}.part"
@@ -371,12 +485,10 @@ class LoraDownloadManager:
                                     pct_str = f"{int(state['progress'] * 100)}%" if total_bytes > 0 else f"{state['downloaded_mb']} MB"
                                     state["message"] = f"下载 {fname}: {pct_str} ({spd:.1f} MB/s)"
 
-                    # Validate downloaded file header before committing to destination
-                    # Temporarily validate using a path with the target suffix
                     check_path = self.loras_dir / f".validate_{task_id}_{fname}"
                     tmp_dest.replace(check_path)
                     tmp_dest = check_path
-                    valid, issue = validate_lora_file(check_path)
+                    valid, issue = validate_lora_file(check_path, check_tensors=True)
                     if not valid:
                         raise RuntimeError(issue or "下载的 LoRA 权重文件校验失败")
 
@@ -411,13 +523,77 @@ class LoraDownloadManager:
             return dict(item) if item else None
 
 
+def _unwrap_state_dict(raw_obj: Any) -> dict[str, Any]:
+    """Unpack nested `.pt` / `.bin` LoRA checkpoints (`state_dict`, `unet`, `transformer`, `model`, `lora`)."""
+    if not isinstance(raw_obj, dict):
+        raise RuntimeError(f"无法解包非字典格式的 LoRA 权重 ({type(raw_obj).__name__})")
+
+    cur: dict[str, Any] = raw_obj
+    for _ in range(3):
+        unwrapped = False
+        for wrapper_key in ("state_dict", "unet", "transformer", "model", "lora", "module"):
+            sub = cur.get(wrapper_key)
+            if isinstance(sub, dict) and sub:
+                # Only replace wholesale if there aren't sibling tensor/dict components
+                other_dicts = {
+                    k: v for k, v in cur.items()
+                    if k != wrapper_key and isinstance(v, dict) and v
+                }
+                if not other_dicts:
+                    cur = sub
+                    unwrapped = True
+                    break
+        if not unwrapped:
+            break
+
+    # Flatten nested sub-dictionaries (e.g. {"unet": {...}, "text_encoder": {...}})
+    flat: dict[str, Any] = {}
+    for k, v in cur.items():
+        if isinstance(v, dict):
+            prefix = "transformer" if k in {"unet", "diffusion_model"} else k
+            for sub_k, sub_v in v.items():
+                flat[f"{prefix}.{sub_k}"] = sub_v
+        else:
+            flat[k] = v
+    return flat
+
+
+def _restore_kohya_unet_key(body: str) -> str:
+    """
+    Restore Kohya `lora_unet_<underscored_hierarchy>.<attr>` back to Diffusers dotted module paths
+    using architecture-aware compound token boundaries (preserving tokens like `transformer_blocks`,
+    `to_out`, `img_mlp`, `gate_up`, `add_q_proj`, etc.).
+    """
+    if "." in body:
+        mod_part, attr_part = body.split(".", 1)
+    else:
+        mod_part, attr_part = body, ""
+
+    # Protect known multi-word snake_case identifiers with null-byte placeholders
+    protected = mod_part
+    placeholders: dict[str, str] = {}
+    for idx, tok in enumerate(_KOHYA_COMPOUND_TOKENS):
+        if tok in protected:
+            marker = f"\x00T{idx}\x00"
+            placeholders[marker] = tok
+            protected = protected.replace(tok, marker)
+
+    # Split remaining module hierarchy underscores into dots
+    dotted = protected.replace("_", ".")
+    for marker, orig_tok in placeholders.items():
+        dotted = dotted.replace(marker, orig_tok)
+
+    dotted = re.sub(r"\.+", ".", dotted).strip(".")
+    return f"transformer.{dotted}.{attr_part}" if attr_part else f"transformer.{dotted}"
+
+
 def normalize_lora_state_dict(lora_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     """
-    Load a LoRA `.safetensors` / `.pt` file on CPU and remap non-standard prefixes
-    (e.g., ComfyUI `diffusion_model.`, `model.diffusion_model.`, `base_model.model.`)
-    so Diffusers `load_lora_weights(..., strict=False)` handles custom node LoRAs cleanly.
+    Load a LoRA `.safetensors` / `.pt` / `.bin` file on CPU, verify tensor finiteness,
+    remap ComfyUI & Kohya prefixes/hierarchies, apply `.alpha / rank` scaling to `lora_B.weight`,
+    and report key collisions for Diffusers `load_lora_weights(..., strict=False)`.
     """
-    valid, issue = validate_lora_file(lora_path)
+    valid, issue = validate_lora_file(lora_path, check_tensors=False)
     if not valid:
         raise RuntimeError(
             f"LoRA 文件 {lora_path.name} 无效或已损坏 ({issue})。请在 LoRA 设置或监控页删除后重新下载（Civitai 链接请附带 API Token）"
@@ -430,12 +606,17 @@ def normalize_lora_state_dict(lora_path: Path) -> tuple[dict[str, Any], dict[str
     else:
         import torch
 
-        raw_sd = torch.load(str(lora_path), map_location="cpu", weights_only=True)
-        if isinstance(raw_sd, dict) and "state_dict" in raw_sd:
-            raw_sd = raw_sd["state_dict"]
+        loaded_obj = torch.load(str(lora_path), map_location="cpu", weights_only=True)
+        raw_sd = _unwrap_state_dict(loaded_obj)
+
+    ok_finite, finite_issue = _check_state_dict_finite(raw_sd)
+    if not ok_finite:
+        raise RuntimeError(f"LoRA 文件 {lora_path.name} 校验失败: {finite_issue}")
 
     remapped: dict[str, Any] = {}
+    alphas: dict[str, Any] = {}
     stripped_prefixes: set[str] = set()
+    collisions: list[str] = []
 
     for orig_key, tensor in raw_sd.items():
         k = orig_key
@@ -445,25 +626,56 @@ def normalize_lora_state_dict(lora_path: Path) -> tuple[dict[str, Any], dict[str
                 stripped_prefixes.add(prefix)
                 break
 
-        # Normalize Kohya / ComfyUI `.lora_down.weight` / `.lora_up.weight` if present
         if ".lora_down." in k:
             k = k.replace(".lora_down.", ".lora_A.")
         elif ".lora_up." in k:
             k = k.replace(".lora_up.", ".lora_B.")
 
-        # Convert Kohya `lora_unet_` style underscores only if no dot hierarchy exists before weight suffix
         if k.startswith("lora_unet_"):
             stripped_prefixes.add("lora_unet_")
-            body = k[len("lora_unet_") :]
-            if "." in body:
-                mod_part, attr_part = body.split(".", 1)
-                k = f"transformer.{mod_part}.{attr_part}"
+            k = _restore_kohya_unet_key(k[len("lora_unet_") :])
 
+        if k.endswith(".alpha"):
+            base_key = k[: -len(".alpha")]
+            if base_key in alphas:
+                logger.warning("Duplicate LoRA alpha key '%s' from original key '%s'", k, orig_key)
+                collisions.append(k)
+            alphas[base_key] = tensor
+            continue
+
+        if k in remapped:
+            logger.warning("LoRA key collision detected: '%s' overwritten by '%s'", k, orig_key)
+            collisions.append(k)
         remapped[k] = tensor
+
+    # Fold Kohya/ComfyUI `.alpha / rank` scaling into `lora_B.weight` so Diffusers PEFT
+    # matches exact Kohya/ComfyUI LoRA strength instead of defaulting alpha == rank.
+    alpha_scaled_layers = 0
+    for base_key, alpha_tensor in alphas.items():
+        a_key = f"{base_key}.lora_A.weight"
+        b_key = f"{base_key}.lora_B.weight"
+        a_tensor = remapped.get(a_key)
+        b_tensor = remapped.get(b_key)
+        if a_tensor is not None and b_tensor is not None and hasattr(a_tensor, "shape") and len(a_tensor.shape) >= 1:
+            rank = int(a_tensor.shape[0])
+            if rank > 0:
+                try:
+                    alpha_val = float(alpha_tensor.item() if hasattr(alpha_tensor, "item") else alpha_tensor)
+                    scale = alpha_val / float(rank)
+                    if abs(scale - 1.0) > 1e-6:
+                        remapped[b_key] = (b_tensor.float() * scale).to(b_tensor.dtype)
+                        alpha_scaled_layers += 1
+                    continue
+                except Exception as exc:
+                    logger.warning("Failed to apply LoRA alpha scaling for %s: %s", base_key, exc)
+        # Preserve unmatched `.alpha` tensor rather than silently dropping it
+        remapped[f"{base_key}.alpha"] = alpha_tensor
 
     info = {
         "orig_keys": len(raw_sd),
         "mapped_keys": len(remapped),
         "stripped_prefixes": sorted(stripped_prefixes),
+        "collisions": collisions,
+        "alpha_scaled_layers": alpha_scaled_layers,
     }
     return remapped, info

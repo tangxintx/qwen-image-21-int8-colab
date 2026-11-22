@@ -5,9 +5,9 @@ Reference: https://github.com/wy51ai/easycolab (AI-generated codebase).
 Features:
 - Deep stale-process & port-holder cleanup before startup (safe Colab cell re-runs)
 - Timeout-protected, atomic, retried `cloudflared` binary download with progress bar
-- Continuous non-blocking tunnel stdout drain + automatic tunnel retry
+- Starts tunnel BEFORE server so `CLOUDFLARED_PID` & PID file are cleanly inherited by `server.py`
+- Generates per-session Bearer admin token (`QWEN_ADMIN_TOKEN`) and appends `#token=` to QR/URL
 - Native Colab tqdm progress bars + clean QR code card
-- Supports Colab tunnel mode and `--local` / `--demo` / `--ai-auto-run` flags
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import argparse
 import os
 import platform
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -27,6 +28,7 @@ from typing import Optional
 
 BASE_DIR = Path(__file__).resolve().parent
 CLOUDFLARED_BIN = Path("/tmp/cloudflared")
+CLOUDFLARED_PID_FILE = Path("/tmp/qwen_cloudflared.pid") if os.name != "nt" else (BASE_DIR / ".cloudflared.pid")
 SERVER_LOG_PATH = Path("/tmp/qwen_server.log") if os.name != "nt" else (BASE_DIR / "qwen_server.log")
 DEFAULT_PORT = int(os.environ.get("PORT", "7860"))
 
@@ -192,8 +194,8 @@ def preload_model_with_progress() -> None:
     if os.environ.get("QWEN_PRELOAD_MODEL", "1").strip().lower() not in {"1", "true", "yes"}:
         return
 
-    model_id = os.environ.get("QWEN_MODEL_ID", "abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8")
-    quant_mode = os.environ.get("QWEN_QUANT_MODE", "gguf-q8-full")
+    model_id = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen-Image-2.1-Turbo")
+    quant_mode = os.environ.get("QWEN_QUANT_MODE", "fp8-int8")
     hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     from hf_downloader import (
         GGUF_BASE_REPO,
@@ -208,17 +210,19 @@ def preload_model_with_progress() -> None:
     is_gguf = (
         base_repo.lower() in {GGUF_BASE_REPO.lower(), GGUF_REDIRECTED_REPO.lower()}
         or "gguf" in base_repo.lower()
-        or qm_low in {"gguf-q8-full", "gguf-q4"}
+        or qm_low in {"gguf-q8-full", "gguf-q8-int8", "gguf-q4"}
     )
     if is_gguf:
         variant = suffix if suffix in {"q8", "q4"} else ("q4" if "q4" in qm_low else "q8")
+        include_te = qm_low != "gguf-q8-int8"
         print(f"正在通过 Hugging Face API 极速按需预下载 GGUF {variant.upper()} 模型组件: {base_repo}", flush=True)
         bundle = download_gguf_bundle_fast(
             variant=variant,
             token=hf_token,
             use_tqdm=True,
             include_diffusers_configs=True,
-            include_mmproj=True,
+            include_mmproj=(variant == "q4"),
+            include_te=include_te,
         )
         print(f"GGUF {variant.upper()} 模型组件已高速缓存至: {bundle.get('dit_path')}", flush=True)
         return
@@ -326,8 +330,8 @@ def start_tunnel_with_retry(
 
 
 def _print_startup_summary(port: int, use_tunnel: bool) -> None:
-    model_id = os.environ.get("QWEN_MODEL_ID", "abenzerps/Qwen-Image-2.1-Turbo-Quantized:q8")
-    quant_mode = os.environ.get("QWEN_QUANT_MODE", "gguf-q8-full")
+    model_id = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen-Image-2.1-Turbo")
+    quant_mode = os.environ.get("QWEN_QUANT_MODE", "fp8-int8")
     offload = os.environ.get("QWEN_OFFLOAD", "auto")
     gpu_prof = os.environ.get("QWEN_GPU_PROFILE", "auto")
     demo = os.environ.get("DEMO_MODE", "0").strip().lower() in {"1", "true", "yes"}
@@ -340,10 +344,17 @@ def _print_startup_summary(port: int, use_tunnel: bool) -> None:
     print("--------------------------------------\n", flush=True)
 
 
-def display_qr_and_url(public_url: str, is_local: bool = False) -> None:
+def display_qr_and_url(
+    public_url: str,
+    is_local: bool = False,
+    admin_token: Optional[str] = None,
+) -> None:
+    access_url = f"{public_url}#token={admin_token}" if admin_token else public_url
     print("\n==========================================", flush=True)
     print("Qwen-Image-2.1 Studio 已就绪 (参考 wy51ai/easycolab)", flush=True)
-    print(f"访问地址: {public_url}", flush=True)
+    print(f"访问地址: {access_url}", flush=True)
+    if admin_token:
+        print(f"管理令牌 (Token): {admin_token}", flush=True)
     print("==========================================\n", flush=True)
     if is_local:
         return
@@ -353,7 +364,7 @@ def display_qr_and_url(public_url: str, is_local: bool = False) -> None:
         from IPython.display import HTML, Image as IPyImage, display
 
         qr = qrcode.QRCode(box_size=6, border=2)
-        qr.add_data(public_url)
+        qr.add_data(access_url)
         qr.make(fit=True)
         img = qr.make_image(fill_color="#18181b", back_color="white")
         buf = io.BytesIO()
@@ -365,9 +376,9 @@ def display_qr_and_url(public_url: str, is_local: bool = False) -> None:
                 f'border-radius:14px;font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:560px;'
                 f'box-shadow:0 2px 10px rgba(15,23,42,0.06)">'
                 f'<div style="font-size:15px;font-weight:700;margin-bottom:6px">Qwen-Image-2.1 Studio 已就绪</div>'
-                f'<div style="margin-bottom:10px;font-size:13px;color:#52525b">点击或手机扫码打开：'
-                f'<a href="{public_url}" target="_blank" style="color:#2563eb;font-weight:600;text-decoration:none">{public_url}</a></div>'
-                f'<div style="font-size:12px;color:#71717a">提示：网页右上角点击「关闭」可安全卸载模型并释放 Colab 资源。</div>'
+                f'<div style="margin-bottom:8px;font-size:13px;color:#52525b">点击或手机扫码自动登录：'
+                f'<a href="{access_url}" target="_blank" style="color:#2563eb;font-weight:600;text-decoration:none">{public_url}</a></div>'
+                f'<div style="font-size:12px;color:#71717a">已自动附加一次性管理令牌 (#token=... 仅本地保存，不经过 URL 查询日志)。</div>'
                 f"</div>"
             )
         )
@@ -396,6 +407,11 @@ def launch_in_colab(
         env["QWEN_AI_AUTO_RUN"] = val
         os.environ["QWEN_AI_AUTO_RUN"] = val
 
+    admin_token = (env.get("QWEN_ADMIN_TOKEN") or "").strip() or secrets.token_urlsafe(24)
+    env["QWEN_ADMIN_TOKEN"] = admin_token
+    os.environ["QWEN_ADMIN_TOKEN"] = admin_token
+    env["CLOUDFLARED_PID_FILE"] = str(CLOUDFLARED_PID_FILE)
+
     use_tunnel = not local_only and os.name != "nt" and os.environ.get("NO_TUNNEL", "0") != "1"
 
     _print_startup_summary(port=port, use_tunnel=use_tunnel)
@@ -404,8 +420,19 @@ def launch_in_colab(
     preload_model_with_progress()
 
     cf_bin: Optional[Path] = None
+    tunnel_proc: Optional[subprocess.Popen[str]] = None
+    public_url: Optional[str] = None
     if use_tunnel:
         cf_bin = ensure_cloudflared()
+        # Start cloudflared BEFORE spawning server.py so CLOUDFLARED_PID is present in server_proc's env
+        tunnel_proc, public_url = start_tunnel_with_retry(cf_bin, port=port, retries=2, timeout_sec=35)
+        if tunnel_proc is not None:
+            env["CLOUDFLARED_PID"] = str(tunnel_proc.pid)
+            os.environ["CLOUDFLARED_PID"] = str(tunnel_proc.pid)
+            try:
+                CLOUDFLARED_PID_FILE.write_text(str(tunnel_proc.pid), encoding="utf-8")
+            except OSError:
+                pass
 
     log_file = open(SERVER_LOG_PATH, "wb")
     server_proc = subprocess.Popen(
@@ -416,22 +443,17 @@ def launch_in_colab(
         stderr=subprocess.STDOUT,
     )
 
-    tunnel_proc: Optional[subprocess.Popen[str]] = None
     try:
         if not wait_server_ready(server_proc, port=port, timeout_sec=45):
             print("FastAPI 服务未能正常启动，请检查上方日志。", flush=True)
             return
 
-        if use_tunnel and cf_bin is not None:
-            tunnel_proc, public_url = start_tunnel_with_retry(cf_bin, port=port, retries=2, timeout_sec=35)
-            if public_url:
-                if tunnel_proc is not None:
-                    os.environ["CLOUDFLARED_PID"] = str(tunnel_proc.pid)
-                display_qr_and_url(public_url, is_local=False)
-            else:
-                print(f"未能获取 Cloudflare 公网地址，本地服务运行于 http://127.0.0.1:{port}", flush=True)
+        if use_tunnel and public_url:
+            display_qr_and_url(public_url, is_local=False, admin_token=admin_token)
         else:
-            display_qr_and_url(f"http://127.0.0.1:{port}", is_local=True)
+            if use_tunnel:
+                print(f"未能获取 Cloudflare 公网地址，本地服务运行于 http://127.0.0.1:{port}", flush=True)
+            display_qr_and_url(f"http://127.0.0.1:{port}", is_local=True, admin_token=admin_token)
 
         print("服务运行中（按 Ctrl+C 或在网页端点击「关闭」可退出）...", flush=True)
         server_proc.wait()
@@ -446,6 +468,10 @@ def launch_in_colab(
                 except subprocess.TimeoutExpired:
                     proc.kill()
         log_file.close()
+        try:
+            CLOUDFLARED_PID_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _parse_args() -> argparse.Namespace:
